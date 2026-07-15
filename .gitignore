@@ -1,4 +1,6 @@
 .env
+ssh-key-2026-07-15.key
+ssh-key-2026-07-15.key.pub
 bot_data.db
 bot.log
 __pycache__/
