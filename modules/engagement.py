@@ -47,7 +47,8 @@ def score_influence(follower_count: int, engagement_avg: float, verified: bool) 
 
 
 def decide_action(influence_score: int, is_lead: bool = False,
-                   sentiment: str = "neutro") -> str:
+                   sentiment: str = "neutro", follower_count: int = 0,
+                   mega_account_threshold: int = 50_000) -> str:
     """
     Punto 8: decide la migliore azione tra
     Ignora, Like, Like+Follow, Commenta, Retweet, Retweet con commento
@@ -58,13 +59,24 @@ def decide_action(influence_score: int, is_lead: bool = False,
     - influencer alto punteggio → Retweet con commento o Commenta
     - influencer medio → Like+Follow
     - basso punteggio → Like o Ignora
+
+    SOGLIA MEGA-ACCOUNT: sopra 'mega_account_threshold' follower (default 50K),
+    l'azione è sempre limitata a Like/Like+Follow, MAI commento automatico.
+    Motivo: account enormi (es. @CrossFit, @HYROXWORLD) hanno un pubblico
+    che non coincide col target commerciale di FlexDropin (gestori palestre),
+    quindi un commento AI automatico rischia di sembrare fuori contesto/spam
+    senza alcun beneficio di lead generation reale. Restano utili per la sola
+    visibilità (like/follow), non per l'interazione attiva.
     """
     if sentiment == "negativo" and not is_lead:
         return "Ignora"
     if is_lead:
         return "Commenta"
+
+    is_mega_account = follower_count >= mega_account_threshold
+
     if influence_score >= 70:
-        return "Retweet con commento"
+        return "Like+Follow" if is_mega_account else "Retweet con commento"
     if influence_score >= 45:
         return "Like+Follow"
     if influence_score >= 20:
@@ -75,11 +87,13 @@ def decide_action(influence_score: int, is_lead: bool = False,
 class EngagementManager:
     """Gestisce follow/like/commenti verso una lista curata di target (non a strascico)"""
 
-    def __init__(self, twitter_client, ai_generator, db: Database, max_comments_per_session: int = 3):
+    def __init__(self, twitter_client, ai_generator, db: Database, max_comments_per_session: int = 3,
+                 mega_account_threshold: int = 50_000):
         self.client = twitter_client
         self.ai = ai_generator
         self.db = db
         self.max_comments_per_session = max_comments_per_session
+        self.mega_account_threshold = mega_account_threshold
 
     def sync_target_accounts(self, usernames: List[str]):
         """
@@ -125,8 +139,13 @@ class EngagementManager:
             if not latest_tweet:
                 continue
 
-            action = decide_action(influence_score=target['score'])
-            logger.info(f"🎯 @{username} (score {target['score']}) → azione: {action}")
+            action = decide_action(
+                influence_score=target['score'],
+                follower_count=target.get('follower_count', 0),
+                mega_account_threshold=self.mega_account_threshold,
+            )
+            logger.info(f"🎯 @{username} (score {target['score']}, follower {target.get('follower_count', 0)}) "
+                        f"→ azione: {action}")
 
             if action == "Ignora":
                 continue

@@ -57,6 +57,13 @@ MAX_FLEXDROPIN_MENTIONS_PER_DAY = int(os.getenv('MAX_FLEXDROPIN_MENTIONS_PER_DAY
 MAX_LINKS_PER_WEEK = int(os.getenv('MAX_LINKS_PER_WEEK', '3'))
 USER_COMMENT_COOLDOWN_HOURS = int(os.getenv('USER_COMMENT_COOLDOWN_HOURS', '24'))
 
+# ========== Soglia mega-account (engagement) ==========
+# Sopra questa soglia di follower, il bot si limita a Like/Like+Follow e non
+# commenta mai in automatico (es. @CrossFit, @HYROXWORLD: ottimi per la
+# visibilità, ma il loro pubblico non coincide col target commerciale di
+# FlexDropin, quindi un commento AI lì rischia di sembrare fuori contesto).
+MEGA_ACCOUNT_FOLLOWER_THRESHOLD = int(os.getenv('MEGA_ACCOUNT_FOLLOWER_THRESHOLD', '50000'))
+
 # ========== Account target curati (punto 7) ==========
 # Popolare con username reali (senza @) di gestori di palestre/boutique studio,
 # coach, founder fitness-tech, influencer di settore FUORI DALL'ITALIA

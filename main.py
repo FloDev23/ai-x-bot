@@ -41,7 +41,7 @@ try:
         TWEET_SCORE_THRESHOLD, MAX_REGENERATION_ATTEMPTS,
         MAX_FLEXDROPIN_MENTIONS_PER_DAY, MAX_LINKS_PER_WEEK,
         TARGET_ACCOUNTS, HUMAN_MODE_PROBABILITY, SEARCH_TOPICS,
-        MAX_COMMENTS_PER_SESSION,
+        MAX_COMMENTS_PER_SESSION, MEGA_ACCOUNT_FOLLOWER_THRESHOLD,
     )
     from modules.database import Database
     from modules.content_scheduler import (
@@ -89,7 +89,8 @@ class FlexDropinGrowthAgent:
             self.scorer = TweetScorer(self.ai_generator.client, self.ai_generator.model)
             self.engagement_manager = EngagementManager(
                 self.twitter_client, self.ai_generator, self.db,
-                max_comments_per_session=MAX_COMMENTS_PER_SESSION
+                max_comments_per_session=MAX_COMMENTS_PER_SESSION,
+                mega_account_threshold=MEGA_ACCOUNT_FOLLOWER_THRESHOLD,
             )
             self.lead_finder = LeadFinder(
                 self.twitter_client, self.ai_generator.client, self.ai_generator.model, self.db
