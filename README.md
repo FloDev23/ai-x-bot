@@ -24,6 +24,20 @@ per abilitare l'engagement mirato sugli account che ti interessano davvero.
 ⚠️ **Nota modello Groq**: `mixtral-8x7b-32768` è stato rimosso da Groq. Il default è
 ora `openai/gpt-oss-120b` (configurabile via `GROQ_MODEL` in `.env`).
 
+## 🌍 Mercato: X in inglese, per il mercato internazionale
+
+Su decisione di Floriano, questo bot X è dedicato al **mercato internazionale**
+(gestori di palestre/boutique studio fuori dall'Italia): tutti i contenuti
+generati (tweet, thread, commenti, lead scoring) sono ora in **inglese**.
+Il mercato italiano resta presidiato via Instagram e visite di persona,
+fuori da questo bot. Questo è coerente con l'architettura reale di FlexDropin,
+che gestisce IVA condizionale e UI IT/EN in base al paese della palestra.
+
+Se in futuro vorrai riportare anche l'italiano su X (es. per gestori IT che
+usano anche X), la persona/i prompt sono centralizzati in
+`modules/ai_generator.py` (`FOUNDER_PERSONA`, `AGENTS`) e si possono
+duplicare per lingua senza toccare il resto dell'architettura.
+
 ## ✨ Caratteristiche
 
 - 📰 **Fetching Notizie** - Recupera articoli da NewsAPI

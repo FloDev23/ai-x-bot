@@ -28,7 +28,10 @@ FLEXDROPIN_APP_STORE = 'https://apps.apple.com/it/app/flexdropin/id6758290879'
 FLEXDROPIN_WEBSITE = 'https://flexdropin.com'
 
 # ========== Bot Configuration (v1, mantenute per retrocompatibilità) ==========
-SEARCH_TOPICS = os.getenv('SEARCH_TOPICS', 'CrossFit Games,fitness drop-in,lezioni fitness,palestra,yoga,running,allenamento,workout,training,CrossFit,functional training,bootcamp,pilates,CrossFit 2024').split(',')
+# NOTA MERCATO: topic in inglese, il bot su X è dedicato al mercato
+# internazionale (gestori palestre/boutique studio fuori dall'Italia).
+# Il mercato italiano resta presidiato via Instagram / di persona.
+SEARCH_TOPICS = os.getenv('SEARCH_TOPICS', 'CrossFit,functional training,yoga,pilates,HIIT,calisthenics,boutique fitness,gym management software,drop-in fitness,class booking app,boxing gym,indoor cycling,gym owner,fitness franchise,wellness trend,gym membership retention,fitness studio marketing').split(',')
 POST_INTERVAL = int(os.getenv('POST_INTERVAL', '3600'))
 MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '5'))
 ENGAGEMENT_CHECK_INTERVAL = int(os.getenv('ENGAGEMENT_CHECK_INTERVAL', '1800'))
@@ -55,8 +58,10 @@ MAX_LINKS_PER_WEEK = int(os.getenv('MAX_LINKS_PER_WEEK', '3'))
 USER_COMMENT_COOLDOWN_HOURS = int(os.getenv('USER_COMMENT_COOLDOWN_HOURS', '24'))
 
 # ========== Account target curati (punto 7) ==========
-# Popolare con username reali (senza @) di proprietari palestre, coach,
-# founder fitness, influencer di settore che si vogliono seguire/coinvolgere.
+# Popolare con username reali (senza @) di gestori di palestre/boutique studio,
+# coach, founder fitness-tech, influencer di settore FUORI DALL'ITALIA
+# (mercato internazionale: US/UK/EU). Verifica sempre che l'account sia attivo
+# prima di aggiungerlo, per non sprecare letture API su profili inattivi.
 TARGET_ACCOUNTS = [a.strip() for a in os.getenv('TARGET_ACCOUNTS', '').split(',') if a.strip()]
 
 # ========== Human mode (punto 5) ==========

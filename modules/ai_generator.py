@@ -1,7 +1,7 @@
 """
-AI Generator v3 - Growth Agent
+AI Generator v3 - Growth Agent (ENGLISH / international market)
 Cambiamenti principali rispetto alla v1:
-- Punto 12: persona cambiata da "social media manager" a "founder che costruisce in pubblico"
+- Punto 12: persona cambiata da "social media manager" a "founder che condivide il percorso"
 - Punto 13: multi-agente (Business/Fitness/Founder/Copywriter/Community) + Editor che sceglie
 - Punto 5: "human mode" - post occasionali informali, non promozionali
 - Punto 6: "build in public" - recap settimanale di progressi/bug/numeri
@@ -9,6 +9,12 @@ Cambiamenti principali rispetto alla v1:
   gli argomenti recenti dal database e li evita esplicitamente nel prompt)
 - Nuovo: controllo esplicito se includere il link (il link costa $0.20 invece di
   $0.015 a post sull'API X 2026, quindi va usato solo quando necessario)
+
+NOTA STRATEGICA: su richiesta di Floriano, X è ora dedicato al mercato
+internazionale (gestori di palestre/boutique studio fuori dall'Italia).
+FlexDropin gestisce IVA condizionale e UI IT/EN a seconda del paese della
+palestra, quindi i contenuti X sono generati in INGLESE. Il mercato italiano
+resta presidiato via Instagram e visite di persona (fuori da questo bot).
 """
 import logging
 import json
@@ -20,39 +26,39 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Punto 12: nuova persona. Non più "social media manager" ma founder reale.
+# In inglese: il pubblico target ora sono gestori di palestre/studio fuori Italia.
 # ---------------------------------------------------------------------------
-FOUNDER_PERSONA = """Sei Floriano, founder solista di FlexDropin, un'app che permette
-di prenotare lezioni fitness drop-in (yoga, crossfit, pilates, functional...) e aiuta
-le palestre a riempire i posti vuoti nelle lezioni. Costruisci tutto da solo: prodotto,
-marketing, vendite. Scrivi su X in prima persona, come un founder che condivide il
-percorso reale (build in public), non come un social media manager che fa promozione.
-Tono: diretto, umano, a volte autoironico, mai gonfio di marketing-speak. Puoi parlare
-di business del fitness, del prodotto, di startup, oppure semplicemente della tua
-giornata da founder."""
+FOUNDER_PERSONA = """You are Floriano, solo founder of FlexDropin, an app that lets people
+book drop-in fitness classes (yoga, crossfit, pilates, functional training...) and helps
+gyms and boutique studios fill empty spots in their classes. You build everything yourself:
+product, marketing, sales. You write on X in first person, as a founder sharing the real
+journey (build in public), not as a social media manager doing promotion.
+Tone: direct, human, occasionally self-deprecating, never full of marketing-speak. You can
+talk about the fitness business, the product, startup life, or just your day as a founder."""
 
 # ---------------------------------------------------------------------------
 # Punto 13: Multi-agente. Ogni agente ha un taglio diverso sullo stesso spunto.
 # ---------------------------------------------------------------------------
 AGENTS = {
     "business_expert": FOUNDER_PERSONA + """
-Scrivi come esperto di business del fitness: parla di margini, retention,
-riempimento corsi, gestione palestre, drop-in come modello di ricavo aggiuntivo.""",
+Write as a fitness business expert: talk about margins, retention, filling classes,
+gym/studio management, drop-in as an extra revenue stream.""",
 
     "fitness_expert": FOUNDER_PERSONA + """
-Scrivi come appassionato di fitness: parla di allenamento, discipline, community,
-motivazione, senza fare business talk.""",
+Write as a fitness enthusiast: talk about training, disciplines, community,
+motivation, no business talk.""",
 
     "startup_founder": FOUNDER_PERSONA + """
-Scrivi come founder che racconta la costruzione di FlexDropin: bug risolti,
-decisioni difficili, numeri, lezioni imparate, dubbi.""",
+Write as the founder telling the story of building FlexDropin: bugs fixed,
+hard decisions, numbers, lessons learned, doubts.""",
 
     "copywriter": FOUNDER_PERSONA + """
-Scrivi in modo estremamente sintetico e ad alto impatto, ottimizzato per generare
-discussione/risposte, stile hook diretto nelle prime parole.""",
+Write extremely concise, high-impact copy, optimized to spark discussion/replies,
+hook-style opening in the first few words.""",
 
     "community_manager": FOUNDER_PERSONA + """
-Scrivi in modo caldo e colloquiale, come se stessi rispondendo a un amico nella
-community fitness, poche frasi, tono leggero.""",
+Write warm and conversational, like replying to a friend in the fitness community,
+short sentences, light tone.""",
 }
 
 # Quale/i agenti usare per ciascuna categoria del palinsesto (content_scheduler.py)
@@ -121,32 +127,32 @@ class AIGenerator:
 
         avoid_block = ""
         if recent_topics:
-            avoid_block = "Argomenti già trattati di recente (NON ripeterli, scegli qualcos'altro): " + \
+            avoid_block = "Topics already covered recently (do NOT repeat them, pick something else): " + \
                            "; ".join(recent_topics[:8])
 
         context_block = ""
         if event_context:
-            context_block += f"\nEventi fitness in corso di cui potresti parlare: {', '.join(event_context)}."
+            context_block += f"\nRelevant fitness events happening now you could mention: {', '.join(event_context)}."
         if seasonal_context:
-            context_block += f"\nContesto stagionale: {seasonal_context}."
+            context_block += f"\nSeasonal context: {seasonal_context}."
 
         link_instruction = (
-            f"Includi naturalmente il link {_get_link()} come call-to-action."
+            f"Naturally include the link {_get_link()} as a call-to-action."
             if include_link else
-            "NON includere nessun link né invito esplicito a scaricare l'app: "
-            "è un post di contenuto/valore, non promozionale."
+            "Do NOT include any link or explicit call to download the app: "
+            "this is a value/content post, not promotional."
         )
 
         candidates = []
         for agent_name in agent_names:
             system_prompt = AGENTS[agent_name]
-            user_prompt = f"""Scrivi UN tweet (max 280 caratteri) per la categoria "{category}".
-{f'Spunto/topic: {topic_hint}' if topic_hint else ''}
+            user_prompt = f"""Write ONE tweet (max 280 characters) for the category "{category}".
+{f'Topic/angle: {topic_hint}' if topic_hint else ''}
 {avoid_block}
 {context_block}
 {link_instruction}
 
-Rispondi SOLO con il testo del tweet, senza virgolette, senza spiegazioni."""
+Reply ONLY with the tweet text, no quotes, no explanations."""
 
             text = self._complete(system_prompt, user_prompt)
             if text:
@@ -162,16 +168,16 @@ Rispondi SOLO con il testo del tweet, senza virgolette, senza spiegazioni."""
     def _editor_pick(self, candidates: List[Dict], category: str) -> Dict:
         """L'agente 'Editor' sceglie il candidato migliore tra quelli generati (punto 13)"""
         options_block = "\n".join(f"{i+1}. {c['text']}" for i, c in enumerate(candidates))
-        prompt = f"""Sei l'editor di un account X di startup fitness. Categoria: {category}.
-Scegli quale di questi tweet pubblicheresti, considerando naturalezza, originalità
-e potenziale di discussione:
+        prompt = f"""You are the editor of a fitness startup X account. Category: {category}.
+Choose which of these tweets you would publish, considering naturalness, originality
+and discussion potential:
 
 {options_block}
 
-Rispondi SOLO con il numero della scelta (es: 1)."""
+Reply ONLY with the number of your choice (e.g: 1)."""
 
         choice = self._complete(
-            "Sei un editor esperto di social media, rigoroso e sintetico.",
+            "You are an experienced, rigorous, concise social media editor.",
             prompt, max_tokens=5, temperature=0.1
         )
         try:
@@ -190,12 +196,12 @@ Rispondi SOLO con il numero della scelta (es: 1)."""
         """Genera un thread multi-tweet (punto 17: campagne strutturate)"""
         prompt = f"""{FOUNDER_PERSONA}
 
-Scrivi un thread X di {num_tweets} tweet sul tema: "{topic}".
-Struttura consigliata: 1) problema/hook, 2) dato o fatto, 3) caso reale o esempio,
-4) consiglio pratico, 5) call to action leggera verso FlexDropin ({_get_link()}).
+Write an X thread of {num_tweets} tweets about: "{topic}".
+Suggested structure: 1) problem/hook, 2) data point or fact, 3) real case or example,
+4) practical tip, 5) light call to action towards FlexDropin ({_get_link()}).
 
-Rispondi SOLO con un array JSON di {num_tweets} stringhe, una per tweet, senza numerazione
-visibile nel testo, senza altre spiegazioni. Esempio: ["testo1", "testo2", ...]"""
+Reply ONLY with a JSON array of {num_tweets} strings, one per tweet, no visible numbering
+in the text, no other explanations. Example: ["text1", "text2", ...]"""
 
         raw = self._complete(FOUNDER_PERSONA, prompt, max_tokens=600, temperature=0.8)
         if not raw:
@@ -214,11 +220,11 @@ visibile nel testo, senza altre spiegazioni. Esempio: ["testo1", "testo2", ...]"
         A = apertura con domanda, B = apertura con dato/fatto.
         """
         prompt_a = f"""{FOUNDER_PERSONA}
-Scrivi un tweet (max 280 caratteri) sul tema "{topic}" che INIZI con una domanda
-diretta al lettore. Rispondi solo col testo del tweet."""
+Write a tweet (max 280 characters) about "{topic}" that OPENS with a direct
+question to the reader. Reply only with the tweet text."""
         prompt_b = f"""{FOUNDER_PERSONA}
-Scrivi un tweet (max 280 caratteri) sul tema "{topic}" che INIZI con un dato o un
-fatto concreto (non una domanda). Rispondi solo col testo del tweet."""
+Write a tweet (max 280 characters) about "{topic}" that OPENS with a concrete
+data point or fact (not a question). Reply only with the tweet text."""
 
         variant_a = self._complete(FOUNDER_PERSONA, prompt_a)
         variant_b = self._complete(FOUNDER_PERSONA, prompt_b)
@@ -234,10 +240,9 @@ fatto concreto (non una domanda). Rispondi solo col testo del tweet."""
         """Post informale che fa sembrare l'account umano, non promozionale"""
         prompt = f"""{FOUNDER_PERSONA}
 
-Scrivi un tweet breve, informale, imperfetto, come quelli che scrivono i founder
-veri quando raccontano una giornata storta o un momento buffo dello sviluppo
-(es. bug assurdi, aspettative sbagliate, piccole vittorie). Niente promozione,
-niente link, niente hashtag. Max 280 caratteri."""
+Write a short, informal, imperfect tweet, the kind real founders write when telling
+about a rough day or a funny moment in development (e.g. absurd bugs, wrong
+expectations, small wins). No promotion, no link, no hashtags. Max 280 characters."""
 
         text = self._complete(FOUNDER_PERSONA, prompt, temperature=0.95)
         return self._truncate(text) if text else None
@@ -251,14 +256,14 @@ niente link, niente hashtag. Max 280 caratteri."""
         highlights: lista di frasi tipo ["risolto bug pagamenti", "+12 palestre onboardate"]
         """
         highlights_block = "\n".join(f"- {h}" for h in highlights) if highlights else \
-            "- una settimana di lavoro tranquilla, senza grandi novità"
+            "- a quiet week of work, no big news"
 
         prompt = f"""{FOUNDER_PERSONA}
 
-Scrivi un tweet di recap settimanale "build in public" basato su questi punti reali:
+Write a weekly "build in public" recap tweet based on these real points:
 {highlights_block}
 
-Tono onesto e concreto, non da comunicato stampa. Max 280 caratteri."""
+Honest, concrete tone, not like a press release. Max 280 characters."""
 
         text = self._complete(FOUNDER_PERSONA, prompt, temperature=0.85)
         return self._truncate(text) if text else None
@@ -273,20 +278,20 @@ Tono onesto e concreto, non da comunicato stampa. Max 280 caratteri."""
         utile per commentare account target senza sembrare spam (punto 9).
         """
         promo_line = (
-            "Puoi menzionare FlexDropin in modo naturale, senza essere invadente."
+            "You can mention FlexDropin naturally, without being pushy."
             if promotional else
-            "NON menzionare FlexDropin: il commento deve aggiungere valore puro alla conversazione."
+            "Do NOT mention FlexDropin: the comment should add pure value to the conversation."
         )
 
         prompt = f"""{FOUNDER_PERSONA}
 
-Leggi questo tweet:
+Read this tweet:
 "{tweet_text}"
 
-Scrivi un commento breve (max 200 caratteri), cortese, che aggiunge valore reale
-alla conversazione. {promo_line}
+Write a short comment (max 200 characters), polite, that adds real value to
+the conversation. {promo_line}
 
-Rispondi SOLO col testo del commento."""
+Reply ONLY with the comment text."""
 
         text = self._complete(FOUNDER_PERSONA, prompt, temperature=0.75)
         return self._truncate(text, 280) if text else None

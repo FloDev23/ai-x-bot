@@ -4,6 +4,9 @@ Lead Finder / Opportunity Detector - Punto 19 dell'analisi
 qui ridimensionata in Fase 4 per motivi di costo: ogni ricerca X costa,
 quindi va fatta con query mirate e poche volte al giorno, non a ciclo continuo).
 
+MERCATO: keyword in inglese, mirate a gestori di palestre/boutique studio
+fuori dall'Italia (il mercato italiano resta presidiato via Instagram/di persona).
+
 Cerca frasi che indicano intenzione commerciale reale (apertura palestra,
 ricerca gestionale, pochi iscritti, ecc.), assegna un punteggio 0-100,
 salva tutto in un piccolo CRM locale (modules/database.py) e SUGGERISCE
@@ -19,16 +22,18 @@ from modules.database import Database
 logger = logging.getLogger(__name__)
 
 # Frasi che indicano una potenziale opportunità commerciale (punto 19)
+# In inglese: mercato internazionale (gestori palestre/studio fuori Italia)
 PROBLEM_KEYWORDS = [
-    "sto aprendo una palestra",
-    "cerco un gestionale",
-    "come riempire i corsi",
-    "ho pochi iscritti",
-    "quale software usate",
-    "come trovate nuovi clienti",
-    "cerco una palestra a",
-    "gestionale per palestra",
-    "app per prenotare lezioni",
+    "opening a gym",
+    "starting a boutique studio",
+    "looking for gym software",
+    "how to fill my classes",
+    "low class attendance",
+    "which gym management software",
+    "how do you get new gym members",
+    "need a booking app for my studio",
+    "gym management software recommendation",
+    "drop-in class booking",
 ]
 
 
@@ -74,24 +79,23 @@ class LeadFinder:
         Assegna un punteggio 0-100 al potenziale lead e suggerisce l'azione
         migliore tra: Ignora, Like, Commenta, DM, Commenta+DM
         """
-        prompt = f"""Un utente su X ha scritto questo tweet che contiene la frase chiave "{keyword}":
+        prompt = f"""A user on X wrote this tweet, which contains the key phrase "{keyword}":
 
 "{text}"
 
-Sei l'analista commerciale di FlexDropin, un'app che aiuta le palestre a
-gestire prenotazioni drop-in e a trovare nuovi clienti.
+You are the commercial analyst for FlexDropin, an app that helps gyms and boutique
+studios manage drop-in class bookings and find new customers.
 
-Valuta quanto questo tweet rappresenta un LEAD COMMERCIALE REALE (non uno
-spam, non un tweet ironico, non un utente non in target) con un punteggio
-da 0 a 100.
+Rate how much this tweet represents a REAL COMMERCIAL LEAD (not spam, not sarcasm,
+not an out-of-target user) with a score from 0 to 100.
 
-Poi scegli la MIGLIORE azione tra queste opzioni esatte:
+Then pick the BEST action among these exact options:
 Ignora, Like, Commenta, DM, Commenta+DM
 
-Rispondi SOLO in questo formato esatto, una riga:
-PUNTEGGIO|AZIONE
+Reply ONLY in this exact one-line format:
+SCORE|ACTION
 
-Esempio: 78|Commenta"""
+Example: 78|Commenta"""
 
         try:
             response = self.groq.chat.completions.create(

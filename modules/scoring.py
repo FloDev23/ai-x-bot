@@ -27,17 +27,17 @@ class TweetScorer:
         Ogni asse è 0-10. In caso di errore ritorna un punteggio neutro (20/40)
         per non bloccare il ciclo di pubblicazione.
         """
-        prompt = f"""Valuta questo tweet per un account fitness/startup su X (Twitter):
+        prompt = f"""Evaluate this tweet for a fitness/startup account on X (Twitter):
 
 "{tweet_text}"
 
-Assegna un punteggio da 0 a 10 per ciascuno di questi 4 assi:
-- utilita: quanto è utile/informativo per chi legge
-- originalita: quanto suona genuino e non generico/robotico
-- discussione: quanto probabilmente genera commenti/interazione
-- promozione: quanto è equilibrata la parte promozionale (10 = perfetto equilibrio, 0 = troppo pubblicitario o assente quando serviva)
+Score each of these 4 axes from 0 to 10:
+- utilita (usefulness): how useful/informative it is for the reader
+- originalita (originality): how genuine it sounds vs generic/robotic
+- discussione (discussion potential): how likely it is to spark comments/interaction
+- promozione (promo balance): how well-balanced the promotional part is (10 = perfect balance, 0 = too salesy or missing when it should be there)
 
-Rispondi SOLO con un oggetto JSON valido, senza altro testo, in questo formato esatto:
+Reply ONLY with a valid JSON object, no other text, in this exact format:
 {{"utilita": <0-10>, "originalita": <0-10>, "discussione": <0-10>, "promozione": <0-10>}}"""
 
         try:
