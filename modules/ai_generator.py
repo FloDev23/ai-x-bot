@@ -87,7 +87,7 @@ class AIGenerator:
     # ------------------------------------------------------------------
     # Helper generico di chiamata a Groq
     # ------------------------------------------------------------------
-    def _complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 120,
+    def _complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 400,
                    temperature: float = 0.8) -> Optional[str]:
         try:
             response = self.client.chat.completions.create(
@@ -98,8 +98,22 @@ class AIGenerator:
                 model=self.model,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                # gpt-oss-120b/20b sono modelli "reasoning": con max_tokens basso
+                # esauriscono il budget nel ragionamento interno e tornano
+                # content vuoto pur rispondendo 200 OK. reasoning_effort="low"
+                # riduce i token spesi a "pensare" prima di scrivere la risposta.
+                reasoning_effort="low",
             )
-            return response.choices[0].message.content.strip()
+            content = (response.choices[0].message.content or "").strip()
+            if not content:
+                finish_reason = response.choices[0].finish_reason
+                logger.warning(
+                    f"⚠️ Groq ha risposto 200 OK ma content vuoto "
+                    f"(finish_reason={finish_reason}, max_tokens={max_tokens}) - "
+                    f"probabile budget esaurito nel reasoning interno"
+                )
+                return None
+            return content
         except Exception as e:
             logger.error(f"❌ Errore chiamata Groq: {e}")
             return None
@@ -178,7 +192,7 @@ Reply ONLY with the number of your choice (e.g: 1)."""
 
         choice = self._complete(
             "You are an experienced, rigorous, concise social media editor.",
-            prompt, max_tokens=5, temperature=0.1
+            prompt, max_tokens=200, temperature=0.1
         )
         try:
             idx = int(choice.strip()) - 1
