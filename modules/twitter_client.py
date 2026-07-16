@@ -98,7 +98,7 @@ class TwitterClient:
         try:
             tweets = self.client.search_recent_tweets(
                 query=query,
-                max_results=min(limit, 100),
+                max_results=max(10, min(limit, 100)),
                 tweet_fields=['public_metrics', 'author_id', 'created_at'],
                 expansions=['author_id'],
                 user_fields=['username']

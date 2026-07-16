@@ -44,7 +44,7 @@ class LeadFinder:
         self.model = model
         self.db = db
 
-    def find_opportunities(self, max_per_keyword: int = 3) -> List[Dict]:
+    def find_opportunities(self, max_per_keyword: int = 10) -> List[Dict]:
         """
         Esegue ricerche mirate (poche, non a strascico) sulle keyword ad alto
         valore commerciale. Da chiamare 2-3 volte al giorno, non ogni 30 minuti.

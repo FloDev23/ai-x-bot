@@ -207,9 +207,11 @@ class FlexDropinGrowthAgent:
 
     def _publish(self, text, category, topic, has_link, score_total, agent_used):
         result = self.twitter_client.post_tweet(text)
-        tweet_id = ''
-        if result and getattr(result, 'data', None):
-            tweet_id = result.data.get('id', '')
+        if not result or not getattr(result, 'data', None):
+            logger.error(f"❌ Pubblicazione fallita [{category}/{agent_used}]: {text[:80]}...")
+            return
+
+        tweet_id = result.data.get('id', '')
         self.db.log_posted_tweet(
             text=text, category=category, topic=topic, tweet_id=tweet_id,
             has_link=has_link, score_total=score_total, agent_used=agent_used,

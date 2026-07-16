@@ -44,10 +44,11 @@ Reply ONLY with a valid JSON object, no other text, in this exact format:
             response = self.client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
-                max_tokens=100,
+                max_tokens=500,
                 temperature=0.2,
+                reasoning_effort="low",
             )
-            raw = response.choices[0].message.content.strip()
+            raw = (response.choices[0].message.content or '').strip()
             raw = raw.replace('```json', '').replace('```', '').strip()
             data = json.loads(raw)
 
