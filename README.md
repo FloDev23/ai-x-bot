@@ -21,6 +21,17 @@ Il bot è passato da "pubblica e basta" a vero agente di crescita:
 Configura i nuovi orari/soglie in `.env` (vedi `.env.example`) e la lista `TARGET_ACCOUNTS`
 per abilitare l'engagement mirato sugli account che ti interessano davvero.
 
+## 🆕 Novità v3.1: character file
+
+- **Persona/contesto in `character.json` (pattern "character file" alla Eliza/ai16z)**
+  — bio, background, knowledge, stile e agenti non sono più stringhe Python
+  hardcoded in `ai_generator.py`, ma vivono in un unico file dichiarativo alla
+  radice del repo: `character.json`. Per cambiare tono, aggiungere conoscenza
+  di dominio o modificare un agente, modifichi quel file, non il codice.
+  - Caricato/parsato da `modules/character.py` (nessuna nuova dipendenza).
+  - Se il file manca o è corrotto, il bot ricade su una persona minima di
+    default e continua a funzionare (non va mai in crash per questo).
+
 ⚠️ **Nota modello Groq**: `mixtral-8x7b-32768` è stato rimosso da Groq. Il default è
 ora `openai/gpt-oss-120b` (configurabile via `GROQ_MODEL` in `.env`).
 
@@ -110,16 +121,18 @@ LIKE_ENGAGEMENT_THRESHOLD=50
 ai-x-bot/
 ├── main.py                    # Entry point del bot
 ├── config.py                  # Configurazione centralizzata
+├── character.json             # Persona/contesto (bio, knowledge, stile, agenti)
 ├── requirements.txt           # Dipendenze Python
-├── .env.example              # Template .env
-├── SETUP.md                  # Guida completa setup
-├── README.md                 # Questo file
+├── .env.example               # Template .env
+├── SETUP.md                   # Guida completa setup
+├── README.md                  # Questo file
 └── modules/
     ├── __init__.py
-    ├── news_fetcher.py       # Fetching notizie
-    ├── ai_generator.py       # Generazione AI
-    ├── twitter_client.py     # Client X/Twitter
-    └── engagement.py         # Engagement manager
+    ├── news_fetcher.py        # Fetching notizie
+    ├── ai_generator.py        # Generazione AI (legge character.json)
+    ├── character.py           # Loader di character.json
+    ├── twitter_client.py      # Client X/Twitter
+    └── engagement.py          # Engagement manager
 ```
 
 ## 🔄 Come Funziona

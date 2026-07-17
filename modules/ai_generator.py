@@ -9,6 +9,10 @@ Cambiamenti principali rispetto alla v1:
   gli argomenti recenti dal database e li evita esplicitamente nel prompt)
 - Nuovo: controllo esplicito se includere il link (il link costa $0.20 invece di
   $0.015 a post sull'API X 2026, quindi va usato solo quando necessario)
+- v3.1 (pattern "character file" alla Eliza/ai16z): persona, agenti, knowledge
+  e mapping categoria->agenti non sono più stringhe hardcoded qui, ma vivono
+  in character.json (root del repo) e vengono costruiti da modules/character.py.
+  Cambiare tono/persona = modificare character.json, non questo file.
 
 NOTA STRATEGICA: su richiesta di Floriano, X è ora dedicato al mercato
 internazionale (gestori di palestre/boutique studio fuori dall'Italia).
@@ -20,60 +24,28 @@ import logging
 import json
 from groq import Groq
 from config import GROQ_API_KEY, GROQ_MODEL, FLEXDROPIN_PLAY_STORE, FLEXDROPIN_APP_STORE, FLEXDROPIN_WEBSITE
+from modules import character as character_module
 from typing import Dict, Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Punto 12: nuova persona. Non più "social media manager" ma founder reale.
-# In inglese: il pubblico target ora sono gestori di palestre/studio fuori Italia.
+# Persona e agenti ora vengono costruiti da character.json (vedi modules/character.py).
+# FOUNDER_PERSONA resta come nome per non rompere il resto del file, ma il suo
+# contenuto è generato dinamicamente dal character file invece di essere hardcoded.
 # ---------------------------------------------------------------------------
-FOUNDER_PERSONA = """You are Floriano, solo founder of FlexDropin, an app that lets people
-book drop-in fitness classes (yoga, crossfit, pilates, functional training...) and helps
-gyms and boutique studios fill empty spots in their classes. You build everything yourself:
-product, marketing, sales. You write on X in first person, as a founder sharing the real
-journey (build in public), not as a social media manager doing promotion.
-Tone: direct, human, occasionally self-deprecating, never full of marketing-speak. You can
-talk about the fitness business, the product, startup life, or just your day as a founder.
+_CHARACTER = character_module.load_character()
+FOUNDER_PERSONA = character_module.build_persona(_CHARACTER)
 
-IMPORTANT: Always write your reply in English (US), regardless of the topic or any other
-language cue in the conversation. Never reply in Italian or any other language."""
 
-# ---------------------------------------------------------------------------
-# Punto 13: Multi-agente. Ogni agente ha un taglio diverso sullo stesso spunto.
-# ---------------------------------------------------------------------------
-AGENTS = {
-    "business_expert": FOUNDER_PERSONA + """
-Write as a fitness business expert: talk about margins, retention, filling classes,
-gym/studio management, drop-in as an extra revenue stream.""",
+def _agent_prompt(agent_name: str) -> str:
+    """Persona + stile specifico di un agente, letto da character.json"""
+    return character_module.build_agent_persona(agent_name, _CHARACTER)
 
-    "fitness_expert": FOUNDER_PERSONA + """
-Write as a fitness enthusiast: talk about training, disciplines, community,
-motivation, no business talk.""",
 
-    "startup_founder": FOUNDER_PERSONA + """
-Write as the founder telling the story of building FlexDropin: bugs fixed,
-hard decisions, numbers, lessons learned, doubts.""",
-
-    "copywriter": FOUNDER_PERSONA + """
-Write extremely concise, high-impact copy, optimized to spark discussion/replies,
-hook-style opening in the first few words.""",
-
-    "community_manager": FOUNDER_PERSONA + """
-Write warm and conversational, like replying to a friend in the fitness community,
-short sentences, light tone.""",
-}
-
-# Quale/i agenti usare per ciascuna categoria del palinsesto (content_scheduler.py)
-CATEGORY_TO_AGENTS = {
-    "business_palestra": ["business_expert", "startup_founder"],
-    "trend_fitness": ["fitness_expert", "copywriter"],
-    "behind_the_scenes": ["startup_founder", "community_manager"],
-    "consiglio_pratico": ["business_expert", "fitness_expert"],
-    "trasparenza": ["startup_founder"],
-    "community": ["community_manager", "fitness_expert"],
-    "human_mode": ["startup_founder"],
-}
+def _category_agents(category: str) -> List[str]:
+    """Agenti da usare per una categoria del palinsesto, letto da character.json"""
+    return character_module.get_category_agents(category, _CHARACTER)
 
 
 def _get_link() -> str:
@@ -139,7 +111,7 @@ class AIGenerator:
         Genera un tweet per una categoria del palinsesto, usando 1-2 agenti e
         scegliendo il migliore. Ritorna un dict {text, agent_used} o None.
         """
-        agent_names = CATEGORY_TO_AGENTS.get(category, ["startup_founder"])
+        agent_names = _category_agents(category)
         recent_topics = recent_topics or []
 
         avoid_block = ""
@@ -162,7 +134,7 @@ class AIGenerator:
 
         candidates = []
         for agent_name in agent_names:
-            system_prompt = AGENTS[agent_name]
+            system_prompt = _agent_prompt(agent_name)
             user_prompt = f"""Write ONE tweet (max 280 characters) for the category "{category}".
 {f'Topic/angle: {topic_hint}' if topic_hint else ''}
 {avoid_block}
