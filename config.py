@@ -17,6 +17,18 @@ GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')
 # (configurabile via env GROQ_MODEL se Groq cambia ancora la lineup):
 GROQ_MODEL = os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')
 
+# ========== Telegram Notifier ==========
+# Notifiche in tempo reale: lead trovati (con bozza di commento/DM pronta),
+# riepilogo azioni dell'engagement mirato (like/follow/commento) ed errori.
+# Se lasciate vuote, il notifier resta disattivato senza rompere il bot.
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+# Punteggio minimo (0-100) di un lead per ricevere la notifica Telegram con
+# bozza di commento/DM. Sotto questa soglia il lead viene comunque salvato
+# nel CRM locale (tabella leads) ma non genera notifica, per non spammarti
+# di lead poco rilevanti e non sprecare chiamate Groq per la bozza.
+LEAD_NOTIFY_MIN_SCORE = int(os.getenv('LEAD_NOTIFY_MIN_SCORE', '40'))
+
 # ========== NewsAPI ==========
 NEWSAPI_KEY = os.getenv('NEWSAPI_KEY', '')
 NEWSAPI_BASE_URL = 'https://newsapi.org/v2'
