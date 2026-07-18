@@ -284,3 +284,25 @@ Reply ONLY with the comment text."""
 
         text = self._complete(FOUNDER_PERSONA, prompt, temperature=0.75)
         return self._truncate(text, 280) if text else None
+
+    def generate_lead_dm(self, tweet_text: str) -> Optional[str]:
+        """
+        Genera una bozza di DM diretto per un lead commerciale reale (punto 19
+        di lead_finder.py): breve, personale, menziona FlexDropin in modo
+        naturale legato al problema espresso nel tweet. Il bot NON invia mai
+        questo DM da solo: è solo una bozza pronta da rivedere e copiare.
+        """
+        prompt = f"""{FOUNDER_PERSONA}
+
+A potential customer wrote this on X:
+"{tweet_text}"
+
+Write a short, friendly direct message (max 300 characters) that acknowledges
+their specific situation and introduces FlexDropin as a possible solution,
+with one clear soft call to action (e.g. "want me to show you how it works?").
+Personal tone, not salesy, no hard pitch.
+
+Reply ONLY with the DM text."""
+
+        text = self._complete(FOUNDER_PERSONA, prompt, temperature=0.7)
+        return self._truncate(text, 500) if text else None
