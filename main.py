@@ -42,8 +42,10 @@ try:
         MAX_FLEXDROPIN_MENTIONS_PER_DAY, MAX_LINKS_PER_WEEK,
         TARGET_ACCOUNTS, HUMAN_MODE_PROBABILITY, SEARCH_TOPICS,
         MAX_COMMENTS_PER_SESSION, MEGA_ACCOUNT_FOLLOWER_THRESHOLD,
+        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, LEAD_NOTIFY_MIN_SCORE,
     )
     from modules.database import Database
+    from modules.notifier import TelegramNotifier
     from modules.content_scheduler import (
         get_categories_for_today, get_seasonal_context, get_active_events,
         pick_category, should_include_link, PROMO_CATEGORIES,
@@ -83,6 +85,7 @@ class FlexDropinGrowthAgent:
             validate_config()
 
             self.db = Database()
+            self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
             self.news_fetcher = NewsFetcher()
             self.ai_generator = AIGenerator()
             self.twitter_client = TwitterClient()
@@ -158,6 +161,7 @@ class FlexDropinGrowthAgent:
 
         except Exception as e:
             logger.error(f"❌ Errore nel ciclo di contenuti: {e}")
+            self.notifier.notify_error("daily_content_cycle", e)
 
     def _get_topic_hint(self, category: str) -> str:
         """Punto 15 (parziale): spunto da news reali per le categorie trend"""
@@ -232,6 +236,7 @@ class FlexDropinGrowthAgent:
                               has_link=False, score_total=None, agent_used='startup_founder')
         except Exception as e:
             logger.error(f"❌ Errore nel ciclo build in public: {e}")
+            self.notifier.notify_error("weekly_build_in_public_cycle", e)
 
     # ------------------------------------------------------------------
     # Ciclo 3: opportunity detector / lead (punto 19)
@@ -239,10 +244,14 @@ class FlexDropinGrowthAgent:
     def opportunity_cycle(self):
         logger.info(f"🎯 Ciclo opportunity detector - {datetime.now()}")
         try:
-            found = self.lead_finder.find_opportunities()
+            found = self.lead_finder.find_opportunities(
+                ai_generator=self.ai_generator, notifier=self.notifier,
+                notify_min_score=LEAD_NOTIFY_MIN_SCORE,
+            )
             logger.info(f"✅ Ciclo opportunity completato: {len(found)} nuovi lead salvati nel CRM locale")
         except Exception as e:
             logger.error(f"❌ Errore nel ciclo opportunity: {e}")
+            self.notifier.notify_error("opportunity_cycle", e)
 
     # ------------------------------------------------------------------
     # Ciclo 4: engagement mirato su account curati (punti 7, 8, 9)
@@ -250,9 +259,10 @@ class FlexDropinGrowthAgent:
     def targeted_engagement_cycle(self):
         logger.info(f"💬 Ciclo engagement mirato - {datetime.now()}")
         try:
-            self.engagement_manager.run_targeted_engagement()
+            self.engagement_manager.run_targeted_engagement(notifier=self.notifier)
         except Exception as e:
             logger.error(f"❌ Errore nel ciclo di engagement mirato: {e}")
+            self.notifier.notify_error("targeted_engagement_cycle", e)
 
     # ------------------------------------------------------------------
     # Ciclo 5: performance analytics / auto-learning (punto 2)
@@ -268,6 +278,7 @@ class FlexDropinGrowthAgent:
                             ", ".join(f"{r['category']} ({r['ctr']}%)" for r in ranking))
         except Exception as e:
             logger.error(f"❌ Errore nel ciclo di performance: {e}")
+            self.notifier.notify_error("performance_cycle", e)
 
     # ------------------------------------------------------------------
     # Setup account target curati (una tantum / settimanale)
