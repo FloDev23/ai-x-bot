@@ -120,10 +120,14 @@ class EngagementManager:
             )
             logger.info(f"👤 Target aggiornato: @{username} → score {score}/100")
 
-    def run_targeted_engagement(self, max_targets: int = 5):
+    def run_targeted_engagement(self, max_targets: int = 5, notifier=None):
         """
         Cicla sui migliori account target curati (punto 7), decide l'azione
         (punto 8) e la esegue rispettando le regole anti-spam (punto 9).
+
+        Se notifier è passato, invia a fine ciclo un riepilogo Telegram con
+        ogni azione eseguita (Like / Like+Follow / Retweet con commento) e il
+        link diretto al tweet/profilo interessato.
         """
         targets = self.db.get_top_targets(limit=max_targets)
         if not targets:
@@ -131,6 +135,7 @@ class EngagementManager:
                         "e chiama sync_target_accounts().")
             return
 
+        actions_taken = []
         comments_made = 0
         for target in targets:
             username = target['username']
@@ -146,6 +151,9 @@ class EngagementManager:
             )
             logger.info(f"🎯 @{username} (score {target['score']}, follower {target.get('follower_count', 0)}) "
                         f"→ azione: {action}")
+            actions_taken.append({
+                'username': username, 'action': action, 'tweet_id': latest_tweet['id'],
+            })
 
             if action == "Ignora":
                 continue
@@ -169,3 +177,5 @@ class EngagementManager:
             self.db.mark_target_interacted(username)
 
         logger.info(f"✅ Ciclo engagement mirato completato: {comments_made} commenti pubblicati")
+        if notifier:
+            notifier.notify_engagement_summary(actions_taken)
