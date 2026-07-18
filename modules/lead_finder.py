@@ -44,10 +44,16 @@ class LeadFinder:
         self.model = model
         self.db = db
 
-    def find_opportunities(self, max_per_keyword: int = 10) -> List[Dict]:
+    def find_opportunities(self, max_per_keyword: int = 10, ai_generator=None,
+                            notifier=None, notify_min_score: int = 40) -> List[Dict]:
         """
         Esegue ricerche mirate (poche, non a strascico) sulle keyword ad alto
         valore commerciale. Da chiamare 2-3 volte al giorno, non ogni 30 minuti.
+
+        Se ai_generator e notifier sono passati, per ogni lead con score >=
+        notify_min_score e azione diversa da "Ignora" viene generata una bozza
+        di commento/DM pronta e inviata su Telegram (nessuna azione viene mai
+        eseguita in automatico su X: solo notifica + bozza).
         """
         found = []
         for keyword in PROBLEM_KEYWORDS:
@@ -66,11 +72,23 @@ class LeadFinder:
                     matched_keyword=keyword,
                     action_suggested=action,
                 )
-                found.append({
+                lead = {
                     'tweet_id': tweet['id'], 'text': tweet['text'],
                     'score': score, 'action': action, 'keyword': keyword,
-                })
+                    'author_username': tweet.get('author_username', ''),
+                }
+                found.append(lead)
                 logger.info(f"🎯 Lead trovato (score {score}/100, azione: {action}): {tweet['text'][:60]}...")
+
+                if notifier and score >= notify_min_score and action != "Ignora":
+                    suggested_text = None
+                    if ai_generator and action in ("Commenta", "Commenta+DM"):
+                        suggested_text = ai_generator.generate_flexdropin_comment(
+                            tweet['text'], promotional=True
+                        )
+                    elif ai_generator and action == "DM":
+                        suggested_text = ai_generator.generate_lead_dm(tweet['text'])
+                    notifier.notify_lead(lead, suggested_text=suggested_text)
 
         return found
 
