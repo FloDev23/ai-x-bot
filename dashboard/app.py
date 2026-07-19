@@ -22,11 +22,17 @@ from flask import Flask, render_template, request, redirect, url_for
 
 # Permette di importare modules.database anche eseguendo questo file
 # direttamente dalla cartella dashboard/
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 from modules.database import Database  # noqa: E402
 
 app = Flask(__name__)
-db = Database()
+# IMPORTANTE: Database() usa di default un percorso relativo ('bot_data.db').
+# La dashboard gira con WorkingDirectory=.../dashboard, quindi un percorso
+# relativo creerebbe/leggerebbe un DB vuoto dentro dashboard/ invece del
+# database reale del bot in REPO_ROOT. Lo forziamo esplicitamente qui.
+BOT_DB_PATH = str(REPO_ROOT / "bot_data.db")
+db = Database(db_path=BOT_DB_PATH)
 
 SERVICE_NAME = os.getenv("BOT_SERVICE_NAME", "flexdropin-bot")
 
