@@ -23,7 +23,7 @@ resta presidiato via Instagram e visite di persona (fuori da questo bot).
 import logging
 import json
 from groq import Groq
-from config import GROQ_API_KEY, GROQ_MODEL, FLEXDROPIN_PLAY_STORE, FLEXDROPIN_APP_STORE, FLEXDROPIN_WEBSITE
+from config import GROQ_API_KEY, GROQ_MODEL, GROQ_VISION_MODEL, FLEXDROPIN_PLAY_STORE, FLEXDROPIN_APP_STORE, FLEXDROPIN_WEBSITE
 from modules import character as character_module
 from typing import Dict, Optional, List, Tuple
 
@@ -106,10 +106,15 @@ class AIGenerator:
                         recent_topics: Optional[List[str]] = None,
                         include_link: bool = False,
                         event_context: Optional[List[str]] = None,
-                        seasonal_context: Optional[str] = None) -> Optional[Dict]:
+                        seasonal_context: Optional[str] = None,
+                        media_description: Optional[str] = None) -> Optional[Dict]:
         """
         Genera un tweet per una categoria del palinsesto, usando 1-2 agenti e
         scegliendo il migliore. Ritorna un dict {text, agent_used} o None.
+
+        Se media_description è passato (perché è già stato scelto un media
+        dalla libreria per questo post), il testo viene scritto per
+        accompagnare quell'immagine/video in modo naturale, non a caso.
         """
         agent_names = _category_agents(category)
         recent_topics = recent_topics or []
@@ -125,6 +130,14 @@ class AIGenerator:
         if seasonal_context:
             context_block += f"\nSeasonal context: {seasonal_context}."
 
+        media_block = ""
+        if media_description:
+            media_block = (
+                f"\nThis tweet will be posted together with an image/video showing: "
+                f"\"{media_description}\". Write the text so it pairs naturally with what's "
+                f"shown (reference or build on it, don't just caption it literally)."
+            )
+
         link_instruction = (
             f"Naturally include the link {_get_link()} as a call-to-action."
             if include_link else
@@ -139,6 +152,7 @@ class AIGenerator:
 {f'Topic/angle: {topic_hint}' if topic_hint else ''}
 {avoid_block}
 {context_block}
+{media_block}
 {link_instruction}
 
 Reply ONLY with the tweet text, no quotes, no explanations."""
@@ -306,3 +320,102 @@ Reply ONLY with the DM text."""
 
         text = self._complete(FOUNDER_PERSONA, prompt, temperature=0.7)
         return self._truncate(text, 500) if text else None
+
+    def analyze_image(self, image_path: str) -> Optional[Dict]:
+        """
+        Analizza un'immagine (o un frame estratto da un video) per la
+        libreria media: descrizione, categoria suggerita, tag e una bozza
+        di didascalia in italiano nel tono di Floriano. Usa un modello Groq
+        con supporto vision (vedi GROQ_VISION_MODEL in config.py).
+
+        Ritorna None se l'analisi fallisce: il file viene comunque
+        registrato nella libreria (categoria 'other', da rivedere a mano
+        nella dashboard) invece di bloccare l'upload.
+        """
+        import base64
+        import json
+
+        try:
+            with open(image_path, 'rb') as f:
+                b64 = base64.b64encode(f.read()).decode('utf-8')
+            ext = image_path.rsplit('.', 1)[-1].lower()
+            mime = 'image/png' if ext == 'png' else 'image/jpeg'
+
+            prompt = """Analyze this image for a FlexDropin social media post
+(FlexDropin is a drop-in fitness class booking app for gyms and studios).
+
+Reply ONLY with a JSON object, no other text, no markdown code fences,
+with exactly this structure:
+{"description": "1-2 sentences in English describing what's in the image",
+ "category": "gym_visit|app_demo|behind_scenes|community|other",
+ "tags": ["tag1", "tag2", "tag3"],
+ "caption_it": "a short caption in Italian, direct and self-deprecating tone, suitable to accompany this image in a post"}
+
+Pick "category" as the single best fit from the list."""
+
+            response = self.client.chat.completions.create(
+                model=GROQ_VISION_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                    ],
+                }],
+                max_tokens=400,
+                temperature=0.4,
+            )
+            raw = (response.choices[0].message.content or '').strip()
+            raw = raw.replace('```json', '').replace('```', '').strip()
+            return json.loads(raw)
+        except Exception as e:
+            logger.error(f"❌ Errore analisi immagine ({image_path}): {e}")
+            return None
+
+    def select_best_media(self, category: str, topic_hint: str,
+                           candidates: List[Dict]) -> Optional[int]:
+        """
+        Sceglie, tra i media non ancora usati, quello più adatto al post di
+        OGGI in base al contenuto (categoria + argomento) — non il più
+        vecchio. Ragiona sulle descrizioni già prodotte dall'analisi vision
+        al momento dell'upload, non rianalizza le immagini.
+
+        Ritorna l'id del media scelto, o None se nessuno è genuinamente
+        adatto: in quel caso il post resta solo testo, non forziamo mai un
+        abbinamento casuale pur di allegare qualcosa.
+        """
+        if not candidates:
+            return None
+
+        options_block = "\n".join(
+            f'- id {c["id"]}: type={c["media_type"]}, category={c["category"]}, '
+            f'description="{c["ai_description"] or "n/a"}", tags={c["ai_tags"] or "n/a"}'
+            for c in candidates
+        )
+
+        prompt = f"""You're picking which photo/video should accompany a social media post
+for FlexDropin (a drop-in fitness class booking app).
+
+Today's post:
+- category: "{category}"
+- topic/angle: "{topic_hint or 'general'}"
+
+Available unused media in the library:
+{options_block}
+
+Pick the id of the single best-matching media for THIS post's topic, based
+on its description/tags. If nothing genuinely fits well, don't force it.
+
+Reply ONLY with a JSON object, no other text: {{"media_id": <id or null>}}"""
+
+        raw = self._complete(FOUNDER_PERSONA, prompt, max_tokens=100, temperature=0.2)
+        if not raw:
+            return None
+        try:
+            raw_clean = raw.strip().replace('```json', '').replace('```', '').strip()
+            data = json.loads(raw_clean)
+            media_id = data.get('media_id')
+            return int(media_id) if media_id else None
+        except Exception as e:
+            logger.warning(f"⚠️ Impossibile interpretare la scelta media dell'AI (raw: {raw[:150]}): {e}")
+            return None

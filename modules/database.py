@@ -135,6 +135,32 @@ class Database:
                 )
             """)
 
+            # Libreria media (foto/video caricati da Floriano, analizzati
+            # dall'AI e usati una sola volta ciascuno nei post)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS media_library (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    filepath TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    category TEXT DEFAULT 'other',
+                    ai_description TEXT,
+                    ai_tags TEXT,
+                    uploaded_at TEXT DEFAULT (datetime('now')),
+                    used INTEGER DEFAULT 0,
+                    used_at TEXT,
+                    used_in_tweet_id TEXT,
+                    file_deleted INTEGER DEFAULT 0
+                )
+            """)
+            # Migrazione per database creati prima dell'introduzione di
+            # file_deleted (il file viene rimosso dal disco dopo l'uso per
+            # risparmiare spazio, ma il record resta per lo storico)
+            try:
+                c.execute("ALTER TABLE media_library ADD COLUMN file_deleted INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # colonna già presente
+
             conn.commit()
         logger.info("✅ Database inizializzato (bot_data.db)")
 
@@ -391,3 +417,84 @@ class Database:
         for r in rows:
             hashtags += [w for w in r['text'].split() if w.startswith('#')]
         return hashtags
+
+    # ---------- Libreria media (foto/video reali per i post) ----------
+
+    def add_media(self, filename: str, filepath: str, media_type: str,
+                  category: str = 'other', ai_description: str = '',
+                  ai_tags: str = '') -> int:
+        with self._conn() as conn:
+            cur = conn.execute("""
+                INSERT INTO media_library (filename, filepath, media_type, category, ai_description, ai_tags)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (filename, filepath, media_type, category, ai_description, ai_tags))
+            return cur.lastrowid
+
+    def get_media_by_id(self, media_id: int) -> Optional[Dict]:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM media_library WHERE id = ?", (media_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_unused_media(self, category: Optional[str] = None, limit: int = 20) -> List[Dict]:
+        """
+        Media non ancora usati. Se category è specificata, filtra su
+        quella. Usato principalmente come base per get_unused_media_pool;
+        la scelta finale di QUALE media usare non è più FIFO ma affidata
+        all'AI (vedi AIGenerator.select_best_media in main.py).
+        """
+        with self._conn() as conn:
+            if category:
+                rows = conn.execute("""
+                    SELECT * FROM media_library WHERE used = 0 AND category = ?
+                    ORDER BY uploaded_at ASC LIMIT ?
+                """, (category, limit)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM media_library WHERE used = 0
+                    ORDER BY uploaded_at ASC LIMIT ?
+                """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_unused_media_pool(self, limit: int = 15) -> List[Dict]:
+        """
+        Pool di candidati non ancora usati da sottoporre all'AI per la
+        scelta del media più adatto al post di oggi. Il limite serve solo a
+        contenere la dimensione del prompt, non è un criterio di scelta:
+        la selezione vera e propria è per contenuto, non per data.
+        """
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM media_library WHERE used = 0 ORDER BY uploaded_at ASC LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_all_media(self, limit: int = 300) -> List[Dict]:
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM media_library ORDER BY uploaded_at DESC LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_media_used(self, media_id: int, tweet_id: str = ''):
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE media_library SET used = 1, used_at = ?, used_in_tweet_id = ? WHERE id = ?
+            """, (datetime.now().isoformat(), tweet_id, media_id))
+
+    def mark_media_file_deleted(self, media_id: int):
+        """Segna che il file fisico è stato rimosso dal disco per risparmiare
+        spazio (il record resta nel DB come storico/audit)."""
+        with self._conn() as conn:
+            conn.execute("UPDATE media_library SET file_deleted = 1 WHERE id = ?", (media_id,))
+
+    def update_media(self, media_id: int, category: Optional[str] = None,
+                      ai_description: Optional[str] = None):
+        with self._conn() as conn:
+            if category is not None:
+                conn.execute("UPDATE media_library SET category = ? WHERE id = ?", (category, media_id))
+            if ai_description is not None:
+                conn.execute("UPDATE media_library SET ai_description = ? WHERE id = ?", (ai_description, media_id))
+
+    def delete_media(self, media_id: int):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM media_library WHERE id = ?", (media_id,))

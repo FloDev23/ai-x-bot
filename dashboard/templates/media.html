@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% set active = "media" %}
+{% block title %}Media{% endblock %}
+
+{% block content %}
+<h1 class="page-title">Libreria media</h1>
+<p class="page-sub">Carica foto e video reali: l'AI li analizza, li categorizza e propone una didascalia. Ogni file viene usato una sola volta nei post, poi resta segnato come "usato".</p>
+
+<div class="section" style="margin-bottom: 20px;">
+  <div class="section-header">
+    <span class="section-title">Carica nuovo file</span>
+  </div>
+  <form method="post" action="{{ url_for('media_upload') }}" enctype="multipart/form-data" style="padding: 18px; display: flex; gap: 12px; align-items: center;">
+    <input type="file" name="file" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,.m4v" required>
+    <button class="btn" type="submit" style="background: var(--teal-dim); color: var(--teal); border-color: transparent;">Carica e analizza</button>
+  </form>
+</div>
+
+<div class="filters">
+  <a class="filter-chip {{ 'active' if status_filter == 'tutti' }}" href="{{ url_for('media_view', status='tutti') }}">Tutti</a>
+  <a class="filter-chip {{ 'active' if status_filter == 'non_usati' }}" href="{{ url_for('media_view', status='non_usati') }}">Non usati</a>
+  <a class="filter-chip {{ 'active' if status_filter == 'usati' }}" href="{{ url_for('media_view', status='usati') }}">Usati</a>
+</div>
+
+{% if items %}
+<div class="media-grid">
+  {% for m in items %}
+  <div class="media-card">
+    <div class="media-thumb">
+      {% if m.file_deleted %}
+        <div class="media-thumb-placeholder">🗑️<br>File eliminato<br><span class="mono">(usato, spazio liberato)</span></div>
+      {% elif m.media_type == 'video' %}
+        <video src="{{ url_for('media_file', filename=m.filename) }}" controls preload="metadata"></video>
+      {% else %}
+        <img src="{{ url_for('media_file', filename=m.filename) }}" alt="{{ m.filename }}">
+      {% endif %}
+    </div>
+    <div class="media-body">
+      <div class="media-top-row">
+        <span class="pill pill-{{ 'gestito' if m.used else 'nuovo' }}">{{ "usato" if m.used else "non usato" }}</span>
+        <span class="pill pill-ignora">{{ m.media_type }}</span>
+      </div>
+      <div class="media-filename mono">{{ m.filename }}</div>
+      {% if m.ai_description %}<div class="media-desc">{{ m.ai_description }}</div>{% endif %}
+      {% if m.used_in_tweet_id %}
+        <a class="link-icon" href="https://x.com/i/status/{{ m.used_in_tweet_id }}" target="_blank" rel="noopener">↗ usato in questo tweet</a>
+      {% endif %}
+
+      <form method="post" action="{{ url_for('media_update', media_id=m.id) }}" class="media-edit-form">
+        <select name="category">
+          {% for cat in ["gym_visit", "app_demo", "behind_scenes", "community", "other"] %}
+          <option value="{{ cat }}" {{ "selected" if m.category == cat }}>{{ cat }}</option>
+          {% endfor %}
+        </select>
+        <input type="text" name="ai_description" value="{{ m.ai_description or '' }}" placeholder="Descrizione...">
+        <button class="btn" type="submit">Salva</button>
+      </form>
+
+      <form method="post" action="{{ url_for('media_delete', media_id=m.id) }}" onsubmit="return confirm('Eliminare definitivamente questo file?');">
+        <button class="btn" type="submit" style="color: var(--red);">Elimina</button>
+      </form>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="section"><div class="empty-state">Nessun file in libreria. Caricane uno qui sopra per iniziare.</div></div>
+{% endif %}
+{% endblock %}

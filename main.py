@@ -27,9 +27,11 @@ per contenere il costo delle letture/post a pagamento. Vedi config.py.
 """
 
 import logging
+import os
 import random
 import sys
 from datetime import datetime
+from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -116,10 +118,12 @@ class FlexDropinGrowthAgent:
         try:
             # Punto 5: ogni tanto, invece del palinsesto, un post "umano"
             if random.random() < HUMAN_MODE_PROBABILITY:
+                media = self._pick_media_for_post('human_mode', 'human_mode')
                 text = self.ai_generator.generate_human_mode_post()
                 if text:
                     self._publish(text, category='human_mode', topic='human_mode',
-                                   has_link=False, score_total=None, agent_used='human_mode')
+                                   has_link=False, score_total=None, agent_used='human_mode',
+                                   media=media)
                 return
 
             recent_topics = self.db.get_recent_topics(days=3)
@@ -148,16 +152,24 @@ class FlexDropinGrowthAgent:
             event_context = get_active_events()
             seasonal_context = get_seasonal_context()
 
+            # Scegliamo il media PRIMA di scrivere il testo, così se ne trova
+            # uno adatto il testo può essere scritto per accompagnarlo
+            # davvero, invece di limitarsi ad allegarlo dopo a un post scritto
+            # a prescindere.
+            media = self._pick_media_for_post(category, topic_hint)
+            media_description = media['ai_description'] if media else None
+
             text, agent_used, scores = self._generate_and_score(
                 category, topic_hint, recent_topics, include_link,
-                event_context, seasonal_context
+                event_context, seasonal_context, media_description=media_description,
             )
             if not text:
                 logger.warning("⚠️ Nessun tweet generato/approvato in questo ciclo, salto la pubblicazione")
                 return
 
             self._publish(text, category=category, topic=topic_hint, has_link=include_link,
-                           score_total=scores.get('totale') if scores else None, agent_used=agent_used)
+                           score_total=scores.get('totale') if scores else None, agent_used=agent_used,
+                           media=media)
 
         except Exception as e:
             logger.error(f"❌ Errore nel ciclo di contenuti: {e}")
@@ -177,7 +189,7 @@ class FlexDropinGrowthAgent:
             return ''
 
     def _generate_and_score(self, category, topic_hint, recent_topics, include_link,
-                             event_context, seasonal_context):
+                             event_context, seasonal_context, media_description=None):
         """Genera un tweet e lo rigenera se sotto soglia di qualità (punto 3)"""
         attempts = 0
         last_scores = None
@@ -186,7 +198,7 @@ class FlexDropinGrowthAgent:
             candidate = self.ai_generator.generate_tweet(
                 category=category, topic_hint=topic_hint, recent_topics=recent_topics,
                 include_link=include_link, event_context=event_context,
-                seasonal_context=seasonal_context,
+                seasonal_context=seasonal_context, media_description=media_description,
             )
             if not candidate:
                 attempts += 1
@@ -209,8 +221,28 @@ class FlexDropinGrowthAgent:
             return candidate['text'], candidate['agent_used'], last_scores
         return None, None, None
 
-    def _publish(self, text, category, topic, has_link, score_total, agent_used):
-        result = self.twitter_client.post_tweet(text)
+    def _pick_media_for_post(self, category: str, topic_hint: str = '') -> Optional[dict]:
+        """
+        Sceglie il media più adatto AL CONTENUTO del post di oggi (non il
+        più vecchio): prende il pool di media non ancora usati e lascia che
+        l'AI ragioni sulle loro descrizioni per trovare il migliore
+        abbinamento con categoria/argomento di oggi. Se nessuno è adatto,
+        ritorna None e il post resta solo testo — non forziamo mai un
+        abbinamento a caso pur di allegare qualcosa.
+        """
+        candidates = self.db.get_unused_media_pool(limit=15)
+        if not candidates:
+            return None
+        media_id = self.ai_generator.select_best_media(category, topic_hint, candidates)
+        if not media_id:
+            return None
+        return self.db.get_media_by_id(media_id)
+
+    def _publish(self, text, category, topic, has_link, score_total, agent_used, media=None):
+        media_path = media['filepath'] if media else None
+        media_type = media['media_type'] if media else 'image'
+
+        result = self.twitter_client.post_tweet(text, media_path=media_path, media_type=media_type)
         if not result or not getattr(result, 'data', None):
             logger.error(f"❌ Pubblicazione fallita [{category}/{agent_used}]: {text[:80]}...")
             return
@@ -220,6 +252,18 @@ class FlexDropinGrowthAgent:
             text=text, category=category, topic=topic, tweet_id=tweet_id,
             has_link=has_link, score_total=score_total, agent_used=agent_used,
         )
+        if media:
+            self.db.mark_media_used(media['id'], tweet_id)
+            # Il file fisico viene rimosso dal disco per risparmiare spazio:
+            # il record nel DB resta (storico/audit visibile in dashboard),
+            # solo il file viene eliminato una volta pubblicato con successo.
+            try:
+                if os.path.exists(media['filepath']):
+                    os.remove(media['filepath'])
+                    self.db.mark_media_file_deleted(media['id'])
+                    logger.info(f"🗑️ Media usato e rimosso dal disco: {media['filename']}")
+            except OSError as e:
+                logger.warning(f"⚠️ Impossibile eliminare il file media {media['filepath']}: {e}")
         logger.info(f"✅ Tweet pubblicato [{category}/{agent_used}]: {text[:80]}...")
 
     # ------------------------------------------------------------------
@@ -232,8 +276,10 @@ class FlexDropinGrowthAgent:
             highlights = recent if recent else []
             text = self.ai_generator.generate_build_in_public_post(highlights)
             if text:
+                media = self._pick_media_for_post('build_in_public', 'weekly_recap')
                 self._publish(text, category='build_in_public', topic='weekly_recap',
-                              has_link=False, score_total=None, agent_used='startup_founder')
+                              has_link=False, score_total=None, agent_used='startup_founder',
+                              media=media)
         except Exception as e:
             logger.error(f"❌ Errore nel ciclo build in public: {e}")
             self.notifier.notify_error("weekly_build_in_public_cycle", e)
