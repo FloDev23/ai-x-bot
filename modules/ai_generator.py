@@ -294,6 +294,11 @@ Read this tweet:
 Write a short comment (max 200 characters), polite, that adds real value to
 the conversation. {promo_line}
 
+IMPORTANT: only reference facts/details actually stated in the tweet. Do
+NOT invent or assume specifics the person didn't write (e.g. don't claim
+they mentioned a specific problem if they didn't). If the tweet itself is
+vague, keep your comment equally general instead of making things up.
+
 Reply ONLY with the comment text."""
 
         text = self._complete(FOUNDER_PERSONA, prompt, temperature=0.75)
@@ -315,6 +320,12 @@ Write a short, friendly direct message (max 300 characters) that acknowledges
 their specific situation and introduces FlexDropin as a possible solution,
 with one clear soft call to action (e.g. "want me to show you how it works?").
 Personal tone, not salesy, no hard pitch.
+
+CRITICAL: only reference what the tweet ACTUALLY says. Do not invent details,
+problems, or context the person didn't write (no fabricated specifics like
+"empty class spots" or "extra admin work" unless those exact concerns are in
+the tweet). If the tweet doesn't give you much to work with, write a shorter,
+more general opener instead of making up a backstory.
 
 Reply ONLY with the DM text."""
 
