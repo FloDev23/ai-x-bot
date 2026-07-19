@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% set active = "overview" %}
+{% block title %}Panoramica{% endblock %}
+
+{% block content %}
+<h1 class="page-title">Panoramica</h1>
+<p class="page-sub">Cosa ha deciso e fatto il bot di recente, in un colpo d'occhio.</p>
+
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="stat-value">{{ stats.leads_nuovi }}</div>
+    <div class="stat-label">Lead da rivedere</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{ stats.targets_attivi }}</div>
+    <div class="stat-label">Account target curati</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{ stats.post_totali }}</div>
+    <div class="stat-label">Post pubblicati</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value" style="color: {{ 'var(--red)' if stats.errori_recenti else 'var(--teal)' }};">{{ stats.errori_recenti }}</div>
+    <div class="stat-label">Errori recenti</div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <span class="section-title">Ultimi lead</span>
+    <a class="section-link" href="{{ url_for('leads_view') }}">Vedi tutti →</a>
+  </div>
+  {% if leads %}
+  <div class="trail">
+    {% for l in leads %}
+    <div class="trail-row">
+      <span class="trail-score {{ 'hi' if l.score >= 70 else ('mid' if l.score >= 40 else '') }}">{{ l.score }}</span>
+      <span class="trail-arrow">→</span>
+      {% if l.action_suggested == 'Ignora' %}
+        <span class="pill pill-ignora">Ignora</span>
+      {% elif 'DM' in l.action_suggested %}
+        <span class="pill pill-dm">{{ l.action_suggested }}</span>
+      {% elif 'Commenta' in l.action_suggested %}
+        <span class="pill pill-comment">{{ l.action_suggested }}</span>
+      {% else %}
+        <span class="pill pill-like">{{ l.action_suggested }}</span>
+      {% endif %}
+      <span class="trail-text">@{{ l.author_username }} — {{ l.text }}</span>
+      <a class="link-icon" href="https://x.com/{{ l.author_username }}/status/{{ l.tweet_id }}" target="_blank" rel="noopener">↗ tweet</a>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">Nessun lead ancora trovato dall'opportunity detector.</div>
+  {% endif %}
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <span class="section-title">Engagement — top account target</span>
+    <a class="section-link" href="{{ url_for('engagement_view') }}">Vedi tutti →</a>
+  </div>
+  {% if targets %}
+  <div class="trail">
+    {% for t in targets %}
+    <div class="trail-row">
+      <span class="trail-score {{ 'hi' if t.score >= 70 else ('mid' if t.score >= 40 else '') }}">{{ t.score }}</span>
+      <span class="trail-arrow">→</span>
+      <span class="trail-account">@{{ t.username }}</span>
+      <span class="trail-text mono">{{ t.follower_count }} follower · ultima interazione {{ t.last_interacted or "mai" }}</span>
+      <a class="link-icon" href="https://x.com/{{ t.username }}" target="_blank" rel="noopener">↗ profilo</a>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">Nessun account target sincronizzato ancora.</div>
+  {% endif %}
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <span class="section-title">Errori recenti</span>
+    <a class="section-link" href="{{ url_for('logs_view') }}?errors=1">Vedi log completi →</a>
+  </div>
+  {% if errors %}
+  <div class="log-console" style="max-height: 240px;">{% for e in errors %}<div class="log-line-error">{{ e }}</div>{% endfor %}</div>
+  {% else %}
+  <div class="empty-state">Nessun errore nelle ultime righe di log. ✅</div>
+  {% endif %}
+</div>
+{% endblock %}

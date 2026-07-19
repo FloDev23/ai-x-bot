@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% set active = "engagement" %}
+{% block title %}Engagement{% endblock %}
+
+{% block content %}
+<h1 class="page-title">Account target curati</h1>
+<p class="page-sub">Chi sincronizza il bot per il ciclo di engagement mirato (like / follow / commento), ordinati per punteggio d'influenza.</p>
+
+<div class="section">
+  {% if targets %}
+  <table>
+    <thead>
+      <tr>
+        <th>Score</th>
+        <th>Account</th>
+        <th>Categoria</th>
+        <th>Follower</th>
+        <th>Verificato</th>
+        <th>Ultima interazione</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in targets %}
+      <tr>
+        <td><span class="trail-score {{ 'hi' if t.score >= 70 else ('mid' if t.score >= 40 else '') }}">{{ t.score }}</span></td>
+        <td><a class="link-icon" href="https://x.com/{{ t.username }}" target="_blank" rel="noopener">@{{ t.username }}</a></td>
+        <td class="metric">{{ t.category or "—" }}</td>
+        <td class="metric">{{ "{:,}".format(t.follower_count) }}</td>
+        <td class="metric">{{ "✓" if t.verified else "—" }}</td>
+        <td class="metric">{{ t.last_interacted or "mai" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty-state">
+    Nessun account target ancora sincronizzato.<br>
+    Configura <span class="mono">TARGET_ACCOUNTS</span> nel <span class="mono">.env</span> e attendi il prossimo sync automatico.
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

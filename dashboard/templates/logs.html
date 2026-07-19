@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% set active = "logs" %}
+{% block title %}Log{% endblock %}
+
+{% block content %}
+<h1 class="page-title">Log del servizio</h1>
+<p class="page-sub">Ultime righe di <span class="mono">journalctl -u {{ service }}</span>. Ricarica la pagina per aggiornare.</p>
+
+<div class="filters">
+  <a class="filter-chip {{ 'active' if not only_errors }}" href="{{ url_for('logs_view') }}">Tutte le righe</a>
+  <a class="filter-chip {{ 'active' if only_errors }}" href="{{ url_for('logs_view') }}?errors=1">Solo errori</a>
+</div>
+
+<div class="log-console">
+{% for line in logs %}{% if "❌" in line or "🚨" in line or "ERROR" in line or "Errore" in line %}<div class="log-line-error">{{ line }}</div>{% else %}<div class="log-line-normal">{{ line }}</div>{% endif %}{% endfor %}
+{% if not logs %}<div class="log-line-normal">Nessun log disponibile.</div>{% endif %}
+</div>
+{% endblock %}

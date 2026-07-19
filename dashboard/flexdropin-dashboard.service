@@ -1,0 +1,18 @@
+[Unit]
+Description=Dashboard di sola lettura per flexdropin-bot
+After=network.target flexdropin-bot.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/home/ubuntu/ai-x-bot/dashboard
+ExecStart=/usr/bin/python3 /home/ubuntu/ai-x-bot/dashboard/app.py
+Environment=BOT_SERVICE_NAME=flexdropin-bot
+Environment=DASHBOARD_PORT=5050
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

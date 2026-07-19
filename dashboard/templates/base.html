@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}flexdropin-bot{% endblock %} · Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="layout">
+    <nav class="sidebar">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <div>
+          <div class="brand-name">flexdropin-bot</div>
+          <div class="brand-sub">{{ service }}</div>
+        </div>
+      </div>
+
+      <a class="nav-link {{ 'active' if active == 'overview' }}" href="{{ url_for('overview') }}">Panoramica</a>
+      <a class="nav-link {{ 'active' if active == 'leads' }}" href="{{ url_for('leads_view') }}">Lead</a>
+      <a class="nav-link {{ 'active' if active == 'engagement' }}" href="{{ url_for('engagement_view') }}">Engagement</a>
+      <a class="nav-link {{ 'active' if active == 'posts' }}" href="{{ url_for('posts_view') }}">Post</a>
+      <a class="nav-link {{ 'active' if active == 'logs' }}" href="{{ url_for('logs_view') }}">Log</a>
+
+      <div class="sidebar-footer">Accesso solo via SSH tunnel<br>127.0.0.1:5050</div>
+    </nav>
+
+    <main class="main">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

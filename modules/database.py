@@ -199,6 +199,23 @@ class Database:
             """, (limit,)).fetchall()
             return [r['tweet_id'] for r in rows]
 
+    def get_recent_posts(self, limit: int = 30) -> List[Dict]:
+        """
+        Post pubblicati con le relative metriche (se già raccolte dal ciclo
+        di performance). Per la dashboard: LEFT JOIN così un post compare
+        anche prima che le metriche vengano lette la prima volta.
+        """
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT p.id, p.tweet_id, p.text, p.category, p.topic, p.has_link,
+                       p.score_total, p.agent_used, p.created_at,
+                       m.impressions, m.likes, m.retweets, m.replies, m.bookmarks
+                FROM posted_tweets p
+                LEFT JOIN tweet_metrics m ON m.tweet_id = p.tweet_id
+                ORDER BY p.created_at DESC LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
     # ---------- Ideas database ----------
 
     def add_idea(self, idea: str, categoria: str, priorita: int = 5):
@@ -249,6 +266,14 @@ class Database:
                 SELECT * FROM leads WHERE status = 'nuovo' AND score >= ?
                 ORDER BY score DESC LIMIT ?
             """, (min_score, limit)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_all_leads(self, limit: int = 200) -> List[Dict]:
+        """Tutti i lead (qualsiasi stato), più recenti prima. Per la dashboard."""
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM leads ORDER BY created_at DESC LIMIT ?
+            """, (limit,)).fetchall()
             return [dict(r) for r in rows]
 
     def update_lead_status(self, lead_id: int, status: str):

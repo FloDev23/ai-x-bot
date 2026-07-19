@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% set active = "leads" %}
+{% block title %}Lead{% endblock %}
+
+{% block content %}
+<h1 class="page-title">Lead commerciali</h1>
+<p class="page-sub">Ogni riga è un tweet trovato dall'opportunity detector: punteggio, azione suggerita, bozza pronta al clic sul link.</p>
+
+<div class="filters">
+  <a class="filter-chip {{ 'active' if status_filter == 'tutti' }}" href="{{ url_for('leads_view', status='tutti') }}">Tutti</a>
+  <a class="filter-chip {{ 'active' if status_filter == 'nuovo' }}" href="{{ url_for('leads_view', status='nuovo') }}">Nuovi</a>
+  <a class="filter-chip {{ 'active' if status_filter == 'gestito' }}" href="{{ url_for('leads_view', status='gestito') }}">Gestiti</a>
+  <a class="filter-chip {{ 'active' if status_filter == 'ignorato' }}" href="{{ url_for('leads_view', status='ignorato') }}">Ignorati</a>
+</div>
+
+<div class="section">
+  {% if leads %}
+  <table>
+    <thead>
+      <tr>
+        <th>Score</th>
+        <th>Account</th>
+        <th>Tweet</th>
+        <th>Keyword</th>
+        <th>Azione suggerita</th>
+        <th>Stato</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for l in leads %}
+      <tr>
+        <td><span class="trail-score {{ 'hi' if l.score >= 70 else ('mid' if l.score >= 40 else '') }}">{{ l.score }}</span></td>
+        <td>
+          <a class="link-icon" href="https://x.com/{{ l.author_username }}" target="_blank" rel="noopener">@{{ l.author_username }}</a>
+        </td>
+        <td class="tweet-preview">
+          {{ l.text }}<br>
+          <a class="link-icon" href="https://x.com/{{ l.author_username }}/status/{{ l.tweet_id }}" target="_blank" rel="noopener">↗ apri tweet</a>
+        </td>
+        <td class="mono">{{ l.matched_keyword }}</td>
+        <td>
+          {% if l.action_suggested == 'Ignora' %}
+            <span class="pill pill-ignora">Ignora</span>
+          {% elif 'DM' in l.action_suggested %}
+            <span class="pill pill-dm">{{ l.action_suggested }}</span>
+          {% elif 'Commenta' in l.action_suggested %}
+            <span class="pill pill-comment">{{ l.action_suggested }}</span>
+          {% else %}
+            <span class="pill pill-like">{{ l.action_suggested }}</span>
+          {% endif %}
+        </td>
+        <td>
+          <span class="pill pill-{{ l.status }}">{{ l.status }}</span>
+        </td>
+        <td>
+          {% if l.status == 'nuovo' %}
+          <form class="btn-inline-form" method="post" action="{{ url_for('update_lead_status', lead_id=l.id) }}">
+            <input type="hidden" name="status" value="gestito">
+            <button class="btn" type="submit">Segna gestito</button>
+          </form>
+          <form class="btn-inline-form" method="post" action="{{ url_for('update_lead_status', lead_id=l.id) }}">
+            <input type="hidden" name="status" value="ignorato">
+            <button class="btn" type="submit">Ignora</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty-state">Nessun lead in questa categoria.</div>
+  {% endif %}
+</div>
+{% endblock %}

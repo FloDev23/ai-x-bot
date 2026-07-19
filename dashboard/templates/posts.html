@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% set active = "posts" %}
+{% block title %}Post{% endblock %}
+
+{% block content %}
+<h1 class="page-title">Post pubblicati</h1>
+<p class="page-sub">Storico dei tweet pubblicati dal bot con le metriche raccolte dal ciclo di performance.</p>
+
+<div class="section">
+  {% if posts %}
+  <table>
+    <thead>
+      <tr>
+        <th>Data</th>
+        <th>Testo</th>
+        <th>Categoria</th>
+        <th>Score</th>
+        <th>👍</th>
+        <th>🔁</th>
+        <th>💬</th>
+        <th>👁</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in posts %}
+      <tr>
+        <td class="metric">{{ p.created_at[:16].replace("T", " ") }}</td>
+        <td class="tweet-preview">
+          {{ p.text }}
+          {% if p.tweet_id %}<br><a class="link-icon" href="https://x.com/i/status/{{ p.tweet_id }}" target="_blank" rel="noopener">↗ apri</a>{% endif %}
+        </td>
+        <td class="metric">{{ p.category or "—" }}</td>
+        <td class="metric">{{ p.score_total if p.score_total is not none else "—" }}</td>
+        <td class="metric">{{ p.likes if p.likes is not none else "—" }}</td>
+        <td class="metric">{{ p.retweets if p.retweets is not none else "—" }}</td>
+        <td class="metric">{{ p.replies if p.replies is not none else "—" }}</td>
+        <td class="metric">{{ p.impressions if p.impressions is not none else "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty-state">Nessun post pubblicato ancora.</div>
+  {% endif %}
+</div>
+{% endblock %}
