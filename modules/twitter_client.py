@@ -30,24 +30,54 @@ class TwitterClient:
         auth.set_access_token(TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET)
         self.api = tweepy.API(auth, wait_on_rate_limit=True)
     
-    def post_tweet(self, text: str, reply_to: Optional[str] = None) -> Optional[Dict]:
+    def upload_media(self, filepath: str, media_type: str = "image") -> Optional[str]:
         """
-        Posta un tweet
-        
+        Carica un'immagine o un video su X (API v1.1, richiede l'auth OAuth1
+        già configurata in self.api) e ritorna il media_id da allegare al
+        tweet. Per i video usa l'upload chunked con media_category
+        'tweet_video' (obbligatorio per X, gestisce anche l'attesa del
+        processing lato server tramite tweepy).
+        """
+        try:
+            if media_type == "video":
+                media = self.api.media_upload(filepath, chunked=True, media_category="tweet_video")
+            else:
+                media = self.api.media_upload(filepath)
+            return media.media_id_string
+        except Exception as e:
+            logger.error(f"❌ Errore upload media ({filepath}): {e}")
+            return None
+
+    def post_tweet(self, text: str, reply_to: Optional[str] = None,
+                    media_path: Optional[str] = None, media_type: str = "image") -> Optional[Dict]:
+        """
+        Posta un tweet, opzionalmente con un'immagine o un video allegato
+        (dalla libreria media). Se l'upload del media fallisce, il tweet
+        viene comunque pubblicato solo testo, invece di bloccare tutto.
+
         Args:
             text: Testo del tweet
             reply_to: ID del tweet a cui rispondere (opzionale)
+            media_path: percorso locale del file da allegare (opzionale)
+            media_type: 'image' o 'video', per scegliere il tipo di upload corretto
         
         Returns:
             Risposta dell'API
         """
         try:
             params = {"text": text}
-            
+
             if reply_to:
                 params["reply_settings"] = "public"
                 params["in_reply_to_tweet_id"] = reply_to
-            
+
+            if media_path:
+                media_id = self.upload_media(media_path, media_type)
+                if media_id:
+                    params["media_ids"] = [media_id]
+                else:
+                    logger.warning(f"⚠️ Upload media fallito per {media_path}: pubblico solo il testo")
+
             response = self.client.create_tweet(**params)
             logger.info(f"✅ Tweet postato: {response}")
             return response
