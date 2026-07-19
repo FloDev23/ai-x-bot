@@ -362,10 +362,20 @@ Pick "category" as the single best fit from the list."""
                         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
                     ],
                 }],
-                max_tokens=400,
+                max_tokens=700,
                 temperature=0.4,
+                # Qwen 3.6 27B è un modello "reasoning": di default entra in
+                # thinking mode e può consumare tutto il budget di token nel
+                # ragionamento interno, lasciando vuota la risposta finale.
+                # reasoning_effort="none" disattiva il thinking mode per
+                # avere direttamente l'output JSON richiesto.
+                reasoning_effort="none",
             )
             raw = (response.choices[0].message.content or '').strip()
+            if not raw:
+                finish_reason = response.choices[0].finish_reason
+                logger.error(f"❌ Risposta vuota dal modello vision (finish_reason: {finish_reason})")
+                return None
             raw = raw.replace('```json', '').replace('```', '').strip()
             return json.loads(raw)
         except Exception as e:
