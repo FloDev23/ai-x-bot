@@ -15,6 +15,7 @@ Floriano, per evitare sia costi di lettura/scrittura inutili sia il rischio
 di spam percepito.
 """
 import logging
+import re
 from typing import Dict, List
 from groq import Groq
 from modules.database import Database
@@ -119,15 +120,30 @@ Example: 78|Commenta"""
             response = self.groq.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
-                max_tokens=20,
+                max_tokens=300,
                 temperature=0.3,
             )
-            raw = response.choices[0].message.content.strip()
-            score_str, action = raw.split('|')
-            score = max(0, min(100, int(score_str.strip())))
-            action = action.strip()
-            if action not in ("Ignora", "Like", "Commenta", "DM", "Commenta+DM"):
-                action = "Ignora"
+            raw = (response.choices[0].message.content or '').strip()
+
+            # Parsing tollerante: il modello a volte aggiunge testo attorno
+            # al formato richiesto, quindi cerchiamo il pattern SCORE|AZIONE
+            # ovunque compaia nella risposta invece di pretendere che sia
+            # l'unica cosa restituita.
+            match = re.search(
+                r'(\d{1,3})\s*\|\s*(Ignora|Commenta\+DM|Commenta|DM|Like)',
+                raw, re.IGNORECASE,
+            )
+            if not match:
+                logger.warning(f"⚠️ Formato scoring non riconosciuto (risposta grezza: '{raw[:150]}')")
+                return 0, "Ignora"
+
+            score = max(0, min(100, int(match.group(1))))
+            action = match.group(2)
+            # Normalizza la capitalizzazione sulle opzioni valide
+            for valid in ("Ignora", "Like", "Commenta+DM", "Commenta", "DM"):
+                if action.lower() == valid.lower():
+                    action = valid
+                    break
             return score, action
         except Exception as e:
             logger.warning(f"⚠️ Errore nello scoring del lead: {e}")

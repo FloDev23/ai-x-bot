@@ -29,6 +29,21 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 # di lead poco rilevanti e non sprecare chiamate Groq per la bozza.
 LEAD_NOTIFY_MIN_SCORE = int(os.getenv('LEAD_NOTIFY_MIN_SCORE', '40'))
 
+# ========== Libreria Media (foto/video reali per i post) ==========
+# Cartella dove vengono salvati i file caricati dalla dashboard.
+# Percorso assoluto calcolato dalla root del progetto, non relativo, per
+# evitare lo stesso problema di percorso avuto con bot_data.db.
+MEDIA_LIBRARY_DIR = os.getenv(
+    'MEDIA_LIBRARY_DIR',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'media_library')
+)
+# Modello Groq con supporto vision per analizzare foto/frame video.
+# ATTENZIONE: la lineup multimodale di Groq cambia spesso (i modelli vision
+# precedenti sono già stati deprecati più volte nel 2026). Se questo modello
+# smette di funzionare, controlla i modelli vision disponibili su
+# https://console.groq.com/docs/vision e aggiorna GROQ_VISION_MODEL nel .env.
+GROQ_VISION_MODEL = os.getenv('GROQ_VISION_MODEL', 'qwen/qwen3.6-27b')
+
 # ========== NewsAPI ==========
 NEWSAPI_KEY = os.getenv('NEWSAPI_KEY', '')
 NEWSAPI_BASE_URL = 'https://newsapi.org/v2'
