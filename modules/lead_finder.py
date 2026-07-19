@@ -24,14 +24,34 @@ logger = logging.getLogger(__name__)
 
 # Frasi che indicano una potenziale opportunità commerciale (punto 19)
 # In inglese: mercato internazionale (gestori palestre/studio fuori Italia)
+#
+# Due archetipi di lead ad alto valore, entrambi coperti qui sotto:
+# 1) Chi ha APPENA APERTO una palestra/studio (fase di avvio, cerca clienti
+#    e strumenti fin dal day one)
+# 2) Chi si LAMENTA di classi vuote / pochi iscritti / non sa come trovare
+#    clienti (dolore attivo, già in attività ma in difficoltà)
 PROBLEM_KEYWORDS = [
+    # Archetipo 1: appena aperto / in fase di apertura
+    "just opened my gym",
+    "just opened our gym",
     "opening a gym",
+    "opening day at the gym",
     "starting a boutique studio",
-    "looking for gym software",
-    "how to fill my classes",
+    "new gym owner",
+    "launched my studio",
+
+    # Archetipo 2: classi vuote / pochi clienti / non sa come trovarli
     "low class attendance",
-    "which gym management software",
+    "how to fill my classes",
+    "empty classes",
+    "no one is signing up",
+    "can't get new members",
+    "struggling to get clients",
     "how do you get new gym members",
+
+    # Segnali di ricerca attiva di uno strumento (intento commerciale diretto)
+    "looking for gym software",
+    "which gym management software",
     "need a booking app for my studio",
     "gym management software recommendation",
     "drop-in class booking",
@@ -93,11 +113,28 @@ class LeadFinder:
 
         return found
 
+    def _has_meaningful_content(self, text: str) -> bool:
+        """
+        Filtro prima ancora di chiamare l'AI: un tweet che, tolti link e
+        menzioni, non lascia quasi nessun testo reale non può essere
+        valutato onestamente come lead (l'AI finirebbe per "inventare" un
+        contesto che non esiste). Meglio scartarlo subito: risparmia anche
+        la chiamata Groq.
+        """
+        stripped = re.sub(r'https?://\S+', '', text)
+        stripped = re.sub(r'@\w+', '', stripped)
+        stripped = stripped.strip()
+        return len(stripped) >= 25
+
     def _score_lead(self, text: str, keyword: str) -> Tuple[int, str]:
         """
         Assegna un punteggio 0-100 al potenziale lead e suggerisce l'azione
         migliore tra: Ignora, Like, Commenta, DM, Commenta+DM
         """
+        if not self._has_meaningful_content(text):
+            logger.info("⏭️ Tweet senza contenuto testuale sostanziale (solo link/mention): salto, score 0")
+            return 0, "Ignora"
+
         prompt = f"""A user on X wrote this tweet, which contains the key phrase "{keyword}":
 
 "{text}"
@@ -105,8 +142,24 @@ class LeadFinder:
 You are the commercial analyst for FlexDropin, an app that helps gyms and boutique
 studios manage drop-in class bookings and find new customers.
 
-Rate how much this tweet represents a REAL COMMERCIAL LEAD (not spam, not sarcasm,
-not an out-of-target user) with a score from 0 to 100.
+Rate how much this tweet represents a REAL COMMERCIAL LEAD, with a score from 0 to 100.
+
+The TWO highest-value lead types (score them 70-100 if clearly present):
+1) Someone who JUST OPENED (or is about to open) a gym/studio and is in the
+   early "let's get this going" phase — they need customers from day one.
+2) Someone who is COMPLAINING about empty classes, low attendance, or not
+   knowing how to get new clients for their existing gym/studio — active pain.
+
+STRICT RULES — be conservative, false positives waste real human time:
+- Only give a score above 40 if the tweet's OWN WORDS clearly express one of
+  the two lead types above, or an equally concrete, specific need.
+- If the tweet is vague, off-topic, just a link/headline, sarcastic, a news
+  story, someone else's business (e.g. a consultant advertising services,
+  a municipality announcement), or you would need to GUESS or ASSUME
+  details not actually written in the tweet, score it 20 or below and
+  choose "Ignora".
+- Never treat a coincidental keyword match as a lead if the surrounding
+  context is unrelated (news, sports, unrelated business, spam/ads).
 
 Then pick the BEST action among these exact options:
 Ignora, Like, Commenta, DM, Commenta+DM
