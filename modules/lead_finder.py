@@ -16,7 +16,7 @@ di spam percepito.
 """
 import logging
 import re
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from groq import Groq
 from modules.database import Database
 
@@ -93,7 +93,7 @@ class LeadFinder:
 
         return found
 
-    def _score_lead(self, text: str, keyword: str) -> (int, str):
+    def _score_lead(self, text: str, keyword: str) -> Tuple[int, str]:
         """
         Assegna un punteggio 0-100 al potenziale lead e suggerisce l'azione
         migliore tra: Ignora, Like, Commenta, DM, Commenta+DM
