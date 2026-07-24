@@ -144,7 +144,10 @@ class LeadFinder:
     def _score_lead(self, text: str, keyword: str) -> Tuple[int, str]:
         """
         Assegna un punteggio 0-100 al potenziale lead e suggerisce l'azione
-        migliore tra: Ignora, Like, Commenta, DM, Commenta+DM
+        migliore tra: Ignora, Commenta, DM, Commenta+DM
+        (niente più "Like": follow/like/commenti generici sono già gestiti
+        dal ciclo di engagement automatico, qui interessano solo le azioni
+        commerciali vere e proprie)
         """
         if not self._has_meaningful_content(text):
             logger.info("⏭️ Tweet senza contenuto testuale sostanziale (solo link/mention): salto, score 0")
@@ -177,7 +180,7 @@ STRICT RULES — be conservative, false positives waste real human time:
   context is unrelated (news, sports, unrelated business, spam/ads).
 
 Then pick the BEST action among these exact options:
-Ignora, Like, Commenta, DM, Commenta+DM
+Ignora, Commenta, DM, Commenta+DM
 
 Reply ONLY in this exact one-line format:
 SCORE|ACTION
@@ -198,7 +201,7 @@ Example: 78|Commenta"""
             # ovunque compaia nella risposta invece di pretendere che sia
             # l'unica cosa restituita.
             match = re.search(
-                r'(\d{1,3})\s*\|\s*(Ignora|Commenta\+DM|Commenta|DM|Like)',
+                r'(\d{1,3})\s*\|\s*(Ignora|Commenta\+DM|Commenta|DM)',
                 raw, re.IGNORECASE,
             )
             if not match:
@@ -208,7 +211,7 @@ Example: 78|Commenta"""
             score = max(0, min(100, int(match.group(1))))
             action = match.group(2)
             # Normalizza la capitalizzazione sulle opzioni valide
-            for valid in ("Ignora", "Like", "Commenta+DM", "Commenta", "DM"):
+            for valid in ("Ignora", "Commenta+DM", "Commenta", "DM"):
                 if action.lower() == valid.lower():
                     action = valid
                     break

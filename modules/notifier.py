@@ -144,11 +144,15 @@ class TelegramNotifier:
         if followed:
             lines.append(f"➕ Seguiti oggi ({len(followed)}):")
             for f in followed:
-                lines.append(f"  • @{f['username']} ({f.get('followers', 0)} follower)")
+                username = f['username']
+                lines.append(
+                    f"  • @{username} ({f.get('followers', 0)} follower) — https://x.com/{username}"
+                )
         if unfollowed:
             lines.append("")
             lines.append(f"➖ Rimossi (non ricambiato, {len(unfollowed)}):")
             for u in unfollowed:
-                lines.append(f"  • @{u['username']}")
+                username = u['username']
+                lines.append(f"  • @{username} — https://x.com/{username}")
 
         self._send("\n".join(lines))

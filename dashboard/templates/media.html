@@ -27,9 +27,7 @@
   {% for m in items %}
   <div class="media-card">
     <div class="media-thumb">
-      {% if m.file_deleted %}
-        <div class="media-thumb-placeholder">🗑️<br>File eliminato<br><span class="mono">(usato, spazio liberato)</span></div>
-      {% elif m.media_type == 'video' %}
+      {% if m.media_type == 'video' %}
         <video src="{{ url_for('media_file', filename=m.filename) }}" controls preload="metadata"></video>
       {% else %}
         <img src="{{ url_for('media_file', filename=m.filename) }}" alt="{{ m.filename }}">
