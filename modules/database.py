@@ -161,6 +161,22 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # colonna già presente
 
+            # Crescita rete: account seguiti dal ciclo di growth, per capire
+            # chi ha ricambiato e decidere l'unfollow automatico se non lo
+            # fa entro GROWTH_UNFOLLOW_AFTER_DAYS
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS growth_follows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    followed_at TEXT DEFAULT (datetime('now')),
+                    followed_back INTEGER DEFAULT 0,
+                    checked_at TEXT,
+                    unfollowed INTEGER DEFAULT 0,
+                    unfollowed_at TEXT
+                )
+            """)
+
             conn.commit()
         logger.info("✅ Database inizializzato (bot_data.db)")
 
@@ -498,3 +514,51 @@ class Database:
     def delete_media(self, media_id: int):
         with self._conn() as conn:
             conn.execute("DELETE FROM media_library WHERE id = ?", (media_id,))
+
+    # ---------- Crescita rete (follow/unfollow per costruire seguito reale) ----------
+
+    def add_growth_follow(self, username: str, user_id: str):
+        with self._conn() as conn:
+            conn.execute("""
+                INSERT INTO growth_follows (username, user_id) VALUES (?, ?)
+            """, (username, user_id))
+
+    def count_growth_follows_today(self) -> int:
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT COUNT(*) as c FROM growth_follows WHERE date(followed_at) = date('now')
+            """).fetchone()
+            return row['c'] if row else 0
+
+    def already_growth_followed(self, user_id: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT 1 FROM growth_follows WHERE user_id = ? LIMIT 1
+            """, (user_id,)).fetchone()
+            return row is not None
+
+    def get_growth_follows_pending_check(self, days_old: int = 21) -> List[Dict]:
+        """
+        Account seguiti da almeno `days_old` giorni, non ancora segnati come
+        'ha ricambiato' e non ancora rimossi: candidati per il controllo di
+        unfollow automatico.
+        """
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM growth_follows
+                WHERE unfollowed = 0 AND followed_back = 0
+                AND julianday('now') - julianday(followed_at) >= ?
+            """, (days_old,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_growth_followed_back(self, follow_id: int):
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE growth_follows SET followed_back = 1, checked_at = ? WHERE id = ?
+            """, (datetime.now().isoformat(), follow_id))
+
+    def mark_growth_unfollowed(self, follow_id: int):
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE growth_follows SET unfollowed = 1, unfollowed_at = ? WHERE id = ?
+            """, (datetime.now().isoformat(), follow_id))

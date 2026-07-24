@@ -187,6 +187,46 @@ class TwitterClient:
             logger.error(f"❌ Errore nel follow: {e}")
             return False
 
+    def unfollow_user(self, user_id: str) -> bool:
+        """Smette di seguire un utente (punto crescita rete: unfollow chi non ricambia)"""
+        try:
+            self.client.unfollow_user(user_id)
+            logger.info(f"➖ Unfollow di {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Errore nell'unfollow: {e}")
+            return False
+
+    def get_authenticated_user_id_cached(self) -> Optional[str]:
+        """Wrapper con cache in memoria per evitare letture ripetute inutili"""
+        if not hasattr(self, '_cached_self_id'):
+            self._cached_self_id = self.get_authenticated_user_id()
+        return self._cached_self_id
+
+    def get_follower_ids(self, max_results: int = 1000) -> set:
+        """
+        Recupera gli ID di chi segue il bot, per verificare se un account
+        che il bot ha seguito ha ricambiato (usato dal ciclo di unfollow
+        automatico). Una singola chiamata paginata, non per ogni utente
+        singolarmente: molto più economica.
+        """
+        follower_ids = set()
+        try:
+            self_id = self.get_authenticated_user_id_cached()
+            if not self_id:
+                return follower_ids
+            paginator = tweepy.Paginator(
+                self.client.get_users_followers, self_id, max_results=1000,
+            )
+            for page in paginator:
+                if page.data:
+                    follower_ids.update(str(u.id) for u in page.data)
+                if len(follower_ids) >= max_results:
+                    break
+        except Exception as e:
+            logger.error(f"❌ Errore nel recupero follower: {e}")
+        return follower_ids
+
     def get_user_info(self, username: str) -> Optional[Dict]:
         """
         Recupera dati pubblici di un utente (follower, verifica) per lo

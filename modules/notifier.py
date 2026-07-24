@@ -129,3 +129,26 @@ class TelegramNotifier:
     def notify_error(self, context: str, error: Exception):
         text = f"🚨 <b>Errore bot</b> ({self._escape(context)})\n\n{self._escape(str(error))[:500]}"
         self._send(text)
+
+    def notify_growth_summary(self, followed: list, unfollowed: list = None):
+        """
+        Riepilogo del ciclo di crescita rete: chi è stato seguito oggi (per
+        costruire seguito reale) e, se presente, chi è stato rimosso perché
+        non ha ricambiato entro la finestra prevista.
+        """
+        unfollowed = unfollowed or []
+        if not followed and not unfollowed:
+            return
+
+        lines = ["🌱 <b>Ciclo crescita rete</b>", ""]
+        if followed:
+            lines.append(f"➕ Seguiti oggi ({len(followed)}):")
+            for f in followed:
+                lines.append(f"  • @{f['username']} ({f.get('followers', 0)} follower)")
+        if unfollowed:
+            lines.append("")
+            lines.append(f"➖ Rimossi (non ricambiato, {len(unfollowed)}):")
+            for u in unfollowed:
+                lines.append(f"  • @{u['username']}")
+
+        self._send("\n".join(lines))

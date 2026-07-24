@@ -30,31 +30,34 @@ logger = logging.getLogger(__name__)
 #    e strumenti fin dal day one)
 # 2) Chi si LAMENTA di classi vuote / pochi iscritti / non sa come trovare
 #    clienti (dolore attivo, già in attività ma in difficoltà)
+#
+# Le frasi sono volutamente più lunghe/specifiche (non singole parole
+# comuni): riduce drasticamente i falsi positivi (corse di cavalli, notizie
+# sportive, thread motivazionali generici che matchavano per puro caso).
 PROBLEM_KEYWORDS = [
     # Archetipo 1: appena aperto / in fase di apertura
-    "just opened my gym",
-    "just opened our gym",
-    "opening a gym",
-    "opening day at the gym",
-    "starting a boutique studio",
-    "new gym owner",
-    "launched my studio",
+    "just opened my gym and",
+    "just opened our gym and",
+    "opening my own gym",
+    "starting a boutique fitness studio",
+    "new gym owner here",
+    "just launched my studio",
 
     # Archetipo 2: classi vuote / pochi clienti / non sa come trovarli
-    "low class attendance",
-    "how to fill my classes",
-    "empty classes",
-    "no one is signing up",
-    "can't get new members",
-    "struggling to get clients",
+    "low attendance in my classes",
+    "how do I fill my classes",
+    "my classes are always empty",
+    "no one is signing up for my classes",
+    "can't get new members for my gym",
+    "struggling to get clients for my studio",
     "how do you get new gym members",
 
     # Segnali di ricerca attiva di uno strumento (intento commerciale diretto)
-    "looking for gym software",
+    "looking for gym management software",
     "which gym management software",
     "need a booking app for my studio",
     "gym management software recommendation",
-    "drop-in class booking",
+    "drop-in class booking app",
 ]
 
 
@@ -78,7 +81,11 @@ class LeadFinder:
         """
         found = []
         for keyword in PROBLEM_KEYWORDS:
-            tweets = self.client.search_tweets(keyword, limit=max_per_keyword)
+            # -is:retweet: un retweet non è mai la persona che vive il
+            # problema in prima persona. lang:en: il mercato target è
+            # anglofono, evita falsi positivi in altre lingue.
+            query = f'"{keyword}" -is:retweet lang:en'
+            tweets = self.client.search_tweets(query, limit=max_per_keyword)
             for tweet in tweets:
                 if self.db.lead_already_seen(tweet['id']):
                     continue

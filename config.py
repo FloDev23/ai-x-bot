@@ -44,6 +44,24 @@ MEDIA_LIBRARY_DIR = os.getenv(
 # https://console.groq.com/docs/vision e aggiorna GROQ_VISION_MODEL nel .env.
 GROQ_VISION_MODEL = os.getenv('GROQ_VISION_MODEL', 'qwen/qwen3.6-27b')
 
+# ========== Crescita rete (follow reale, non lead-hunting) ==========
+# Cerca contenuti genuini di fitness/palestre e segue account in target,
+# per costruire una rete che dia visibilità organica ai post (a differenza
+# dell'opportunity detector, che cerca clienti con un problema specifico).
+GROWTH_HASHTAGS = [h.strip() for h in os.getenv(
+    'GROWTH_HASHTAGS',
+    '#gymowner,#boutiquefitness,#personaltrainer,#crossfitbox,#fitnessstudio,#gymlife,#studioowner'
+).split(',') if h.strip()]
+# Tetto giornaliero prudente: X segnala/sospende chi segue in modo
+# aggressivo. 8/giorno è in linea con le linee guida più caute per un
+# account che deve ancora costruire fiducia algoritmica.
+GROWTH_FOLLOW_PER_DAY = int(os.getenv('GROWTH_FOLLOW_PER_DAY', '8'))
+GROWTH_FOLLOWER_MIN = int(os.getenv('GROWTH_FOLLOWER_MIN', '300'))
+GROWTH_FOLLOWER_MAX = int(os.getenv('GROWTH_FOLLOWER_MAX', '20000'))
+GROWTH_UNFOLLOW_AFTER_DAYS = int(os.getenv('GROWTH_UNFOLLOW_AFTER_DAYS', '21'))
+GROWTH_CYCLE_TIME = os.getenv('GROWTH_CYCLE_TIME', '15:30')  # 1 volta/giorno
+UNFOLLOW_CHECK_DAY = os.getenv('UNFOLLOW_CHECK_DAY', 'sun')  # controllo settimanale
+
 # ========== NewsAPI ==========
 NEWSAPI_KEY = os.getenv('NEWSAPI_KEY', '')
 NEWSAPI_BASE_URL = 'https://newsapi.org/v2'

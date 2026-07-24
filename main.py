@@ -45,6 +45,9 @@ try:
         TARGET_ACCOUNTS, HUMAN_MODE_PROBABILITY, SEARCH_TOPICS,
         MAX_COMMENTS_PER_SESSION, MEGA_ACCOUNT_FOLLOWER_THRESHOLD,
         TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, LEAD_NOTIFY_MIN_SCORE,
+        GROWTH_HASHTAGS, GROWTH_FOLLOW_PER_DAY, GROWTH_FOLLOWER_MIN,
+        GROWTH_FOLLOWER_MAX, GROWTH_UNFOLLOW_AFTER_DAYS,
+        GROWTH_CYCLE_TIME, UNFOLLOW_CHECK_DAY,
     )
     from modules.database import Database
     from modules.notifier import TelegramNotifier
@@ -57,6 +60,7 @@ try:
     from modules.twitter_client import TwitterClient
     from modules.engagement import EngagementManager
     from modules.lead_finder import LeadFinder
+    from modules.growth import GrowthManager
     from modules.analytics import PerformanceAnalyzer
     from modules.news_fetcher import NewsFetcher
 except ImportError as e:
@@ -100,6 +104,7 @@ class FlexDropinGrowthAgent:
             self.lead_finder = LeadFinder(
                 self.twitter_client, self.ai_generator.client, self.ai_generator.model, self.db
             )
+            self.growth_manager = GrowthManager(self.twitter_client, self.db)
             self.analyzer = PerformanceAnalyzer(self.twitter_client, self.db)
 
             self.scheduler = BackgroundScheduler()
@@ -311,6 +316,31 @@ class FlexDropinGrowthAgent:
             self.notifier.notify_error("targeted_engagement_cycle", e)
 
     # ------------------------------------------------------------------
+    # Ciclo crescita rete: segue account fitness reali (non lead-hunting)
+    # per costruire una rete che dia visibilità organica ai post
+    # ------------------------------------------------------------------
+    def growth_cycle(self):
+        logger.info(f"🌱 Ciclo crescita rete - {datetime.now()}")
+        try:
+            followed = self.growth_manager.run_daily_follow_cycle(
+                hashtags=GROWTH_HASHTAGS, per_day=GROWTH_FOLLOW_PER_DAY,
+                follower_min=GROWTH_FOLLOWER_MIN, follower_max=GROWTH_FOLLOWER_MAX,
+            )
+            self.notifier.notify_growth_summary(followed)
+        except Exception as e:
+            logger.error(f"❌ Errore nel ciclo di crescita rete: {e}")
+            self.notifier.notify_error("growth_cycle", e)
+
+    def unfollow_check_cycle(self):
+        logger.info(f"🔍 Controllo unfollow settimanale - {datetime.now()}")
+        try:
+            unfollowed = self.growth_manager.run_unfollow_check(days_old=GROWTH_UNFOLLOW_AFTER_DAYS)
+            self.notifier.notify_growth_summary(followed=[], unfollowed=unfollowed)
+        except Exception as e:
+            logger.error(f"❌ Errore nel controllo unfollow: {e}")
+            self.notifier.notify_error("unfollow_check_cycle", e)
+
+    # ------------------------------------------------------------------
     # Ciclo 5: performance analytics / auto-learning (punto 2)
     # ------------------------------------------------------------------
     def performance_cycle(self):
@@ -379,6 +409,18 @@ class FlexDropinGrowthAgent:
             id='build_in_public', name='Build in Public settimanale'
         )
 
+        hh, mm = GROWTH_CYCLE_TIME.strip().split(':')
+        self.scheduler.add_job(
+            self.growth_cycle, CronTrigger(hour=int(hh), minute=int(mm)),
+            id='growth_cycle', name='Crescita rete (follow)'
+        )
+
+        self.scheduler.add_job(
+            self.unfollow_check_cycle,
+            CronTrigger(day_of_week=UNFOLLOW_CHECK_DAY[:3].lower(), hour=9, minute=0),
+            id='unfollow_check', name='Controllo unfollow settimanale'
+        )
+
         # Sincronizza i target curati una volta all'avvio e poi settimanalmente
         self.sync_targets()
         self.scheduler.add_job(
@@ -389,7 +431,7 @@ class FlexDropinGrowthAgent:
         self.scheduler.start()
         logger.info("✅ Growth Agent avviato e in esecuzione. Premi Ctrl+C per fermare.")
         logger.info(f"📅 Post giornalieri: {DAILY_POST_TIMES} | Opportunity: {OPPORTUNITY_CYCLE_TIMES} | "
-                    f"Engagement mirato: {TARGETED_ENGAGEMENT_TIMES}")
+                    f"Engagement mirato: {TARGETED_ENGAGEMENT_TIMES} | Crescita rete: {GROWTH_CYCLE_TIME}")
 
         try:
             import time
