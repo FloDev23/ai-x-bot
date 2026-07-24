@@ -101,6 +101,11 @@ fi
 
 # ---- 7. Riavvio servizi ----
 step "7/7 · Riavvio bot e dashboard"
+# daemon-reload incondizionato: qualunque unit file sia cambiato su disco
+# (dashboard copiato allo step 5, bot modificato manualmente in passato, o
+# qualsiasi altra causa) la cache di systemd viene sempre riallineata prima
+# del restart, evitando il warning "unit file ... changed on disk".
+sudo systemctl daemon-reload
 sudo systemctl restart "$BOT_SERVICE"
 sudo systemctl restart "$DASHBOARD_SERVICE"
 sleep 2
