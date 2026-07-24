@@ -91,6 +91,14 @@ class LeadFinder:
                     continue
 
                 score, action = self._score_lead(tweet['text'], keyword)
+
+                if action == "Ignora":
+                    # Non ci interessa vederlo in dashboard: non lo salviamo
+                    # come lead, ma segniamo il tweet come già valutato per
+                    # non richiamare l'AI su di lui in futuro.
+                    self.db.mark_tweet_seen(tweet['id'])
+                    continue
+
                 self.db.add_lead(
                     tweet_id=tweet['id'],
                     author_username=tweet.get('author_username', ''),
@@ -108,7 +116,7 @@ class LeadFinder:
                 found.append(lead)
                 logger.info(f"🎯 Lead trovato (score {score}/100, azione: {action}): {tweet['text'][:60]}...")
 
-                if notifier and score >= notify_min_score and action != "Ignora":
+                if notifier and score >= notify_min_score:
                     suggested_text = None
                     if ai_generator and action in ("Commenta", "Commenta+DM"):
                         suggested_text = ai_generator.generate_flexdropin_comment(

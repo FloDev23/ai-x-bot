@@ -87,6 +87,17 @@ class Database:
                 )
             """)
 
+            # Tweet già valutati dall'opportunity detector ma NON salvati come
+            # lead (azione suggerita "Ignora"): non ci interessano in dashboard,
+            # ma dobbiamo comunque ricordare di averli già scored per non
+            # richiamare l'AI sugli stessi tweet ad ogni ciclo.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS seen_tweets (
+                    tweet_id TEXT PRIMARY KEY,
+                    seen_at TEXT NOT NULL
+                )
+            """)
+
             # Performance per categoria (punto 2 - auto learning)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS category_weights (
@@ -299,8 +310,20 @@ class Database:
 
     def lead_already_seen(self, tweet_id: str) -> bool:
         with self._conn() as conn:
-            row = conn.execute("SELECT 1 FROM leads WHERE tweet_id = ?", (tweet_id,)).fetchone()
+            row = conn.execute(
+                "SELECT 1 FROM leads WHERE tweet_id = ? "
+                "UNION SELECT 1 FROM seen_tweets WHERE tweet_id = ?",
+                (tweet_id, tweet_id),
+            ).fetchone()
             return row is not None
+
+    def mark_tweet_seen(self, tweet_id: str):
+        """Ricorda un tweet già valutato (azione 'Ignora') senza salvarlo come lead."""
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO seen_tweets (tweet_id, seen_at) VALUES (?, ?)",
+                (tweet_id, datetime.now().isoformat()),
+            )
 
     def get_open_leads(self, min_score: int = 0, limit: int = 50) -> List[Dict]:
         with self._conn() as conn:
