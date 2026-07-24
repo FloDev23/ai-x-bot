@@ -81,13 +81,16 @@ def extract_error_lines(logs):
 
 @app.route("/")
 def overview():
-    leads = db.get_all_leads(limit=8)
+    leads = [l for l in db.get_all_leads(limit=50) if l["action_suggested"] != "Ignora"][:8]
     targets = db.get_top_targets(limit=6)
     posts = db.get_recent_posts(limit=5)
     logs = get_recent_logs(300)
     errors = extract_error_lines(logs)[-8:]
     stats = {
-        "leads_nuovi": sum(1 for l in db.get_all_leads(limit=1000) if l["status"] == "nuovo"),
+        "leads_nuovi": sum(
+            1 for l in db.get_all_leads(limit=1000)
+            if l["status"] == "nuovo" and l["action_suggested"] != "Ignora"
+        ),
         "targets_attivi": len(db.get_top_targets(limit=1000)),
         "post_totali": len(db.get_recent_posts(limit=1000)),
         "errori_recenti": len(errors),
@@ -101,10 +104,19 @@ def overview():
 @app.route("/leads")
 def leads_view():
     status_filter = request.args.get("status", "tutti")
+    # Di default nascondiamo i lead con azione suggerita "Ignora": non richiedono
+    # nessuna azione e affollerebbero la vista rischiando di far perdere quelli
+    # realmente interessanti. Con ?action=tutti si possono comunque rivedere.
+    action_filter = request.args.get("action", "azionabili")
     all_leads = db.get_all_leads(limit=300)
     if status_filter != "tutti":
         all_leads = [l for l in all_leads if l["status"] == status_filter]
-    return render_template("leads.html", leads=all_leads, status_filter=status_filter, service=SERVICE_NAME)
+    if action_filter == "azionabili":
+        all_leads = [l for l in all_leads if l["action_suggested"] != "Ignora"]
+    return render_template(
+        "leads.html", leads=all_leads, status_filter=status_filter,
+        action_filter=action_filter, service=SERVICE_NAME,
+    )
 
 
 @app.route("/leads/<int:lead_id>/status", methods=["POST"])
