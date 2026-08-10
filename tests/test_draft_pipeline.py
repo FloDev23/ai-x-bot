@@ -219,15 +219,24 @@ def test_fact_failure_skips_slot_and_records_reason_codes(pipeline_parts):
     }
 
 
-def test_model_supplied_fact_reason_is_reduced_to_a_safe_code(pipeline_parts):
+@pytest.mark.parametrize(
+    ("raw_reason", "safe_reason"),
+    [
+        ("unsupported_claim_type:private-model-payload", "unsupported_claim_type"),
+        ("private_model_payload", "invalid_reason_code"),
+    ],
+)
+def test_model_supplied_fact_reason_is_reduced_to_a_safe_code(
+    pipeline_parts, raw_reason, safe_reason
+):
     pipeline, database, _, _, guard, _ = pipeline_parts
     guard.approved = False
-    guard.reasons = ["unsupported_claim_type:private-model-payload"]
+    guard.reasons = [raw_reason]
 
     assert pipeline.create_for_slot(database.next_slot) is None
 
     assert database.evaluations[-1]["details"]["reason_codes"] == [
-        "unsupported_claim_type"
+        safe_reason
     ]
 
 
@@ -446,6 +455,15 @@ def test_discard_is_single_use_and_releases_reserved_media(pipeline_parts):
     assert draft["status"] == "discarded"
     assert draft["error"] == "not_relevant"
     assert database.released_media == [draft["id"]]
+
+
+def test_discard_does_not_persist_an_arbitrary_reason_payload(pipeline_parts):
+    pipeline, database, _, _, _, _ = pipeline_parts
+    draft = pipeline.create_for_slot(database.next_slot)
+
+    assert pipeline.discard(draft["id"], "private_model_payload") is True
+
+    assert draft["error"] == "discarded"
     assert pipeline.discard(draft["id"], "again") is False
     assert database.released_media == [draft["id"]]
 

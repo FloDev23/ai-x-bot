@@ -13,6 +13,25 @@ from modules.fact_guard import INCIDENT_SUBTYPES, SUPPORTED_CLAIM_TYPES
 
 _REASON_CODE = re.compile(r"^[a-z0-9_:-]+$")
 _SCORE_KEYS = frozenset(SCORE_AXES) | {"total"}
+_SAFE_SIMPLE_FACT_REASONS = frozenset(
+    {
+        "claim_analysis_unavailable",
+        "malformed_sources",
+        "malformed_claim",
+        "invalid_incident_subtype",
+    }
+)
+_DISCARD_REASON_CODES = frozenset(
+    {
+        "discarded",
+        "duplicate",
+        "low_quality",
+        "not_relevant",
+        "unsafe",
+        "user_discarded",
+        "wrong_timing",
+    }
+)
 _REGENERATABLE_STATUSES = ["pending_approval", "approved", "expired"]
 _DISCARDABLE_STATUSES = [
     "pending_approval",
@@ -72,7 +91,7 @@ def _safe_reason_codes(reasons) -> List[str]:
             and suffix in INCIDENT_SUBTYPES
         ):
             safe.append(reason)
-        elif not separator:
+        elif not separator and base in _SAFE_SIMPLE_FACT_REASONS:
             safe.append(base)
         else:
             safe.append("invalid_reason_code")
@@ -428,7 +447,7 @@ class DraftPipeline:
             return False
         reason_code = (
             reason
-            if isinstance(reason, str) and _REASON_CODE.fullmatch(reason)
+            if isinstance(reason, str) and reason in _DISCARD_REASON_CODES
             else "discarded"
         )
         transitioned = self.db.transition_post_draft(
