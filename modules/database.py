@@ -471,6 +471,13 @@ class Database:
                         (now, stale["id"]),
                     )
                     c.execute("""
+                        UPDATE media_library
+                        SET lifecycle_state = 'available',
+                            reserved_by_draft_id = NULL
+                        WHERE reserved_by_draft_id = ?
+                          AND lifecycle_state = 'reserved'
+                    """, (stale["id"],))
+                    c.execute("""
                         INSERT INTO draft_evaluations (
                             intended_slot, category, outcome, details_json,
                             created_at
@@ -836,7 +843,7 @@ class Database:
         intended_slot: str,
         publication_key: str,
     ):
-        """Atomically claim a live slot, returning ``(draft, created)``."""
+        """Atomically claim a live slot, returning ``(draft, outcome)``."""
         intended_slot = self._normalize_datetime_iso(intended_slot)
         now = self._now_iso()
         with self._conn() as conn:
@@ -848,7 +855,9 @@ class Database:
                 (intended_slot,),
             ).fetchone()
             if row:
-                return self._decode_post_draft(row), False
+                return self._decode_post_draft(row), "existing"
+            if not self._eligible_content_sources_in_conn(conn, source_ids):
+                return None, "no_eligible_source"
             try:
                 cursor = conn.execute("""
                     INSERT INTO post_drafts (
@@ -873,7 +882,7 @@ class Database:
                     (intended_slot,),
                 ).fetchone()
                 if row:
-                    return self._decode_post_draft(row), False
+                    return self._decode_post_draft(row), "existing"
                 raise
             draft_id = cursor.lastrowid
             self._insert_draft_evaluation_in_conn(
@@ -891,7 +900,7 @@ class Database:
             row = conn.execute(
                 "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
             ).fetchone()
-            return self._decode_post_draft(row), True
+            return self._decode_post_draft(row), "created"
 
     def _decode_post_draft(self, row: sqlite3.Row) -> Dict:
         return self._decode_json_fields(row, {
@@ -1039,6 +1048,59 @@ class Database:
                 return cursor.rowcount == 1
         except sqlite3.IntegrityError:
             return False
+
+    def approve_post_draft_atomic(
+        self,
+        draft_id: int,
+        expected_revision: int,
+        expected_slot: str,
+        approved_by: str,
+        now_fn=None,
+    ) -> bool:
+        """Approve one exact pending revision before its unchanged slot."""
+        expected_slot = self._normalize_datetime_iso(expected_slot)
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            raw_now = (
+                now_fn() if callable(now_fn) else datetime.now(timezone.utc)
+            )
+            if isinstance(raw_now, str):
+                try:
+                    current_time = self._parse_datetime(raw_now)
+                except (TypeError, ValueError):
+                    return False
+            elif isinstance(raw_now, datetime):
+                current_time = self._as_utc(raw_now)
+            else:
+                return False
+            current = conn.execute(
+                "SELECT status, revision, intended_slot FROM post_drafts "
+                "WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            if (
+                current is None
+                or current["status"] != "pending_approval"
+                or current["revision"] != expected_revision
+                or current["intended_slot"] != expected_slot
+                or current_time >= self._parse_datetime(current["intended_slot"])
+            ):
+                return False
+            cursor = conn.execute("""
+                UPDATE post_drafts
+                SET status = 'approved', approved_at = ?, approved_by = ?,
+                    updated_at = ?, revision = revision + 1
+                WHERE id = ? AND status = 'pending_approval'
+                  AND revision = ? AND intended_slot = ?
+            """, (
+                current_time.isoformat(),
+                approved_by,
+                self._now_iso(),
+                draft_id,
+                expected_revision,
+                expected_slot,
+            ))
+            return cursor.rowcount == 1
 
     def replace_post_draft_atomic(
         self,

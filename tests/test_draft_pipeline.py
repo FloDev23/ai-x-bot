@@ -85,7 +85,9 @@ class FakeDraftDatabase:
     def create_or_get_post_draft(self, **values):
         existing = self.get_active_draft_for_slot(values["intended_slot"])
         if existing:
-            return existing, False
+            return existing, "existing"
+        if not self.get_eligible_content_sources(values["source_ids"]):
+            return None, "no_eligible_source"
         draft_id = self.create_post_draft(**values)
         draft = self.get_post_draft(draft_id)
         self.record_draft_evaluation(
@@ -98,7 +100,7 @@ class FakeDraftDatabase:
                 "scores": draft["score_data"],
             },
         )
-        return draft, True
+        return draft, "created"
 
     def get_post_draft(self, draft_id):
         return self.drafts.get(draft_id)
@@ -135,6 +137,33 @@ class FakeDraftDatabase:
             intended_slot=new_slot,
             approved_at=None,
             approved_by=None,
+        )
+        draft["revision"] += 1
+        return True
+
+    def approve_post_draft_atomic(
+        self,
+        draft_id,
+        expected_revision,
+        expected_slot,
+        approved_by,
+        now_fn,
+    ):
+        draft = self.drafts.get(draft_id)
+        slot = datetime.fromisoformat(expected_slot)
+        now = now_fn()
+        if (
+            draft is None
+            or draft["status"] != "pending_approval"
+            or draft["revision"] != expected_revision
+            or draft["intended_slot"] != expected_slot
+            or now >= slot
+        ):
+            return False
+        draft.update(
+            status="approved",
+            approved_at=now.isoformat(),
+            approved_by=approved_by,
         )
         draft["revision"] += 1
         return True

@@ -313,8 +313,8 @@ class DraftPipeline:
             intended_slot=slot_iso,
         )
 
-    def _persist(self, prepared: _PreparedDraft) -> Dict:
-        draft, _created = self.db.create_or_get_post_draft(
+    def _persist(self, prepared: _PreparedDraft) -> Optional[Dict]:
+        draft, outcome = self.db.create_or_get_post_draft(
             text=prepared.text,
             category=prepared.category,
             source_ids=prepared.source_ids,
@@ -322,6 +322,14 @@ class DraftPipeline:
             intended_slot=prepared.intended_slot,
             publication_key="draft:" + uuid4().hex,
         )
+        if outcome == "no_eligible_source":
+            self._record(
+                prepared.intended_slot,
+                prepared.category,
+                "no_eligible_source",
+                {"source_ids": prepared.source_ids},
+            )
+            return None
         return draft
 
     def create_for_slot(self, intended_slot) -> Optional[Dict]:
@@ -410,15 +418,14 @@ class DraftPipeline:
         if not isinstance(approved_by, str) or not approved_by.strip():
             return False
         slot = _aware_datetime(draft.get("intended_slot"))
-        now = _aware_datetime(self.now_fn())
-        if slot is None or now is None or now >= slot:
+        if slot is None:
             return False
-        return self.db.transition_post_draft(
+        return self.db.approve_post_draft_atomic(
             draft_id,
-            ["pending_approval"],
-            "approved",
-            approved_at=now.isoformat(),
-            approved_by=approved_by.strip(),
+            draft.get("revision", 0),
+            draft.get("intended_slot"),
+            approved_by.strip(),
+            self.now_fn,
         )
 
     def postpone(self, draft_id, new_slot) -> bool:
