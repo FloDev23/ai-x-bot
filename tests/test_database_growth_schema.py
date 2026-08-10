@@ -164,3 +164,120 @@ def test_content_mix_excludes_audit_only_drafts(tmp_path):
                 draft_id, ["pending_approval"], status,
             )
     assert db.get_content_mix_counts() == {"gym_strategy": 2}
+
+
+def test_rejected_candidate_is_reactivated_after_30_day_suppression(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    candidate_id = db.upsert_growth_candidate({
+        "user_id": "rejected-owner",
+        "username": "owner",
+        "profile": {"username": "owner"},
+        "latest_post": {},
+        "score": 90,
+        "score_data": {"total": 90},
+        "discovery_source": "search",
+    })
+    assert db.mark_candidate_decision(candidate_id, "rejected", "not relevant")
+    with db._conn() as conn:
+        row = conn.execute(
+            "SELECT decision, suppressed_until FROM growth_candidates WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+    assert row["decision"] == "rejected"
+    assert datetime.fromisoformat(row["suppressed_until"]) > datetime.now(timezone.utc)
+    assert db.get_digest_candidates() == []
+
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    with db._conn() as conn:
+        conn.execute(
+            "UPDATE growth_candidates SET suppressed_until = ? WHERE id = ?",
+            (expired, candidate_id),
+        )
+    assert db.get_digest_candidates()[0]["decision"] == "new"
+
+
+def test_telegram_results_allowlist_fields_and_redact_credentials(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    secret = "123456789:telegram_Bot-Secret"
+    assert db.claim_telegram_update(902, "42")
+    db.complete_telegram_update(902, "failed", {
+        "result": "failed safely",
+        "error": f"Authorization: Bearer {secret}",
+        "token": secret,
+        "message": {"text": secret},
+    })
+    with db._conn() as conn:
+        stored = conn.execute(
+            "SELECT result_json FROM telegram_updates WHERE update_id = 902"
+        ).fetchone()["result_json"]
+    assert secret not in stored
+    assert "token" not in stored.lower()
+    assert "message" not in stored.lower()
+    assert "failed safely" in stored
+
+
+def test_error_logging_rejects_raw_telegram_payloads_and_redacts_tokens(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    secret = "123456789:telegram_Bot-Secret"
+    raw_payload = (
+        "{'update_id': 77, 'message': {'text': '" + secret + "'}} "
+        "https://api.example.test/path?token=" + secret
+    )
+    db.log_error("telegram", "AuthorizationError", raw_payload)
+    stored = db.get_recent_errors()[0]["safe_message"]
+    assert secret not in stored
+    assert "update_id" not in stored
+    assert "message" not in stored
+
+
+def test_error_logging_redacts_quoted_credential_fields(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    db.log_error(
+        "transport",
+        "ApiFailure",
+        '{"api_key": "plain-secret-value", "detail": "timeout"}',
+    )
+    stored = db.get_recent_errors()[0]["safe_message"]
+    assert "plain-secret-value" not in stored
+    assert "timeout" in stored
+
+
+def test_draft_slots_are_normalized_for_identity_order_and_migration(tmp_path):
+    path = tmp_path / "bot.db"
+    db = Database(str(path))
+    source_id = db.add_content_source("evergreen_idea", "Source")
+    later_id = db.create_post_draft(
+        "Later", "gym_strategy", [source_id], {"total": 90},
+        "2026-08-11T14:00:00+02:00", "slot-later",
+    )
+    earlier_id = db.create_post_draft(
+        "Earlier", "gym_strategy", [source_id], {"total": 90},
+        "2026-08-11T13:00:00+14:00", "slot-earlier",
+    )
+    assert db.get_post_draft(later_id)["intended_slot"] == (
+        "2026-08-11T12:00:00+00:00"
+    )
+    assert db.get_active_draft_for_slot(
+        "2026-08-11T08:00:00-04:00"
+    )["id"] == later_id
+    assert [row["id"] for row in db.list_post_drafts()] == [later_id, earlier_id]
+
+    assert db.transition_post_draft(
+        earlier_id,
+        ["pending_approval"],
+        "pending_approval",
+        intended_slot="2026-08-12T16:00:00+04:00",
+    )
+    assert db.get_post_draft(earlier_id)["intended_slot"] == (
+        "2026-08-12T12:00:00+00:00"
+    )
+
+    with db._conn() as conn:
+        conn.execute(
+            "UPDATE post_drafts SET intended_slot = ? WHERE id = ?",
+            ("2026-08-13T14:00:00+02:00", later_id),
+        )
+    migrated = Database(str(path))
+    assert migrated.get_post_draft(later_id)["intended_slot"] == (
+        "2026-08-13T12:00:00+00:00"
+    )

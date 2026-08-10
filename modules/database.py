@@ -13,6 +13,7 @@ Nessuna chiamata esterna: questo modulo è a costo zero.
 import sqlite3
 import logging
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, List, Dict, Optional, Set
 from contextlib import contextmanager
@@ -43,6 +44,57 @@ class Database:
     @classmethod
     def _parse_datetime(cls, value: str) -> datetime:
         return cls._as_utc(datetime.fromisoformat(value))
+
+    @classmethod
+    def _normalize_datetime_iso(cls, value: str) -> str:
+        return cls._parse_datetime(value).isoformat()
+
+    @staticmethod
+    def _sanitize_persisted_text(value: Any) -> str:
+        text = str(value)
+        lowered = text.lower()
+        if "update_id" in lowered and (
+            "message" in lowered or "callback_query" in lowered
+        ):
+            return "[redacted raw Telegram payload]"
+        text = re.sub(
+            r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+",
+            "Bearer [redacted]",
+            text,
+        )
+        text = re.sub(
+            r"\b\d{6,}:[A-Za-z0-9_-]{8,}\b",
+            "[redacted]",
+            text,
+        )
+        text = re.sub(
+            r"(?i)(https?://[^\s?'\"}]+)\?[^\s'\"}]+",
+            r"\1?[redacted]",
+            text,
+        )
+        text = re.sub(
+            r"(?i)([\"']?(?:token|api[_-]?key|authorization|password|secret|"
+            r"credential)[\"']?\s*[:=]\s*)[\"']?[^,\s}\]\"']+[\"']?",
+            r"\1[redacted]",
+            text,
+        )
+        return text
+
+    @classmethod
+    def _safe_telegram_result(cls, result: Dict) -> Dict:
+        if not isinstance(result, dict):
+            return {}
+        safe = {}
+        for key in ("result", "error"):
+            value = result.get(key)
+            if value is None or isinstance(value, (bool, int, float)):
+                if key in result:
+                    safe[key] = value
+            elif isinstance(value, str):
+                safe[key] = cls._sanitize_persisted_text(value)
+            elif key in result:
+                safe[key] = "[redacted non-scalar value]"
+        return safe
 
     @staticmethod
     def _decode_json_fields(row: sqlite3.Row, fields: Dict[str, str]) -> Dict:
@@ -282,6 +334,20 @@ class Database:
                     updated_at TEXT NOT NULL
                 )
             """)
+            for draft in c.execute(
+                "SELECT id, intended_slot FROM post_drafts"
+            ).fetchall():
+                try:
+                    normalized_slot = self._normalize_datetime_iso(
+                        draft["intended_slot"]
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if normalized_slot != draft["intended_slot"]:
+                    c.execute(
+                        "UPDATE post_drafts SET intended_slot = ? WHERE id = ?",
+                        (normalized_slot, draft["id"]),
+                    )
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS growth_candidates (
@@ -603,6 +669,7 @@ class Database:
         publication_key: str,
     ) -> int:
         now = self._now_iso()
+        intended_slot = self._normalize_datetime_iso(intended_slot)
         with self._conn() as conn:
             cursor = conn.execute("""
                 INSERT INTO post_drafts (
@@ -656,6 +723,7 @@ class Database:
         return [self._decode_post_draft(row) for row in rows]
 
     def get_active_draft_for_slot(self, intended_slot: str) -> Optional[Dict]:
+        intended_slot = self._normalize_datetime_iso(intended_slot)
         with self._conn() as conn:
             row = conn.execute("""
                 SELECT * FROM post_drafts
@@ -738,6 +806,8 @@ class Database:
         for name, value in changes.items():
             if name == "score_json" and not isinstance(value, str):
                 value = json.dumps(value)
+            elif name == "intended_slot":
+                value = self._normalize_datetime_iso(value)
             assignments.append(name + " = ?")
             values.append(value)
         placeholders = ", ".join("?" for _ in expected_statuses)
@@ -757,6 +827,7 @@ class Database:
         outcome: str,
         details: Dict,
     ) -> int:
+        intended_slot = self._normalize_datetime_iso(intended_slot)
         with self._conn() as conn:
             cursor = conn.execute("""
                 INSERT INTO draft_evaluations (
@@ -1197,6 +1268,16 @@ class Database:
     def get_digest_candidates(self, limit: int = 5) -> List[Dict]:
         now = datetime.now(timezone.utc)
         with self._conn() as conn:
+            conn.execute("""
+                UPDATE growth_candidates
+                SET decision = 'new', rejection_reason = NULL,
+                    suppressed_until = NULL
+                WHERE decision IN ('rejected', 'discarded')
+                  AND (
+                      suppressed_until IS NULL
+                      OR julianday(suppressed_until) <= julianday(?)
+                  )
+            """, (now.isoformat(),))
             rows = conn.execute("""
                 SELECT * FROM growth_candidates
                 WHERE decision = 'new' AND score >= 75
@@ -1225,15 +1306,26 @@ class Database:
         decision: str,
         reason: Optional[str] = None,
     ) -> bool:
-        now = self._now_iso()
-        manual_followed_at = now if decision == "followed_manually" else None
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        manual_followed_at = now_iso if decision == "followed_manually" else None
+        suppressed_until = None
+        if decision in {"rejected", "discarded"}:
+            suppressed_until = (now + timedelta(days=30)).isoformat()
         with self._conn() as conn:
             cursor = conn.execute("""
                 UPDATE growth_candidates
                 SET decision = ?, rejection_reason = ?,
-                    manual_followed_at = COALESCE(?, manual_followed_at)
+                    manual_followed_at = COALESCE(?, manual_followed_at),
+                    suppressed_until = ?
                 WHERE id = ? AND decision = 'new'
-            """, (decision, reason, manual_followed_at, candidate_id))
+            """, (
+                decision,
+                reason,
+                manual_followed_at,
+                suppressed_until,
+                candidate_id,
+            ))
             return cursor.rowcount == 1
 
     def save_follower_snapshot(
@@ -1305,12 +1397,19 @@ class Database:
         state: str,
         result: Dict,
     ) -> None:
+        safe_state = self._sanitize_persisted_text(state)
+        safe_result = self._safe_telegram_result(result)
         with self._conn() as conn:
             conn.execute("""
                 UPDATE telegram_updates
                 SET state = ?, result_json = ?, processed_at = ?
                 WHERE update_id = ? AND state = 'processing'
-            """, (state, json.dumps(result or {}), self._now_iso(), update_id))
+            """, (
+                safe_state,
+                json.dumps(safe_result),
+                self._now_iso(),
+                update_id,
+            ))
 
     def set_state(self, key: str, value: str) -> None:
         with self._conn() as conn:
@@ -1330,6 +1429,9 @@ class Database:
         return row["value"] if row else default
 
     def log_error(self, context: str, error_type: str, safe_message: str) -> int:
+        context = self._sanitize_persisted_text(context)
+        error_type = self._sanitize_persisted_text(error_type)
+        safe_message = self._sanitize_persisted_text(safe_message)
         with self._conn() as conn:
             cursor = conn.execute("""
                 INSERT INTO error_events (
