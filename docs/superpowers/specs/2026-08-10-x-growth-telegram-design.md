@@ -1,7 +1,7 @@
 # FlexDropin X Growth Bot — follower growth and Telegram control design
 
 Date: 2026-08-10
-Status: approved in conversation; awaiting review of this written specification
+Status: approved by Floriano on 2026-08-10
 
 ## 1. Context
 
