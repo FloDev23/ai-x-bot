@@ -22,6 +22,17 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 DB_PATH = 'bot_data.db'
+LIVE_DRAFT_STATUSES = (
+    "pending_approval",
+    "approved",
+    "publishing",
+    "published",
+    "publication_unknown",
+)
+_LIVE_DRAFT_STATUS_SQL = (
+    "'pending_approval', 'approved', 'publishing', 'published', "
+    "'publication_unknown'"
+)
 
 
 class Database:
@@ -330,9 +341,18 @@ class Database:
                     published_tweet_id TEXT,
                     error TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0
                 )
             """)
+            draft_columns = {
+                row["name"] for row in c.execute("PRAGMA table_info(post_drafts)")
+            }
+            if "revision" not in draft_columns:
+                c.execute(
+                    "ALTER TABLE post_drafts "
+                    "ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+                )
             for draft in c.execute(
                 "SELECT id, intended_slot FROM post_drafts"
             ).fetchall():
@@ -423,6 +443,54 @@ class Database:
                     created_at TEXT NOT NULL
                 )
             """)
+
+            duplicate_slots = c.execute(
+                "SELECT intended_slot FROM post_drafts "
+                "WHERE status IN (" + _LIVE_DRAFT_STATUS_SQL + ") "
+                "GROUP BY intended_slot HAVING COUNT(*) > 1"
+            ).fetchall()
+            for duplicate in duplicate_slots:
+                rows = c.execute(
+                    "SELECT id, category FROM post_drafts "
+                    "WHERE intended_slot = ? AND status IN ("
+                    + _LIVE_DRAFT_STATUS_SQL
+                    + ") ORDER BY CASE status "
+                    "WHEN 'published' THEN 5 "
+                    "WHEN 'publication_unknown' THEN 4 "
+                    "WHEN 'publishing' THEN 3 "
+                    "WHEN 'approved' THEN 2 ELSE 1 END DESC, id ASC",
+                    (duplicate["intended_slot"],),
+                ).fetchall()
+                keeper_id = rows[0]["id"]
+                for stale in rows[1:]:
+                    now = self._now_iso()
+                    c.execute(
+                        "UPDATE post_drafts SET status = 'superseded', "
+                        "error = 'migration_duplicate_slot', updated_at = ?, "
+                        "revision = revision + 1 WHERE id = ?",
+                        (now, stale["id"]),
+                    )
+                    c.execute("""
+                        INSERT INTO draft_evaluations (
+                            intended_slot, category, outcome, details_json,
+                            created_at
+                        ) VALUES (?, ?, 'migration_duplicate_slot', ?, ?)
+                    """, (
+                        duplicate["intended_slot"],
+                        stale["category"],
+                        json.dumps({
+                            "draft_id": stale["id"],
+                            "kept_draft_id": keeper_id,
+                        }),
+                        now,
+                    ))
+            c.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_post_drafts_live_intended_slot "
+                "ON post_drafts(intended_slot) WHERE status IN ("
+                + _LIVE_DRAFT_STATUS_SQL
+                + ")"
+            )
 
             migration_key = "migration:legacy_ideas_to_sources"
             migration_done = c.execute(
@@ -615,6 +683,56 @@ class Database:
             return None
         return self._decode_json_fields(row, {"metadata_json": "metadata"})
 
+    def _eligible_content_sources_in_conn(
+        self,
+        conn,
+        source_ids: List[int],
+        now: Optional[datetime] = None,
+    ) -> List[Dict]:
+        if (
+            not isinstance(source_ids, list)
+            or not source_ids
+            or any(
+                isinstance(source_id, bool)
+                or not isinstance(source_id, int)
+                or source_id <= 0
+                for source_id in source_ids
+            )
+        ):
+            return []
+        placeholders = ", ".join("?" for _ in set(source_ids))
+        rows = conn.execute(
+            "SELECT * FROM content_sources WHERE id IN (" + placeholders + ")",
+            list(dict.fromkeys(source_ids)),
+        ).fetchall()
+        by_id = {row["id"]: row for row in rows}
+        current = self._as_utc(now or datetime.now(timezone.utc))
+        eligible = []
+        for source_id in source_ids:
+            row = by_id.get(source_id)
+            if row is None or row["trust_state"] != "verified":
+                return []
+            if row["expires_at"]:
+                try:
+                    expires_at = self._parse_datetime(row["expires_at"])
+                except (TypeError, ValueError):
+                    return []
+                if expires_at <= current:
+                    return []
+            eligible.append(
+                self._decode_json_fields(row, {"metadata_json": "metadata"})
+            )
+        return eligible
+
+    def get_eligible_content_sources(
+        self,
+        source_ids: List[int],
+        now: Optional[datetime] = None,
+    ) -> List[Dict]:
+        """Return every requested source in order, or none if any is ineligible."""
+        with self._conn() as conn:
+            return self._eligible_content_sources_in_conn(conn, source_ids, now)
+
     def get_eligible_sources(
         self,
         source_type: Optional[str] = None,
@@ -686,6 +804,94 @@ class Database:
                 now,
             ))
             return cursor.lastrowid
+
+    def _insert_draft_evaluation_in_conn(
+        self,
+        conn,
+        intended_slot: str,
+        category: str,
+        outcome: str,
+        details: Dict,
+        created_at: Optional[str] = None,
+    ) -> int:
+        cursor = conn.execute("""
+            INSERT INTO draft_evaluations (
+                intended_slot, category, outcome, details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+        """, (
+            self._normalize_datetime_iso(intended_slot),
+            category,
+            outcome,
+            json.dumps(details or {}),
+            created_at or self._now_iso(),
+        ))
+        return cursor.lastrowid
+
+    def create_or_get_post_draft(
+        self,
+        text: str,
+        category: str,
+        source_ids: List[int],
+        score_data: Dict,
+        intended_slot: str,
+        publication_key: str,
+    ):
+        """Atomically claim a live slot, returning ``(draft, created)``."""
+        intended_slot = self._normalize_datetime_iso(intended_slot)
+        now = self._now_iso()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM post_drafts WHERE intended_slot = ? "
+                "AND status IN (" + _LIVE_DRAFT_STATUS_SQL + ") "
+                "ORDER BY id ASC LIMIT 1",
+                (intended_slot,),
+            ).fetchone()
+            if row:
+                return self._decode_post_draft(row), False
+            try:
+                cursor = conn.execute("""
+                    INSERT INTO post_drafts (
+                        publication_key, text, category, source_ids_json,
+                        score_json, intended_slot, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    publication_key,
+                    text,
+                    category,
+                    json.dumps(source_ids),
+                    json.dumps(score_data),
+                    intended_slot,
+                    now,
+                    now,
+                ))
+            except sqlite3.IntegrityError:
+                row = conn.execute(
+                    "SELECT * FROM post_drafts WHERE intended_slot = ? "
+                    "AND status IN (" + _LIVE_DRAFT_STATUS_SQL + ") "
+                    "ORDER BY id ASC LIMIT 1",
+                    (intended_slot,),
+                ).fetchone()
+                if row:
+                    return self._decode_post_draft(row), False
+                raise
+            draft_id = cursor.lastrowid
+            self._insert_draft_evaluation_in_conn(
+                conn,
+                intended_slot,
+                category,
+                "pending_approval",
+                {
+                    "draft_id": draft_id,
+                    "source_ids": source_ids,
+                    "scores": score_data,
+                },
+                now,
+            )
+            row = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+            return self._decode_post_draft(row), True
 
     def _decode_post_draft(self, row: sqlite3.Row) -> Dict:
         return self._decode_json_fields(row, {
@@ -782,6 +988,143 @@ class Database:
             """, (since, since)).fetchall()
         return [row["text"] for row in rows]
 
+    def postpone_post_draft_atomic(
+        self,
+        draft_id: int,
+        expected_revision: int,
+        expected_statuses: List[str],
+        new_slot: str,
+    ) -> bool:
+        """Move a draft with revision CAS while atomically claiming the slot."""
+        if not expected_statuses:
+            return False
+        new_slot = self._normalize_datetime_iso(new_slot)
+        placeholders = ", ".join("?" for _ in expected_statuses)
+        try:
+            with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute(
+                    "SELECT status, revision FROM post_drafts WHERE id = ?",
+                    (draft_id,),
+                ).fetchone()
+                if (
+                    current is None
+                    or current["revision"] != expected_revision
+                    or current["status"] not in expected_statuses
+                ):
+                    return False
+                occupied = conn.execute(
+                    "SELECT id FROM post_drafts WHERE intended_slot = ? "
+                    "AND id != ? AND status IN ("
+                    + _LIVE_DRAFT_STATUS_SQL
+                    + ") LIMIT 1",
+                    (new_slot, draft_id),
+                ).fetchone()
+                if occupied:
+                    return False
+                cursor = conn.execute(
+                    "UPDATE post_drafts SET status = 'pending_approval', "
+                    "intended_slot = ?, approved_at = NULL, "
+                    "approved_by = NULL, updated_at = ?, "
+                    "revision = revision + 1 WHERE id = ? AND revision = ? "
+                    "AND status IN (" + placeholders + ")",
+                    [
+                        new_slot,
+                        self._now_iso(),
+                        draft_id,
+                        expected_revision,
+                        *expected_statuses,
+                    ],
+                )
+                return cursor.rowcount == 1
+        except sqlite3.IntegrityError:
+            return False
+
+    def replace_post_draft_atomic(
+        self,
+        *,
+        prior_draft_id: int,
+        expected_revision: int,
+        expected_slot: str,
+        expected_category: str,
+        expected_source_ids: List[int],
+        text: str,
+        score_data: Dict,
+        publication_key: str,
+    ):
+        """Supersede and replace one exact draft in a single transaction."""
+        expected_slot = self._normalize_datetime_iso(expected_slot)
+        now = self._now_iso()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            prior = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (prior_draft_id,)
+            ).fetchone()
+            if prior is None:
+                return None, "conflict"
+            prior_source_ids = json.loads(prior["source_ids_json"])
+            if (
+                prior["revision"] != expected_revision
+                or prior["status"]
+                not in ("pending_approval", "approved", "expired")
+                or prior["intended_slot"] != expected_slot
+                or prior["category"] != expected_category
+                or prior_source_ids != expected_source_ids
+            ):
+                return None, "conflict"
+            if not self._eligible_content_sources_in_conn(
+                conn, expected_source_ids
+            ):
+                return None, "no_eligible_source"
+
+            cursor = conn.execute(
+                "UPDATE post_drafts SET status = 'superseded', updated_at = ?, "
+                "revision = revision + 1 WHERE id = ? AND revision = ? "
+                "AND intended_slot = ? AND status IN "
+                "('pending_approval', 'approved', 'expired')",
+                (now, prior_draft_id, expected_revision, expected_slot),
+            )
+            if cursor.rowcount != 1:
+                return None, "conflict"
+            replacement = conn.execute("""
+                INSERT INTO post_drafts (
+                    publication_key, text, category, source_ids_json,
+                    score_json, intended_slot, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                publication_key,
+                text,
+                expected_category,
+                json.dumps(expected_source_ids),
+                json.dumps(score_data),
+                expected_slot,
+                now,
+                now,
+            ))
+            replacement_id = replacement.lastrowid
+            self._insert_draft_evaluation_in_conn(
+                conn,
+                expected_slot,
+                expected_category,
+                "pending_approval",
+                {
+                    "draft_id": replacement_id,
+                    "source_ids": expected_source_ids,
+                    "scores": score_data,
+                    "supersedes_draft_id": prior_draft_id,
+                },
+                now,
+            )
+            conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                WHERE reserved_by_draft_id = ? AND lifecycle_state = 'reserved'
+            """, (prior_draft_id,))
+            row = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (replacement_id,)
+            ).fetchone()
+            return self._decode_post_draft(row), "created"
+
     def transition_post_draft(
         self,
         draft_id: int,
@@ -800,7 +1143,11 @@ class Database:
             )
         if not expected_statuses:
             return False
-        assignments = ["status = ?", "updated_at = ?"]
+        assignments = [
+            "status = ?",
+            "updated_at = ?",
+            "revision = revision + 1",
+        ]
         values = [new_status, self._now_iso()]
         for name, value in changes.items():
             if name == "score_json" and not isinstance(value, str):
@@ -811,13 +1158,16 @@ class Database:
             values.append(value)
         placeholders = ", ".join("?" for _ in expected_statuses)
         values.extend([draft_id] + list(expected_statuses))
-        with self._conn() as conn:
-            cursor = conn.execute(
-                "UPDATE post_drafts SET " + ", ".join(assignments)
-                + " WHERE id = ? AND status IN (" + placeholders + ")",
-                values,
-            )
-            return cursor.rowcount == 1
+        try:
+            with self._conn() as conn:
+                cursor = conn.execute(
+                    "UPDATE post_drafts SET " + ", ".join(assignments)
+                    + " WHERE id = ? AND status IN (" + placeholders + ")",
+                    values,
+                )
+                return cursor.rowcount == 1
+        except sqlite3.IntegrityError:
+            return False
 
     def record_draft_evaluation(
         self,
@@ -828,18 +1178,13 @@ class Database:
     ) -> int:
         intended_slot = self._normalize_datetime_iso(intended_slot)
         with self._conn() as conn:
-            cursor = conn.execute("""
-                INSERT INTO draft_evaluations (
-                    intended_slot, category, outcome, details_json, created_at
-                ) VALUES (?, ?, ?, ?, ?)
-            """, (
+            return self._insert_draft_evaluation_in_conn(
+                conn,
                 intended_slot,
                 category,
                 outcome,
-                json.dumps(details or {}),
-                self._now_iso(),
-            ))
-            return cursor.lastrowid
+                details,
+            )
 
     def count_draft_evaluations(self, outcome: str, days: int = 7) -> int:
         since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()

@@ -162,10 +162,11 @@ class DraftPipeline:
             for source_id in source_ids or []
             if isinstance(source_id, int) and not isinstance(source_id, bool)
         ]
-        sources = [self.db.get_content_source(value) for value in safe_source_ids]
-        if not safe_source_ids or len(sources) != len(safe_source_ids) or any(
-            source is None for source in sources
-        ):
+        sources = self.db.get_eligible_content_sources(
+            safe_source_ids,
+            now=self.now_fn(),
+        )
+        if not safe_source_ids or len(sources) != len(safe_source_ids):
             self._record(
                 slot_iso,
                 category,
@@ -312,8 +313,8 @@ class DraftPipeline:
             intended_slot=slot_iso,
         )
 
-    def _persist(self, prepared: _PreparedDraft, supersedes=None) -> Dict:
-        draft_id = self.db.create_post_draft(
+    def _persist(self, prepared: _PreparedDraft) -> Dict:
+        draft, _created = self.db.create_or_get_post_draft(
             text=prepared.text,
             category=prepared.category,
             source_ids=prepared.source_ids,
@@ -321,20 +322,7 @@ class DraftPipeline:
             intended_slot=prepared.intended_slot,
             publication_key="draft:" + uuid4().hex,
         )
-        details = {
-            "draft_id": draft_id,
-            "source_ids": prepared.source_ids,
-            "scores": prepared.score_data,
-        }
-        if supersedes is not None:
-            details["supersedes_draft_id"] = supersedes
-        self._record(
-            prepared.intended_slot,
-            prepared.category,
-            "pending_approval",
-            details,
-        )
-        return self.db.get_post_draft(draft_id)
+        return draft
 
     def create_for_slot(self, intended_slot) -> Optional[Dict]:
         slot_iso = _slot_iso(intended_slot)
@@ -373,29 +361,46 @@ class DraftPipeline:
         )
         if prepared is None:
             return None
-        replacement = self._persist(prepared, supersedes=draft_id)
-        if not self.db.transition_post_draft(
-            draft_id,
-            _REGENERATABLE_STATUSES,
-            "superseded",
-        ):
-            self.db.transition_post_draft(
-                replacement["id"],
-                ["pending_approval"],
-                "discarded",
-                error="regeneration_conflict",
+        try:
+            replacement, outcome = self.db.replace_post_draft_atomic(
+                prior_draft_id=draft_id,
+                expected_revision=prior.get("revision", 0),
+                expected_slot=intended_slot,
+                expected_category=prior.get("category"),
+                expected_source_ids=source_ids,
+                text=prepared.text,
+                score_data=prepared.score_data,
+                publication_key="draft:" + uuid4().hex,
             )
+        except Exception:
+            self._record(
+                intended_slot,
+                prior.get("category"),
+                "generation_failed",
+                {
+                    "reason_codes": ["draft_persistence_unavailable"],
+                    "source_ids": source_ids,
+                },
+            )
+            return None
+        if outcome == "no_eligible_source":
+            self._record(
+                intended_slot,
+                prior.get("category"),
+                "no_eligible_source",
+                {"source_ids": source_ids},
+            )
+            return None
+        if outcome != "created":
             self._record(
                 prepared.intended_slot,
                 prepared.category,
                 "regeneration_conflict",
                 {
-                    "draft_id": replacement["id"],
                     "supersedes_draft_id": draft_id,
                 },
             )
             return None
-        self.db.release_media_for_draft(draft_id)
         return replacement
 
     def approve(self, draft_id, approved_by) -> bool:
@@ -429,16 +434,11 @@ class DraftPipeline:
         if slot is None or now is None or slot <= now:
             return False
         slot_iso = slot.isoformat()
-        existing = self.db.get_active_draft_for_slot(slot_iso)
-        if existing and existing.get("id") != draft_id:
-            return False
-        return self.db.transition_post_draft(
+        return self.db.postpone_post_draft_atomic(
             draft_id,
+            draft.get("revision", 0),
             ["pending_approval", "approved", "expired"],
-            "pending_approval",
-            intended_slot=slot_iso,
-            approved_at=None,
-            approved_by=None,
+            slot_iso,
         )
 
     def discard(self, draft_id, reason) -> bool:

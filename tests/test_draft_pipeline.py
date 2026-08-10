@@ -28,6 +28,7 @@ class FakeDraftDatabase:
         self.recent_texts = []
         self.released_media = []
         self.reject_transitions_for = set()
+        self.raise_replace = False
         self._next_id = 1
 
     def get_active_draft_for_slot(self, intended_slot):
@@ -51,6 +52,16 @@ class FakeDraftDatabase:
     def get_content_source(self, source_id):
         return self.sources.get(source_id)
 
+    def get_eligible_content_sources(self, source_ids, now=None):
+        del now
+        sources = [self.sources.get(source_id) for source_id in source_ids]
+        if any(
+            source is None or source.get("trust_state") != "verified"
+            for source in sources
+        ):
+            return []
+        return sources
+
     def get_recent_content_texts(self, days=30):
         assert days == 30
         return list(self.recent_texts)
@@ -64,11 +75,30 @@ class FakeDraftDatabase:
             "media_id": None,
             "approved_at": None,
             "approved_by": None,
+            "revision": 0,
             **values,
         }
         self.drafts[draft_id] = draft
         self.created_drafts.append(draft)
         return draft_id
+
+    def create_or_get_post_draft(self, **values):
+        existing = self.get_active_draft_for_slot(values["intended_slot"])
+        if existing:
+            return existing, False
+        draft_id = self.create_post_draft(**values)
+        draft = self.get_post_draft(draft_id)
+        self.record_draft_evaluation(
+            draft["intended_slot"],
+            draft["category"],
+            "pending_approval",
+            {
+                "draft_id": draft_id,
+                "source_ids": draft["source_ids"],
+                "scores": draft["score_data"],
+            },
+        )
+        return draft, True
 
     def get_post_draft(self, draft_id):
         return self.drafts.get(draft_id)
@@ -85,7 +115,82 @@ class FakeDraftDatabase:
             return False
         draft.update(changes)
         draft["status"] = new_status
+        draft["revision"] += 1
         return True
+
+    def postpone_post_draft_atomic(
+        self, draft_id, expected_revision, expected_statuses, new_slot
+    ):
+        draft = self.drafts.get(draft_id)
+        occupied = self.get_active_draft_for_slot(new_slot)
+        if (
+            draft is None
+            or draft["revision"] != expected_revision
+            or draft["status"] not in expected_statuses
+            or (occupied and occupied["id"] != draft_id)
+        ):
+            return False
+        draft.update(
+            status="pending_approval",
+            intended_slot=new_slot,
+            approved_at=None,
+            approved_by=None,
+        )
+        draft["revision"] += 1
+        return True
+
+    def replace_post_draft_atomic(
+        self,
+        *,
+        prior_draft_id,
+        expected_revision,
+        expected_slot,
+        expected_category,
+        expected_source_ids,
+        text,
+        score_data,
+        publication_key,
+    ):
+        if self.raise_replace:
+            raise RuntimeError("raw sqlite payload")
+        prior = self.drafts.get(prior_draft_id)
+        if (
+            prior is None
+            or prior_draft_id in self.reject_transitions_for
+            or prior["revision"] != expected_revision
+            or prior["status"]
+            not in {"pending_approval", "approved", "expired"}
+            or prior["intended_slot"] != expected_slot
+            or prior["category"] != expected_category
+            or prior["source_ids"] != expected_source_ids
+        ):
+            return None, "conflict"
+        if not self.get_eligible_content_sources(expected_source_ids):
+            return None, "no_eligible_source"
+        prior["status"] = "superseded"
+        prior["revision"] += 1
+        replacement_id = self.create_post_draft(
+            text=text,
+            category=expected_category,
+            source_ids=expected_source_ids,
+            score_data=score_data,
+            intended_slot=expected_slot,
+            publication_key=publication_key,
+        )
+        replacement = self.get_post_draft(replacement_id)
+        self.record_draft_evaluation(
+            expected_slot,
+            expected_category,
+            "pending_approval",
+            {
+                "draft_id": replacement_id,
+                "source_ids": expected_source_ids,
+                "scores": score_data,
+                "supersedes_draft_id": prior_draft_id,
+            },
+        )
+        self.release_media_for_draft(prior_draft_id)
+        return replacement, "created"
 
     def record_draft_evaluation(
         self, intended_slot, category, outcome, details
@@ -526,7 +631,7 @@ def test_regenerate_is_single_use(pipeline_parts):
     assert len(database.created_drafts) == 2
 
 
-def test_regeneration_conflict_discards_replacement_and_preserves_prior(
+def test_regeneration_conflict_creates_no_replacement_and_preserves_prior(
     pipeline_parts,
 ):
     pipeline, database, _, generator, _, _ = pipeline_parts
@@ -537,7 +642,25 @@ def test_regeneration_conflict_discards_replacement_and_preserves_prior(
     assert pipeline.regenerate(prior["id"]) is None
 
     assert prior["status"] == "pending_approval"
-    replacement = database.created_drafts[-1]
-    assert replacement["id"] != prior["id"]
-    assert replacement["status"] == "discarded"
-    assert replacement["error"] == "regeneration_conflict"
+    assert len(database.created_drafts) == 1
+    assert database.evaluations[-1]["outcome"] == "regeneration_conflict"
+
+
+def test_regeneration_persistence_failure_is_safely_audited(pipeline_parts):
+    pipeline, database, _, generator, _, _ = pipeline_parts
+    prior = pipeline.create_for_slot(database.next_slot)
+    database.raise_replace = True
+    generator.text = "A valid replacement that cannot be stored."
+
+    assert pipeline.regenerate(prior["id"]) is None
+
+    assert prior["status"] == "pending_approval"
+    assert database.evaluations[-1] == {
+        "intended_slot": prior["intended_slot"],
+        "category": prior["category"],
+        "outcome": "generation_failed",
+        "details": {
+            "reason_codes": ["draft_persistence_unavailable"],
+            "source_ids": prior["source_ids"],
+        },
+    }
