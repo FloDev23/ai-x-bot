@@ -1,19 +1,72 @@
-"""
-Tweet Scoring - Punto 3 dell'analisi
-Ogni tweet viene valutato su 4 assi (0-10 ciascuno, totale 0-40) prima
-di essere pubblicato. Sotto soglia viene rigenerato invece che pubblicato.
-
-Usa Groq (già in uso nel bot, costo trascurabile), NON chiama X: costo zero
-lato X API.
-"""
+"""Editorial quality scoring and deterministic duplicate detection."""
 import json
 import logging
-from typing import Dict
+import math
+import re
+from collections import Counter
+from typing import Dict, Optional
 from groq import Groq
 
 logger = logging.getLogger(__name__)
 
-SCORE_AXES = ["utilita", "originalita", "discussione", "promozione"]
+SCORE_AXES = [
+    "hook",
+    "usefulness",
+    "specificity",
+    "originality",
+    "audience_relevance",
+    "follow_worthiness",
+    "semantic_novelty",
+]
+
+_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "for",
+    "from", "in", "is", "it", "of", "on", "or", "that", "the", "this",
+    "to", "with", "you", "your",
+}
+_NUMBER_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10",
+}
+
+
+def _singularize(token: str) -> str:
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+    if token.endswith(("sses", "ches", "shes", "xes", "zes")):
+        return token[:-2]
+    if token.endswith("s") and not token.endswith("ss") and len(token) > 3:
+        return token[:-1]
+    return token
+
+
+def _normalized_tokens(text: str):
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    normalized = []
+    for token in tokens:
+        token = _NUMBER_WORDS.get(token, token)
+        if token in _STOP_WORDS:
+            continue
+        normalized.append(_singularize(token))
+    return normalized
+
+
+def semantic_similarity(left: str, right: str) -> float:
+    """Cosine similarity over normalized English token frequencies."""
+    left_counts = Counter(_normalized_tokens(left))
+    right_counts = Counter(_normalized_tokens(right))
+    if left_counts == right_counts:
+        return 1.0
+    if not left_counts or not right_counts:
+        return 0.0
+    dot_product = sum(
+        count * right_counts.get(token, 0)
+        for token, count in left_counts.items()
+    )
+    left_norm = math.sqrt(sum(count * count for count in left_counts.values()))
+    right_norm = math.sqrt(sum(count * count for count in right_counts.values()))
+    return dot_product / (left_norm * right_norm)
 
 
 class TweetScorer:
@@ -21,24 +74,16 @@ class TweetScorer:
         self.client = groq_client
         self.model = model
 
-    def score(self, tweet_text: str) -> Dict:
-        """
-        Ritorna un dict: {utilita, originalita, discussione, promozione, totale}
-        Ogni asse è 0-10. In caso di errore ritorna un punteggio neutro (20/40)
-        per non bloccare il ciclo di pubblicazione.
-        """
-        prompt = f"""Evaluate this tweet for a fitness/startup account on X (Twitter):
+    def score_draft(self, tweet_text: str) -> Optional[Dict]:
+        """Return normalized editorial scores, or ``None`` on any failure."""
+        prompt = f"""Evaluate this draft for the FlexDropin X account:
 
 "{tweet_text}"
 
-Score each of these 4 axes from 0 to 10:
-- utilita (usefulness): how useful/informative it is for the reader
-- originalita (originality): how genuine it sounds vs generic/robotic
-- discussione (discussion potential): how likely it is to spark comments/interaction
-- promozione (promo balance): how well-balanced the promotional part is (10 = perfect balance, 0 = too salesy or missing when it should be there)
+The audience is gym owners and boutique fitness operators. Score each axis
+from 0 to 10: {", ".join(SCORE_AXES)}.
 
-Reply ONLY with a valid JSON object, no other text, in this exact format:
-{{"utilita": <0-10>, "originalita": <0-10>, "discussione": <0-10>, "promozione": <0-10>}}"""
+Reply ONLY with one JSON object containing every named axis."""
 
         try:
             response = self.client.chat.completions.create(
@@ -51,19 +96,19 @@ Reply ONLY with a valid JSON object, no other text, in this exact format:
             raw = (response.choices[0].message.content or '').strip()
             raw = raw.replace('```json', '').replace('```', '').strip()
             data = json.loads(raw)
-
-            scores = {axis: int(data.get(axis, 5)) for axis in SCORE_AXES}
-            scores['totale'] = sum(scores.values())
+            if not isinstance(data, dict) or any(axis not in data for axis in SCORE_AXES):
+                return None
+            scores = {}
+            for axis in SCORE_AXES:
+                value = data[axis]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    return None
+                if not 0 <= value <= 10:
+                    return None
+                scores[axis] = value
+            scores['total'] = round(sum(scores.values()) * 100 / 70)
             return scores
 
         except Exception as e:
-            logger.warning(f"⚠️ Errore nello scoring (uso punteggio neutro): {e}")
-            neutral = {axis: 5 for axis in SCORE_AXES}
-            neutral['totale'] = 20
-            return neutral
-
-    def passes_threshold(self, tweet_text: str, threshold: int = 24) -> Dict:
-        """Valuta il tweet e ritorna gli score arricchiti con 'approved': bool"""
-        scores = self.score(tweet_text)
-        scores['approved'] = scores['totale'] >= threshold
-        return scores
+            logger.warning(f"Editorial scoring unavailable: {e}")
+            return None
