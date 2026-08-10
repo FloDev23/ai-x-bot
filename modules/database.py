@@ -13,9 +13,10 @@ Nessuna chiamata esterna: questo modulo è a costo zero.
 import sqlite3
 import logging
 import json
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, List, Dict, Optional, Set
 from contextlib import contextmanager
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,28 @@ class Database:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._init_schema()
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _parse_datetime(cls, value: str) -> datetime:
+        return cls._as_utc(datetime.fromisoformat(value))
+
+    @staticmethod
+    def _decode_json_fields(row: sqlite3.Row, fields: Dict[str, str]) -> Dict:
+        result = dict(row)
+        for stored_name, public_name in fields.items():
+            raw = result.pop(stored_name, None)
+            result[public_name] = json.loads(raw) if raw else None
+        return result
 
     @contextmanager
     def _conn(self):
@@ -161,16 +184,52 @@ class Database:
                     used INTEGER DEFAULT 0,
                     used_at TEXT,
                     used_in_tweet_id TEXT,
-                    file_deleted INTEGER DEFAULT 0
+                    file_deleted INTEGER DEFAULT 0,
+                    lifecycle_state TEXT DEFAULT 'available',
+                    reusable INTEGER DEFAULT 0,
+                    user_context TEXT DEFAULT '',
+                    reserved_by_draft_id INTEGER,
+                    mime_type TEXT,
+                    file_size INTEGER DEFAULT 0
                 )
             """)
-            # Migrazione per database creati prima dell'introduzione di
-            # file_deleted (il file viene rimosso dal disco dopo l'uso per
-            # risparmiare spazio, ma il record resta per lo storico)
-            try:
-                c.execute("ALTER TABLE media_library ADD COLUMN file_deleted INTEGER DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass  # colonna già presente
+
+            media_columns = {
+                row["name"] for row in c.execute("PRAGMA table_info(media_library)")
+            }
+            media_migrations = {
+                "file_deleted": "INTEGER DEFAULT 0",
+                "lifecycle_state": "TEXT DEFAULT 'available'",
+                "reusable": "INTEGER DEFAULT 0",
+                "user_context": "TEXT DEFAULT ''",
+                "reserved_by_draft_id": "INTEGER",
+                "mime_type": "TEXT",
+                "file_size": "INTEGER DEFAULT 0",
+            }
+            lifecycle_added = "lifecycle_state" not in media_columns
+            for column, definition in media_migrations.items():
+                if column not in media_columns:
+                    c.execute(
+                        f"ALTER TABLE media_library ADD COLUMN {column} {definition}"
+                    )
+            if lifecycle_added:
+                c.execute("""
+                    UPDATE media_library
+                    SET lifecycle_state = CASE
+                        WHEN file_deleted = 1 THEN 'deleted'
+                        WHEN used = 1 THEN 'used'
+                        ELSE 'available'
+                    END
+                """)
+            else:
+                c.execute("""
+                    UPDATE media_library SET lifecycle_state = CASE
+                        WHEN file_deleted = 1 THEN 'deleted'
+                        WHEN used = 1 THEN 'used'
+                        ELSE 'available'
+                    END
+                    WHERE lifecycle_state IS NULL OR lifecycle_state = ''
+                """)
 
             # Crescita rete: account seguiti dal ciclo di growth, per capire
             # chi ha ricambiato e decidere l'unfollow automatico se non lo
@@ -187,6 +246,146 @@ class Database:
                     unfollowed_at TEXT
                 )
             """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS content_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_type TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    url TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    trust_state TEXT NOT NULL DEFAULT 'verified',
+                    verified_by TEXT,
+                    verified_at TEXT,
+                    expires_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS post_drafts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    publication_key TEXT NOT NULL UNIQUE,
+                    text TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    source_ids_json TEXT NOT NULL,
+                    score_json TEXT NOT NULL,
+                    intended_slot TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending_approval',
+                    media_id INTEGER,
+                    approved_at TEXT,
+                    approved_by TEXT,
+                    published_tweet_id TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS growth_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL UNIQUE,
+                    username TEXT NOT NULL,
+                    profile_json TEXT NOT NULL,
+                    latest_post_json TEXT,
+                    score INTEGER NOT NULL,
+                    score_json TEXT NOT NULL,
+                    discovery_source TEXT NOT NULL,
+                    decision TEXT NOT NULL DEFAULT 'new',
+                    rejection_reason TEXT,
+                    first_seen_at TEXT NOT NULL,
+                    last_evaluated_at TEXT NOT NULL,
+                    profile_expires_at TEXT NOT NULL,
+                    digest_sent_at TEXT,
+                    manual_followed_at TEXT,
+                    followed_back_at TEXT,
+                    suppressed_until TEXT
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS follower_snapshots (
+                    observed_on TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    relevant INTEGER NOT NULL,
+                    source TEXT,
+                    profile_json TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    PRIMARY KEY (observed_on, user_id)
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS telegram_updates (
+                    update_id INTEGER PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'processing',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    received_at TEXT NOT NULL,
+                    processed_at TEXT
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS error_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    context TEXT NOT NULL,
+                    error_type TEXT NOT NULL,
+                    safe_message TEXT NOT NULL,
+                    resolved INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS draft_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    intended_slot TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                )
+            """)
+
+            migration_key = "migration:legacy_ideas_to_sources"
+            migration_done = c.execute(
+                "SELECT 1 FROM bot_state WHERE key = ?", (migration_key,)
+            ).fetchone()
+            if not migration_done:
+                now = self._now_iso()
+                legacy_ideas = c.execute("""
+                    SELECT id, idea, categoria, priorita
+                    FROM ideas
+                    WHERE COALESCE(stato, 'nuova') != 'usata'
+                """).fetchall()
+                for idea in legacy_ideas:
+                    metadata = {
+                        "legacy_idea_id": idea["id"],
+                        "category": idea["categoria"],
+                        "priority": idea["priorita"],
+                    }
+                    c.execute("""
+                        INSERT INTO content_sources (
+                            source_type, text, metadata_json, trust_state,
+                            created_at, updated_at
+                        ) VALUES ('evergreen_idea', ?, ?, 'verified', ?, ?)
+                    """, (idea["idea"], json.dumps(metadata), now, now))
+                c.execute("""
+                    INSERT INTO bot_state (key, value, updated_at)
+                    VALUES (?, 'complete', ?)
+                """, (migration_key, now))
 
             conn.commit()
         logger.info("✅ Database inizializzato (bot_data.db)")
@@ -295,6 +494,291 @@ class Database:
             conn.execute("""
                 UPDATE ideas SET stato = 'usata', data_ultima_pubblicazione = ? WHERE id = ?
             """, (datetime.now().isoformat(), idea_id))
+
+    # ---------- Content sources ----------
+
+    def add_content_source(
+        self,
+        source_type: str,
+        text: str,
+        url: Optional[str] = None,
+        metadata: Optional[Dict] = None,
+        trust_state: str = "verified",
+        verified_by: Optional[str] = None,
+        verified_at: Optional[str] = None,
+    ) -> int:
+        now = self._now_iso()
+        effective_trust = trust_state
+        effective_verified_at = verified_at
+        expires_at = None
+        if source_type == "product_fact":
+            if not verified_by:
+                effective_trust = "pending"
+                effective_verified_at = None
+            elif effective_trust == "verified":
+                effective_verified_at = effective_verified_at or now
+                expires_at = (
+                    datetime.fromisoformat(effective_verified_at) + timedelta(days=90)
+                ).isoformat()
+
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                INSERT INTO content_sources (
+                    source_type, text, url, metadata_json, trust_state,
+                    verified_by, verified_at, expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                source_type,
+                text,
+                url,
+                json.dumps(metadata or {}),
+                effective_trust,
+                verified_by,
+                effective_verified_at,
+                expires_at,
+                now,
+                now,
+            ))
+            return cursor.lastrowid
+
+    def get_content_source(self, source_id: int) -> Optional[Dict]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM content_sources WHERE id = ?", (source_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return self._decode_json_fields(row, {"metadata_json": "metadata"})
+
+    def get_eligible_sources(
+        self,
+        source_type: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> List[Dict]:
+        with self._conn() as conn:
+            if source_type:
+                rows = conn.execute("""
+                    SELECT * FROM content_sources
+                    WHERE trust_state = 'verified' AND source_type = ?
+                    ORDER BY created_at DESC
+                """, (source_type,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM content_sources
+                    WHERE trust_state = 'verified'
+                    ORDER BY created_at DESC
+                """).fetchall()
+
+        current = now or datetime.now(timezone.utc)
+        if isinstance(current, str):
+            current = datetime.fromisoformat(current)
+        current = self._as_utc(current)
+        eligible = []
+        for row in rows:
+            if row["expires_at"] and self._parse_datetime(row["expires_at"]) <= current:
+                continue
+            eligible.append(
+                self._decode_json_fields(row, {"metadata_json": "metadata"})
+            )
+        return eligible
+
+    def content_source_exists(self, url: str) -> bool:
+        if not url:
+            return False
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM content_sources WHERE url = ? LIMIT 1", (url,)
+            ).fetchone()
+            return row is not None
+
+    # ---------- Post drafts ----------
+
+    def create_post_draft(
+        self,
+        text: str,
+        category: str,
+        source_ids: List[int],
+        score_data: Dict,
+        intended_slot: str,
+        publication_key: str,
+    ) -> int:
+        now = self._now_iso()
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                INSERT INTO post_drafts (
+                    publication_key, text, category, source_ids_json, score_json,
+                    intended_slot, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                publication_key,
+                text,
+                category,
+                json.dumps(source_ids),
+                json.dumps(score_data),
+                intended_slot,
+                now,
+                now,
+            ))
+            return cursor.lastrowid
+
+    def _decode_post_draft(self, row: sqlite3.Row) -> Dict:
+        return self._decode_json_fields(row, {
+            "source_ids_json": "source_ids",
+            "score_json": "score_data",
+        })
+
+    def get_post_draft(self, draft_id: int) -> Optional[Dict]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+        return self._decode_post_draft(row) if row else None
+
+    def list_post_drafts(
+        self,
+        statuses: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> List[Dict]:
+        with self._conn() as conn:
+            if statuses:
+                placeholders = ", ".join("?" for _ in statuses)
+                rows = conn.execute(
+                    "SELECT * FROM post_drafts WHERE status IN ("
+                    + placeholders
+                    + ") ORDER BY intended_slot DESC LIMIT ?",
+                    list(statuses) + [limit],
+                ).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM post_drafts
+                    ORDER BY intended_slot DESC LIMIT ?
+                """, (limit,)).fetchall()
+        return [self._decode_post_draft(row) for row in rows]
+
+    def get_active_draft_for_slot(self, intended_slot: str) -> Optional[Dict]:
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT * FROM post_drafts
+                WHERE intended_slot = ?
+                  AND status IN (
+                      'pending_approval', 'approved', 'publishing', 'published',
+                      'publication_unknown'
+                  )
+                ORDER BY created_at DESC LIMIT 1
+            """, (intended_slot,)).fetchone()
+        return self._decode_post_draft(row) if row else None
+
+    def get_content_mix_counts(self, days: int = 30) -> Dict[str, int]:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT category, COUNT(*) AS count
+                FROM post_drafts
+                WHERE created_at >= ?
+                  AND status IN (
+                      'pending_approval', 'approved', 'publishing', 'published',
+                      'publication_unknown'
+                  )
+                GROUP BY category
+            """, (since,)).fetchall()
+        return {row["category"]: row["count"] for row in rows}
+
+    def count_drafts_for_local_date(
+        self,
+        local_date: date,
+        timezone_name: str,
+    ) -> int:
+        if isinstance(local_date, str):
+            local_date = date.fromisoformat(local_date)
+        local_timezone = ZoneInfo(timezone_name)
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT intended_slot FROM post_drafts"
+            ).fetchall()
+        count = 0
+        for row in rows:
+            intended = datetime.fromisoformat(row["intended_slot"])
+            if intended.tzinfo is None:
+                intended = intended.replace(tzinfo=local_timezone)
+            if intended.astimezone(local_timezone).date() == local_date:
+                count += 1
+        return count
+
+    def get_recent_content_texts(self, days: int = 30) -> List[str]:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT text, created_at FROM post_drafts WHERE created_at >= ?
+                UNION ALL
+                SELECT text, created_at FROM posted_tweets WHERE created_at >= ?
+                ORDER BY created_at DESC
+            """, (since, since)).fetchall()
+        return [row["text"] for row in rows]
+
+    def transition_post_draft(
+        self,
+        draft_id: int,
+        expected_statuses: List[str],
+        new_status: str,
+        **changes: Any,
+    ) -> bool:
+        allowed = {
+            "text", "score_json", "intended_slot", "media_id", "approved_at",
+            "approved_by", "published_tweet_id", "error", "updated_at",
+        }
+        invalid = set(changes) - allowed
+        if invalid:
+            raise ValueError(
+                "Unsupported draft fields: " + ", ".join(sorted(invalid))
+            )
+        if not expected_statuses:
+            return False
+        assignments = ["status = ?", "updated_at = ?"]
+        values = [new_status, self._now_iso()]
+        for name, value in changes.items():
+            if name == "score_json" and not isinstance(value, str):
+                value = json.dumps(value)
+            assignments.append(name + " = ?")
+            values.append(value)
+        placeholders = ", ".join("?" for _ in expected_statuses)
+        values.extend([draft_id] + list(expected_statuses))
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE post_drafts SET " + ", ".join(assignments)
+                + " WHERE id = ? AND status IN (" + placeholders + ")",
+                values,
+            )
+            return cursor.rowcount == 1
+
+    def record_draft_evaluation(
+        self,
+        intended_slot: str,
+        category: str,
+        outcome: str,
+        details: Dict,
+    ) -> int:
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                INSERT INTO draft_evaluations (
+                    intended_slot, category, outcome, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+            """, (
+                intended_slot,
+                category,
+                outcome,
+                json.dumps(details or {}),
+                self._now_iso(),
+            ))
+            return cursor.lastrowid
+
+    def count_draft_evaluations(self, outcome: str, days: int = 7) -> int:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT COUNT(*) AS count FROM draft_evaluations
+                WHERE outcome = ? AND created_at >= ?
+            """, (outcome, since)).fetchone()
+        return row["count"] if row else 0
 
     # ---------- Leads / opportunity detector ----------
 
@@ -484,12 +968,15 @@ class Database:
         with self._conn() as conn:
             if category:
                 rows = conn.execute("""
-                    SELECT * FROM media_library WHERE used = 0 AND category = ?
+                    SELECT * FROM media_library
+                    WHERE lifecycle_state = 'available' AND file_deleted = 0
+                      AND category = ?
                     ORDER BY uploaded_at ASC LIMIT ?
                 """, (category, limit)).fetchall()
             else:
                 rows = conn.execute("""
-                    SELECT * FROM media_library WHERE used = 0
+                    SELECT * FROM media_library
+                    WHERE lifecycle_state = 'available' AND file_deleted = 0
                     ORDER BY uploaded_at ASC LIMIT ?
                 """, (limit,)).fetchall()
             return [dict(r) for r in rows]
@@ -503,7 +990,9 @@ class Database:
         """
         with self._conn() as conn:
             rows = conn.execute("""
-                SELECT * FROM media_library WHERE used = 0 ORDER BY uploaded_at ASC LIMIT ?
+                SELECT * FROM media_library
+                WHERE lifecycle_state = 'available' AND file_deleted = 0
+                ORDER BY uploaded_at ASC LIMIT ?
             """, (limit,)).fetchall()
             return [dict(r) for r in rows]
 
@@ -514,17 +1003,77 @@ class Database:
             """, (limit,)).fetchall()
             return [dict(r) for r in rows]
 
+    def get_available_media(self, limit: int = 15) -> List[Dict]:
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM media_library
+                WHERE lifecycle_state = 'available' AND file_deleted = 0
+                ORDER BY uploaded_at ASC LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def reserve_media(self, media_id: int, draft_id: int) -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
+                WHERE id = ? AND lifecycle_state = 'available'
+                  AND file_deleted = 0
+            """, (draft_id, media_id))
+            return cursor.rowcount == 1
+
+    def release_media_for_draft(self, draft_id: int) -> None:
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                WHERE reserved_by_draft_id = ? AND lifecycle_state = 'reserved'
+            """, (draft_id,))
+
     def mark_media_used(self, media_id: int, tweet_id: str = ''):
         with self._conn() as conn:
             conn.execute("""
-                UPDATE media_library SET used = 1, used_at = ?, used_in_tweet_id = ? WHERE id = ?
-            """, (datetime.now().isoformat(), tweet_id, media_id))
+                UPDATE media_library
+                SET used = 1, used_at = ?, used_in_tweet_id = ?,
+                    lifecycle_state = 'used', reserved_by_draft_id = NULL
+                WHERE id = ? AND lifecycle_state IN ('available', 'reserved')
+                  AND file_deleted = 0
+            """, (self._now_iso(), tweet_id, media_id))
+
+    def archive_media(self, media_id: int) -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'archived', reserved_by_draft_id = NULL
+                WHERE id = ? AND lifecycle_state IN ('available', 'reserved')
+            """, (media_id,))
+            return cursor.rowcount == 1
+
+    def set_media_reusable(self, media_id: int, reusable: bool) -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET reusable = ?,
+                    lifecycle_state = CASE
+                        WHEN ? = 1 AND lifecycle_state = 'used' THEN 'available'
+                        WHEN ? = 0 AND used = 1
+                             AND lifecycle_state = 'available' THEN 'used'
+                        ELSE lifecycle_state
+                    END
+                WHERE id = ?
+            """, (int(reusable), int(reusable), int(reusable), media_id))
+            return cursor.rowcount == 1
 
     def mark_media_file_deleted(self, media_id: int):
         """Segna che il file fisico è stato rimosso dal disco per risparmiare
         spazio (il record resta nel DB come storico/audit)."""
         with self._conn() as conn:
-            conn.execute("UPDATE media_library SET file_deleted = 1 WHERE id = ?", (media_id,))
+            conn.execute("""
+                UPDATE media_library
+                SET file_deleted = 1, lifecycle_state = 'deleted',
+                    reserved_by_draft_id = NULL
+                WHERE id = ?
+            """, (media_id,))
 
     def update_media(self, media_id: int, category: Optional[str] = None,
                       ai_description: Optional[str] = None):
@@ -585,3 +1134,224 @@ class Database:
             conn.execute("""
                 UPDATE growth_follows SET unfollowed = 1, unfollowed_at = ? WHERE id = ?
             """, (datetime.now().isoformat(), follow_id))
+
+    # ---------- Growth candidates and follower snapshots ----------
+
+    def upsert_growth_candidate(self, candidate: Dict) -> int:
+        now = self._now_iso()
+        profile_expires_at = candidate.get("profile_expires_at") or (
+            datetime.now(timezone.utc) + timedelta(days=7)
+        ).isoformat()
+        profile = candidate.get("profile") or {}
+        latest_post = candidate.get("latest_post")
+        score_data = candidate.get("score_data", candidate.get("score_json", {}))
+        with self._conn() as conn:
+            conn.execute("""
+                INSERT INTO growth_candidates (
+                    user_id, username, profile_json, latest_post_json, score,
+                    score_json, discovery_source, decision, rejection_reason,
+                    first_seen_at, last_evaluated_at, profile_expires_at,
+                    digest_sent_at, manual_followed_at, followed_back_at,
+                    suppressed_until
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    profile_json = excluded.profile_json,
+                    latest_post_json = excluded.latest_post_json,
+                    score = excluded.score,
+                    score_json = excluded.score_json,
+                    discovery_source = excluded.discovery_source,
+                    last_evaluated_at = excluded.last_evaluated_at,
+                    profile_expires_at = excluded.profile_expires_at
+            """, (
+                str(candidate["user_id"]),
+                candidate["username"],
+                json.dumps(profile),
+                json.dumps(latest_post) if latest_post is not None else None,
+                int(candidate["score"]),
+                json.dumps(score_data),
+                candidate["discovery_source"],
+                candidate.get("decision", "new"),
+                candidate.get("rejection_reason"),
+                candidate.get("first_seen_at", now),
+                candidate.get("last_evaluated_at", now),
+                profile_expires_at,
+                candidate.get("digest_sent_at"),
+                candidate.get("manual_followed_at"),
+                candidate.get("followed_back_at"),
+                candidate.get("suppressed_until"),
+            ))
+            row = conn.execute(
+                "SELECT id FROM growth_candidates WHERE user_id = ?",
+                (str(candidate["user_id"]),),
+            ).fetchone()
+            return row["id"]
+
+    def _decode_growth_candidate(self, row: sqlite3.Row) -> Dict:
+        return self._decode_json_fields(row, {
+            "profile_json": "profile",
+            "latest_post_json": "latest_post",
+            "score_json": "score_data",
+        })
+
+    def get_digest_candidates(self, limit: int = 5) -> List[Dict]:
+        now = datetime.now(timezone.utc)
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM growth_candidates
+                WHERE decision = 'new' AND score >= 75
+                ORDER BY score DESC, first_seen_at ASC
+            """).fetchall()
+        eligible = []
+        for row in rows:
+            try:
+                if self._parse_datetime(row["profile_expires_at"]) <= now:
+                    continue
+                if (
+                    row["suppressed_until"]
+                    and self._parse_datetime(row["suppressed_until"]) > now
+                ):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            eligible.append(self._decode_growth_candidate(row))
+            if len(eligible) == limit:
+                break
+        return eligible
+
+    def mark_candidate_decision(
+        self,
+        candidate_id: int,
+        decision: str,
+        reason: Optional[str] = None,
+    ) -> bool:
+        now = self._now_iso()
+        manual_followed_at = now if decision == "followed_manually" else None
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                UPDATE growth_candidates
+                SET decision = ?, rejection_reason = ?,
+                    manual_followed_at = COALESCE(?, manual_followed_at)
+                WHERE id = ? AND decision = 'new'
+            """, (decision, reason, manual_followed_at, candidate_id))
+            return cursor.rowcount == 1
+
+    def save_follower_snapshot(
+        self,
+        observed_on: str,
+        profile: Dict,
+        relevant: bool,
+        source: Optional[str],
+    ) -> bool:
+        user_id = profile.get("user_id", profile.get("id"))
+        if user_id is None:
+            raise ValueError("Follower profile requires user_id or id")
+        username = profile.get("username", "")
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO follower_snapshots (
+                    observed_on, user_id, username, relevant, source,
+                    profile_json, first_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                observed_on,
+                str(user_id),
+                username,
+                int(relevant),
+                source,
+                json.dumps(profile),
+                self._now_iso(),
+            ))
+            return cursor.rowcount == 1
+
+    def get_known_follower_ids(
+        self,
+        before_date: Optional[str] = None,
+    ) -> Set[str]:
+        with self._conn() as conn:
+            if before_date is None:
+                rows = conn.execute(
+                    "SELECT DISTINCT user_id FROM follower_snapshots"
+                ).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT DISTINCT user_id FROM follower_snapshots
+                    WHERE observed_on < ?
+                """, (before_date,)).fetchall()
+        return {row["user_id"] for row in rows}
+
+    def mark_candidate_followed_back(self, user_id: str, observed_at: str) -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                UPDATE growth_candidates SET followed_back_at = ?
+                WHERE user_id = ? AND followed_back_at IS NULL
+            """, (observed_at, str(user_id)))
+            return cursor.rowcount == 1
+
+    # ---------- Telegram updates, state and safe errors ----------
+
+    def claim_telegram_update(self, update_id: int, chat_id: str) -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO telegram_updates (
+                    update_id, chat_id, state, result_json, received_at
+                ) VALUES (?, ?, 'processing', '{}', ?)
+            """, (update_id, str(chat_id), self._now_iso()))
+            return cursor.rowcount == 1
+
+    def complete_telegram_update(
+        self,
+        update_id: int,
+        state: str,
+        result: Dict,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE telegram_updates
+                SET state = ?, result_json = ?, processed_at = ?
+                WHERE update_id = ? AND state = 'processing'
+            """, (state, json.dumps(result or {}), self._now_iso(), update_id))
+
+    def set_state(self, key: str, value: str) -> None:
+        with self._conn() as conn:
+            conn.execute("""
+                INSERT INTO bot_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+            """, (key, value, self._now_iso()))
+
+    def get_state(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else default
+
+    def log_error(self, context: str, error_type: str, safe_message: str) -> int:
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                INSERT INTO error_events (
+                    context, error_type, safe_message, created_at
+                ) VALUES (?, ?, ?, ?)
+            """, (context, error_type, safe_message, self._now_iso()))
+            return cursor.lastrowid
+
+    def get_recent_errors(
+        self,
+        limit: int = 10,
+        unresolved_only: bool = True,
+    ) -> List[Dict]:
+        with self._conn() as conn:
+            if unresolved_only:
+                rows = conn.execute("""
+                    SELECT * FROM error_events WHERE resolved = 0
+                    ORDER BY created_at DESC LIMIT ?
+                """, (limit,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM error_events
+                    ORDER BY created_at DESC LIMIT ?
+                """, (limit,)).fetchall()
+        return [dict(row) for row in rows]
