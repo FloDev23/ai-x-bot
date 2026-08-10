@@ -242,6 +242,28 @@ def test_error_logging_redacts_quoted_credential_fields(tmp_path):
     assert "timeout" in stored
 
 
+def test_error_logging_rejects_raw_inline_query_updates(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    db.log_error(
+        "telegram",
+        "DispatchFailure",
+        '{"update_id": 1, "inline_query": {"query": "private-inline"}}',
+    )
+    stored = db.get_recent_errors()[0]["safe_message"]
+    assert stored == "[redacted raw Telegram payload]"
+
+
+def test_error_logging_rejects_raw_poll_answer_updates(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    db.log_error(
+        "telegram",
+        "DispatchFailure",
+        "{'update_id': 2, 'poll_answer': {'option_ids': [0, 2]}}",
+    )
+    stored = db.get_recent_errors()[0]["safe_message"]
+    assert stored == "[redacted raw Telegram payload]"
+
+
 def test_draft_slots_are_normalized_for_identity_order_and_migration(tmp_path):
     path = tmp_path / "bot.db"
     db = Database(str(path))

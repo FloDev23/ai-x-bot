@@ -52,9 +52,8 @@ class Database:
     @staticmethod
     def _sanitize_persisted_text(value: Any) -> str:
         text = str(value)
-        lowered = text.lower()
-        if "update_id" in lowered and (
-            "message" in lowered or "callback_query" in lowered
+        if text.lstrip().startswith("{") and re.search(
+            r"(?i)[\"']?update_id[\"']?\s*:", text
         ):
             return "[redacted raw Telegram payload]"
         text = re.sub(
