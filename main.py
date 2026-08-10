@@ -44,8 +44,7 @@ try:
     from modules.database import Database
     from modules.notifier import TelegramNotifier
     from modules.content_scheduler import (
-        get_categories_for_today, get_seasonal_context, get_active_events,
-        pick_category, should_include_link, PROMO_CATEGORIES,
+        get_seasonal_context, get_active_events, PROMO_CATEGORIES,
     )
     from modules.scoring import TweetScorer
     from modules.ai_generator import AIGenerator
