@@ -44,23 +44,19 @@ MEDIA_LIBRARY_DIR = os.getenv(
 # https://console.groq.com/docs/vision e aggiorna GROQ_VISION_MODEL nel .env.
 GROQ_VISION_MODEL = os.getenv('GROQ_VISION_MODEL', 'qwen/qwen3.6-27b')
 
-# ========== Crescita rete (follow reale, non lead-hunting) ==========
-# Cerca contenuti genuini di fitness/palestre e segue account in target,
-# per costruire una rete che dia visibilità organica ai post (a differenza
-# dell'opportunity detector, che cerca clienti con un problema specifico).
-GROWTH_HASHTAGS = [h.strip() for h in os.getenv(
-    'GROWTH_HASHTAGS',
-    '#gymowner,#boutiquefitness,#personaltrainer,#crossfitbox,#fitnessstudio,#gymlife,#studioowner'
-).split(',') if h.strip()]
-# Tetto giornaliero prudente: X segnala/sospende chi segue in modo
-# aggressivo. 8/giorno è in linea con le linee guida più caute per un
-# account che deve ancora costruire fiducia algoritmica.
-GROWTH_FOLLOW_PER_DAY = int(os.getenv('GROWTH_FOLLOW_PER_DAY', '8'))
-GROWTH_FOLLOWER_MIN = int(os.getenv('GROWTH_FOLLOWER_MIN', '300'))
-GROWTH_FOLLOWER_MAX = int(os.getenv('GROWTH_FOLLOWER_MAX', '20000'))
-GROWTH_UNFOLLOW_AFTER_DAYS = int(os.getenv('GROWTH_UNFOLLOW_AFTER_DAYS', '21'))
-GROWTH_CYCLE_TIME = os.getenv('GROWTH_CYCLE_TIME', '15:30')  # 1 volta/giorno
-UNFOLLOW_CHECK_DAY = os.getenv('UNFOLLOW_CHECK_DAY', 'sun')  # controllo settimanale
+# ========== Approval-only publishing rollout ==========
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Rome")
+CONTENT_SLOTS = [value.strip() for value in os.getenv(
+    "CONTENT_SLOTS", "14:00,20:00"
+).split(",") if value.strip()]
+DRAFT_LEAD_MINUTES = int(os.getenv("DRAFT_LEAD_MINUTES", "120"))
+PUBLISH_GRACE_SECONDS = int(os.getenv("PUBLISH_GRACE_SECONDS", "300"))
+APPROVAL_REQUIRED = os.getenv("APPROVAL_REQUIRED", "true").lower() == "true"
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+DRAFT_SCORE_THRESHOLD = int(os.getenv("DRAFT_SCORE_THRESHOLD", "75"))
+SEMANTIC_DUPLICATE_THRESHOLD = float(os.getenv("SEMANTIC_DUPLICATE_THRESHOLD", "0.72"))
+MAX_LINKS_PER_WEEK = int(os.getenv("MAX_LINKS_PER_WEEK", "1"))
+ENABLE_LEAD_DISCOVERY = os.getenv("ENABLE_LEAD_DISCOVERY", "false").lower() == "true"
 
 # ========== NewsAPI ==========
 NEWSAPI_KEY = os.getenv('NEWSAPI_KEY', '')
@@ -87,11 +83,8 @@ MAX_COMMENTS_PER_SESSION = int(os.getenv('MAX_COMMENTS_PER_SESSION', '3'))
 # NOTA COSTI (X API 2026, pay-per-use): letture ~$0.005, post ~$0.015,
 # post con link ~$0.20. Gli intervalli qui sotto sono pensati per contenere
 # il costo mensile, non per massimizzare la frequenza di pubblicazione.
-DAILY_POST_TIMES = os.getenv('DAILY_POST_TIMES', '09:00,14:00,19:00').split(',')  # 3 post/giorno
 OPPORTUNITY_CYCLE_TIMES = os.getenv('OPPORTUNITY_CYCLE_TIMES', '10:00,16:00').split(',')  # 2 ricerche lead/giorno
-TARGETED_ENGAGEMENT_TIMES = os.getenv('TARGETED_ENGAGEMENT_TIMES', '11:00,18:00').split(',')  # 2 cicli engagement/giorno
 PERFORMANCE_CYCLE_TIME = os.getenv('PERFORMANCE_CYCLE_TIME', '23:00')  # 1 volta/giorno, owned reads economici
-BUILD_IN_PUBLIC_DAY = os.getenv('BUILD_IN_PUBLIC_DAY', 'friday')  # Venerdì, punto 6
 
 # ========== Scoring tweet (punto 3) ==========
 TWEET_SCORE_THRESHOLD = int(os.getenv('TWEET_SCORE_THRESHOLD', '24'))  # su 40 (60%)
@@ -99,22 +92,7 @@ MAX_REGENERATION_ATTEMPTS = int(os.getenv('MAX_REGENERATION_ATTEMPTS', '2'))
 
 # ========== Regole anti-spam (punto 9) ==========
 MAX_FLEXDROPIN_MENTIONS_PER_DAY = int(os.getenv('MAX_FLEXDROPIN_MENTIONS_PER_DAY', '2'))
-MAX_LINKS_PER_WEEK = int(os.getenv('MAX_LINKS_PER_WEEK', '3'))
 USER_COMMENT_COOLDOWN_HOURS = int(os.getenv('USER_COMMENT_COOLDOWN_HOURS', '24'))
-
-# ========== Soglia mega-account (engagement) ==========
-# Sopra questa soglia di follower, il bot si limita a Like/Like+Follow e non
-# commenta mai in automatico (es. @CrossFit, @HYROXWORLD: ottimi per la
-# visibilità, ma il loro pubblico non coincide col target commerciale di
-# FlexDropin, quindi un commento AI lì rischia di sembrare fuori contesto).
-MEGA_ACCOUNT_FOLLOWER_THRESHOLD = int(os.getenv('MEGA_ACCOUNT_FOLLOWER_THRESHOLD', '50000'))
-
-# ========== Account target curati (punto 7) ==========
-# Popolare con username reali (senza @) di gestori di palestre/boutique studio,
-# coach, founder fitness-tech, influencer di settore FUORI DALL'ITALIA
-# (mercato internazionale: US/UK/EU). Verifica sempre che l'account sia attivo
-# prima di aggiungerlo, per non sprecare letture API su profili inattivi.
-TARGET_ACCOUNTS = [a.strip() for a in os.getenv('TARGET_ACCOUNTS', '').split(',') if a.strip()]
 
 # ========== Human mode (punto 5) ==========
 # Probabilità (0-1) che, invece di un post da palinsesto, venga pubblicato

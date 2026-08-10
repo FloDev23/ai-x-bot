@@ -48,8 +48,8 @@ class TwitterClient:
             logger.error(f"❌ Errore upload media ({filepath}): {e}")
             return None
 
-    def post_tweet(self, text: str, reply_to: Optional[str] = None,
-                    media_path: Optional[str] = None, media_type: str = "image") -> Optional[Dict]:
+    def post_tweet(self, text: str, media_path: Optional[str] = None,
+                    media_type: str = "image") -> Optional[Dict]:
         """
         Posta un tweet, opzionalmente con un'immagine o un video allegato
         (dalla libreria media). Se l'upload del media fallisce, il tweet
@@ -57,7 +57,6 @@ class TwitterClient:
 
         Args:
             text: Testo del tweet
-            reply_to: ID del tweet a cui rispondere (opzionale)
             media_path: percorso locale del file da allegare (opzionale)
             media_type: 'image' o 'video', per scegliere il tipo di upload corretto
         
@@ -66,10 +65,6 @@ class TwitterClient:
         """
         try:
             params = {"text": text}
-
-            if reply_to:
-                params["reply_settings"] = "public"
-                params["in_reply_to_tweet_id"] = reply_to
 
             if media_path:
                 media_id = self.upload_media(media_path, media_type)
@@ -84,30 +79,6 @@ class TwitterClient:
         
         except Exception as e:
             logger.error(f"❌ Errore nel posting del tweet: {e}")
-            return None
-    
-    def reply_to_tweet(self, tweet_id: str, text: str) -> Optional[Dict]:
-        """
-        Risponde a un tweet
-        
-        Args:
-            tweet_id: ID del tweet a cui rispondere
-            text: Testo della risposta
-        
-        Returns:
-            Risposta dell'API
-        """
-        try:
-            response = self.client.create_tweet(
-                text=text,
-                in_reply_to_tweet_id=tweet_id,
-                reply_settings="public"
-            )
-            logger.info(f"✅ Risposta postata: {response}")
-            return response
-        
-        except Exception as e:
-            logger.error(f"❌ Errore nel posting della risposta: {e}")
             return None
     
     def search_tweets(self, query: str, limit: int = 10) -> List[Dict]:
@@ -160,42 +131,6 @@ class TwitterClient:
         except Exception as e:
             logger.error(f"❌ Errore nella ricerca dei tweet: {e}")
             return []
-
-    def like_tweet(self, tweet_id: str) -> bool:
-        """Mette like a un tweet"""
-        try:
-            self.client.like(tweet_id)
-            logger.info(f"👍 Like a tweet {tweet_id}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Errore nel mettere like: {e}")
-            return False
-
-    def follow_user(self, user_id_or_username: str) -> bool:
-        """Segue un utente, dato lo user_id (preferito) o lo username come fallback"""
-        try:
-            target_id = user_id_or_username
-            if not str(user_id_or_username).isdigit():
-                info = self.get_user_info(user_id_or_username)
-                if not info:
-                    return False
-                target_id = info['id']
-            self.client.follow_user(target_id)
-            logger.info(f"➕ Follow a {user_id_or_username}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Errore nel follow: {e}")
-            return False
-
-    def unfollow_user(self, user_id: str) -> bool:
-        """Smette di seguire un utente (punto crescita rete: unfollow chi non ricambia)"""
-        try:
-            self.client.unfollow_user(user_id)
-            logger.info(f"➖ Unfollow di {user_id}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Errore nell'unfollow: {e}")
-            return False
 
     def get_authenticated_user_id_cached(self) -> Optional[str]:
         """Wrapper con cache in memoria per evitare letture ripetute inutili"""

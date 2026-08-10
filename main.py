@@ -2,8 +2,8 @@
 """
 AI X Bot v3 - FlexDropin Growth Agent
 Da "bot che pubblica" a "agente di crescita": memoria a lungo termine,
-scoring pre-pubblicazione, auto-learning sulle performance, opportunity
-detector, engagement mirato su account curati, build in public settimanale.
+scoring pre-pubblicazione, auto-learning sulle performance e opportunity
+detector.
 
 Punti implementati (vedi analisi allegata):
 1. Memoria a lungo termine        -> modules/database.py
@@ -11,9 +11,6 @@ Punti implementati (vedi analisi allegata):
 3. Score dei tweet                 -> modules/scoring.py
 4. Database delle idee             -> modules/database.py (tabella ideas)
 5. Human mode                      -> modules/ai_generator.py
-6. Build in public                 -> ciclo weekly_build_in_public_cycle
-7. Riconoscere gli influencer       -> modules/engagement.py (score_influence)
-8. Decidere l'azione su un tweet    -> modules/engagement.py (decide_action)
 9. Anti-spam                       -> modules/database.py + content_scheduler.py
 10-11. Eventi e calendario stagionale -> modules/content_scheduler.py
 12. Persona founder                -> modules/ai_generator.py (FOUNDER_PERSONA)
@@ -38,16 +35,11 @@ from apscheduler.triggers.cron import CronTrigger
 try:
     from config import (
         validate_config, DEBUG, FLEXDROPIN_PROMO,
-        DAILY_POST_TIMES, OPPORTUNITY_CYCLE_TIMES, TARGETED_ENGAGEMENT_TIMES,
-        PERFORMANCE_CYCLE_TIME, BUILD_IN_PUBLIC_DAY,
+        OPPORTUNITY_CYCLE_TIMES, PERFORMANCE_CYCLE_TIME,
         TWEET_SCORE_THRESHOLD, MAX_REGENERATION_ATTEMPTS,
         MAX_FLEXDROPIN_MENTIONS_PER_DAY, MAX_LINKS_PER_WEEK,
-        TARGET_ACCOUNTS, HUMAN_MODE_PROBABILITY, SEARCH_TOPICS,
-        MAX_COMMENTS_PER_SESSION, MEGA_ACCOUNT_FOLLOWER_THRESHOLD,
+        HUMAN_MODE_PROBABILITY, SEARCH_TOPICS,
         TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, LEAD_NOTIFY_MIN_SCORE,
-        GROWTH_HASHTAGS, GROWTH_FOLLOW_PER_DAY, GROWTH_FOLLOWER_MIN,
-        GROWTH_FOLLOWER_MAX, GROWTH_UNFOLLOW_AFTER_DAYS,
-        GROWTH_CYCLE_TIME, UNFOLLOW_CHECK_DAY,
     )
     from modules.database import Database
     from modules.notifier import TelegramNotifier
@@ -58,9 +50,7 @@ try:
     from modules.scoring import TweetScorer
     from modules.ai_generator import AIGenerator
     from modules.twitter_client import TwitterClient
-    from modules.engagement import EngagementManager
     from modules.lead_finder import LeadFinder
-    from modules.growth import GrowthManager
     from modules.analytics import PerformanceAnalyzer
     from modules.news_fetcher import NewsFetcher
 except ImportError as e:
@@ -96,15 +86,9 @@ class FlexDropinGrowthAgent:
             self.ai_generator = AIGenerator()
             self.twitter_client = TwitterClient()
             self.scorer = TweetScorer(self.ai_generator.client, self.ai_generator.model)
-            self.engagement_manager = EngagementManager(
-                self.twitter_client, self.ai_generator, self.db,
-                max_comments_per_session=MAX_COMMENTS_PER_SESSION,
-                mega_account_threshold=MEGA_ACCOUNT_FOLLOWER_THRESHOLD,
-            )
             self.lead_finder = LeadFinder(
                 self.twitter_client, self.ai_generator.client, self.ai_generator.model, self.db
             )
-            self.growth_manager = GrowthManager(self.twitter_client, self.db)
             self.analyzer = PerformanceAnalyzer(self.twitter_client, self.db)
 
             self.scheduler = BackgroundScheduler()
@@ -272,24 +256,6 @@ class FlexDropinGrowthAgent:
         logger.info(f"✅ Tweet pubblicato [{category}/{agent_used}]: {text[:80]}...")
 
     # ------------------------------------------------------------------
-    # Ciclo 2: build in public settimanale (punto 6)
-    # ------------------------------------------------------------------
-    def weekly_build_in_public_cycle(self):
-        logger.info(f"📢 Ciclo build in public - {datetime.now()}")
-        try:
-            recent = self.db.get_recent_topics(days=7, limit=10)
-            highlights = recent if recent else []
-            text = self.ai_generator.generate_build_in_public_post(highlights)
-            if text:
-                media = self._pick_media_for_post('build_in_public', 'weekly_recap')
-                self._publish(text, category='build_in_public', topic='weekly_recap',
-                              has_link=False, score_total=None, agent_used='startup_founder',
-                              media=media)
-        except Exception as e:
-            logger.error(f"❌ Errore nel ciclo build in public: {e}")
-            self.notifier.notify_error("weekly_build_in_public_cycle", e)
-
-    # ------------------------------------------------------------------
     # Ciclo 3: opportunity detector / lead (punto 19)
     # ------------------------------------------------------------------
     def opportunity_cycle(self):
@@ -303,42 +269,6 @@ class FlexDropinGrowthAgent:
         except Exception as e:
             logger.error(f"❌ Errore nel ciclo opportunity: {e}")
             self.notifier.notify_error("opportunity_cycle", e)
-
-    # ------------------------------------------------------------------
-    # Ciclo 4: engagement mirato su account curati (punti 7, 8, 9)
-    # ------------------------------------------------------------------
-    def targeted_engagement_cycle(self):
-        logger.info(f"💬 Ciclo engagement mirato - {datetime.now()}")
-        try:
-            self.engagement_manager.run_targeted_engagement(notifier=self.notifier)
-        except Exception as e:
-            logger.error(f"❌ Errore nel ciclo di engagement mirato: {e}")
-            self.notifier.notify_error("targeted_engagement_cycle", e)
-
-    # ------------------------------------------------------------------
-    # Ciclo crescita rete: segue account fitness reali (non lead-hunting)
-    # per costruire una rete che dia visibilità organica ai post
-    # ------------------------------------------------------------------
-    def growth_cycle(self):
-        logger.info(f"🌱 Ciclo crescita rete - {datetime.now()}")
-        try:
-            followed = self.growth_manager.run_daily_follow_cycle(
-                hashtags=GROWTH_HASHTAGS, per_day=GROWTH_FOLLOW_PER_DAY,
-                follower_min=GROWTH_FOLLOWER_MIN, follower_max=GROWTH_FOLLOWER_MAX,
-            )
-            self.notifier.notify_growth_summary(followed)
-        except Exception as e:
-            logger.error(f"❌ Errore nel ciclo di crescita rete: {e}")
-            self.notifier.notify_error("growth_cycle", e)
-
-    def unfollow_check_cycle(self):
-        logger.info(f"🔍 Controllo unfollow settimanale - {datetime.now()}")
-        try:
-            unfollowed = self.growth_manager.run_unfollow_check(days_old=GROWTH_UNFOLLOW_AFTER_DAYS)
-            self.notifier.notify_growth_summary(followed=[], unfollowed=unfollowed)
-        except Exception as e:
-            logger.error(f"❌ Errore nel controllo unfollow: {e}")
-            self.notifier.notify_error("unfollow_check_cycle", e)
 
     # ------------------------------------------------------------------
     # Ciclo 5: performance analytics / auto-learning (punto 2)
@@ -357,31 +287,10 @@ class FlexDropinGrowthAgent:
             self.notifier.notify_error("performance_cycle", e)
 
     # ------------------------------------------------------------------
-    # Setup account target curati (una tantum / settimanale)
-    # ------------------------------------------------------------------
-    def sync_targets(self):
-        if not TARGET_ACCOUNTS:
-            logger.info("ℹ️ TARGET_ACCOUNTS vuoto in config.py/.env: nessun account curato da sincronizzare. "
-                        "Aggiungi username separati da virgola in TARGET_ACCOUNTS per abilitare "
-                        "l'engagement mirato (punto 7).")
-            return
-        try:
-            self.engagement_manager.sync_target_accounts(TARGET_ACCOUNTS)
-        except Exception as e:
-            logger.error(f"❌ Errore nella sincronizzazione dei target: {e}")
-
-    # ------------------------------------------------------------------
     # Avvio
     # ------------------------------------------------------------------
     def start(self):
         logger.info("🚀 Avvio FlexDropin Growth Agent...")
-
-        for t in DAILY_POST_TIMES:
-            hh, mm = t.strip().split(':')
-            self.scheduler.add_job(
-                self.daily_content_cycle, CronTrigger(hour=int(hh), minute=int(mm)),
-                id=f'content_{t}', name=f'Daily Content {t}'
-            )
 
         for t in OPPORTUNITY_CYCLE_TIMES:
             hh, mm = t.strip().split(':')
@@ -390,48 +299,15 @@ class FlexDropinGrowthAgent:
                 id=f'opportunity_{t}', name=f'Opportunity Detector {t}'
             )
 
-        for t in TARGETED_ENGAGEMENT_TIMES:
-            hh, mm = t.strip().split(':')
-            self.scheduler.add_job(
-                self.targeted_engagement_cycle, CronTrigger(hour=int(hh), minute=int(mm)),
-                id=f'engagement_{t}', name=f'Targeted Engagement {t}'
-            )
-
         hh, mm = PERFORMANCE_CYCLE_TIME.strip().split(':')
         self.scheduler.add_job(
             self.performance_cycle, CronTrigger(hour=int(hh), minute=int(mm)),
             id='performance_cycle', name='Performance Analytics'
         )
 
-        self.scheduler.add_job(
-            self.weekly_build_in_public_cycle,
-            CronTrigger(day_of_week=BUILD_IN_PUBLIC_DAY[:3].lower(), hour=9, minute=30),
-            id='build_in_public', name='Build in Public settimanale'
-        )
-
-        hh, mm = GROWTH_CYCLE_TIME.strip().split(':')
-        self.scheduler.add_job(
-            self.growth_cycle, CronTrigger(hour=int(hh), minute=int(mm)),
-            id='growth_cycle', name='Crescita rete (follow)'
-        )
-
-        self.scheduler.add_job(
-            self.unfollow_check_cycle,
-            CronTrigger(day_of_week=UNFOLLOW_CHECK_DAY[:3].lower(), hour=9, minute=0),
-            id='unfollow_check', name='Controllo unfollow settimanale'
-        )
-
-        # Sincronizza i target curati una volta all'avvio e poi settimanalmente
-        self.sync_targets()
-        self.scheduler.add_job(
-            self.sync_targets, CronTrigger(day_of_week='mon', hour=8, minute=0),
-            id='sync_targets', name='Sync Target Accounts'
-        )
-
         self.scheduler.start()
         logger.info("✅ Growth Agent avviato e in esecuzione. Premi Ctrl+C per fermare.")
-        logger.info(f"📅 Post giornalieri: {DAILY_POST_TIMES} | Opportunity: {OPPORTUNITY_CYCLE_TIMES} | "
-                    f"Engagement mirato: {TARGETED_ENGAGEMENT_TIMES} | Crescita rete: {GROWTH_CYCLE_TIME}")
+        logger.info(f"📅 Opportunity: {OPPORTUNITY_CYCLE_TIMES}")
 
         try:
             import time
