@@ -8,9 +8,9 @@ logger = logging.getLogger(__name__)
 class NewsFetcher:
     """Fetcha notizie da NewsAPI"""
     
-    def __init__(self):
-        self.api_key = NEWSAPI_KEY
-        self.base_url = NEWSAPI_BASE_URL
+    def __init__(self, api_key: str = NEWSAPI_KEY, base_url: str = NEWSAPI_BASE_URL):
+        self.api_key = api_key
+        self.base_url = base_url
     
     def get_trending_news(self, query: str, limit: int = MAX_SEARCH_RESULTS) -> List[Dict]:
         """
@@ -23,6 +23,9 @@ class NewsFetcher:
         Returns:
             Lista di articoli
         """
+        if not self.api_key:
+            logger.info("News fetching disabled because NEWSAPI_KEY is not configured")
+            return []
         try:
             params = {
                 'q': query,
@@ -58,6 +61,9 @@ class NewsFetcher:
         Returns:
             Lista di articoli
         """
+        if not self.api_key:
+            logger.info("News fetching disabled because NEWSAPI_KEY is not configured")
+            return []
         try:
             params = {
                 'sources': source,

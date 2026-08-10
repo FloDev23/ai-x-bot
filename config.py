@@ -61,6 +61,11 @@ ENABLE_LEAD_DISCOVERY = os.getenv("ENABLE_LEAD_DISCOVERY", "false").lower() == "
 # ========== NewsAPI ==========
 NEWSAPI_KEY = os.getenv('NEWSAPI_KEY', '')
 NEWSAPI_BASE_URL = 'https://newsapi.org/v2'
+NEWS_TRUSTED_DOMAINS = {
+    domain.strip().lower().rstrip('.')
+    for domain in os.getenv('NEWS_TRUSTED_DOMAINS', '').split(',')
+    if domain.strip()
+}
 
 # ========== FlexDropin Configuration ==========
 FLEXDROPIN_PROMO = True  # Abilita promozione FlexDropin
