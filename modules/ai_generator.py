@@ -25,6 +25,7 @@ import json
 from groq import Groq
 from config import GROQ_API_KEY, GROQ_MODEL, GROQ_VISION_MODEL, FLEXDROPIN_PLAY_STORE, FLEXDROPIN_APP_STORE, FLEXDROPIN_WEBSITE
 from modules import character as character_module
+from modules.fact_guard import normalize_incident_subtype, valid_source_id
 from typing import Dict, Optional, List
 
 logger = logging.getLogger(__name__)
@@ -207,11 +208,11 @@ SOURCE_BUNDLE:
                 return None
             if not isinstance(claim.get("supported_by"), list):
                 return None
-            if any(
-                isinstance(source_id, bool)
-                or not isinstance(source_id, (int, str))
-                for source_id in claim["supported_by"]
-            ):
+            if any(not valid_source_id(source_id) for source_id in claim["supported_by"]):
+                return None
+            if claim["type"].strip() == "incident" and normalize_incident_subtype(
+                claim.get("subtype")
+            ) is None:
                 return None
         return data
 

@@ -85,6 +85,23 @@ def test_claim_analysis_rejects_structured_values_as_source_ids(fake_ai):
     assert fake_ai.analyze_claims("The fee is 15%.", [{"id": 7}]) is None
 
 
+def test_claim_analysis_requires_known_incident_subtype(fake_ai):
+    missing = {
+        "claims": [{"type": "incident", "text": "Incident", "supported_by": [5]}],
+    }
+    unknown = {
+        "claims": [{
+            "type": "incident",
+            "subtype": "availability",
+            "text": "Incident",
+            "supported_by": [5],
+        }],
+    }
+    fake_ai.responses = [json.dumps(missing), json.dumps(unknown)]
+    assert fake_ai.analyze_claims("Incident.", [{"id": 5}]) is None
+    assert fake_ai.analyze_claims("Incident.", [{"id": 5}]) is None
+
+
 def test_score_draft_normalizes_seven_axes_to_one_hundred():
     payload = {axis: 10 for axis in SCORE_AXES}
     result = _scorer(json.dumps(payload)).score_draft("Useful draft")

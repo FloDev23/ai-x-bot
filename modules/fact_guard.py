@@ -21,12 +21,12 @@ REQUIRED_SOURCE_TYPES = {
     "named_current_event": {"verified_news"},
 }
 
-SENSITIVE_INCIDENT_SUBTYPES = {
+INCIDENT_SUBTYPES = frozenset({
     "payment",
     "privacy",
     "security",
     "customer_impacting",
-}
+})
 
 
 def _parse_timestamp(raw):
@@ -56,15 +56,27 @@ def source_is_expired(source, now=None):
     return expires_at <= moment.astimezone(timezone.utc)
 
 
+def valid_source_id(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, str):
+        return bool(value.strip())
+    return False
+
+
+def normalize_incident_subtype(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized if normalized in INCIDENT_SUBTYPES else None
+
+
 def _source_is_valid(source, allowed_types):
     if not isinstance(source, dict):
         return False
-    source_id = source.get("id")
-    if (
-        isinstance(source_id, bool)
-        or not isinstance(source_id, (int, str))
-        or (isinstance(source_id, str) and not source_id.strip())
-    ):
+    if not valid_source_id(source.get("id")):
         return False
     if source.get("trust_state") != "verified":
         return False
@@ -80,15 +92,6 @@ def _source_is_valid(source, allowed_types):
     if source.get("source_type") == "founder_note":
         return source.get("metadata", {}).get("publishable") is True
     return True
-
-
-def _incident_subtype(claim):
-    raw = claim.get("subtype") or claim.get("incident_type")
-    if claim.get("customer_impacting") is True:
-        return "customer_impacting"
-    if not isinstance(raw, str):
-        return None
-    return raw.strip().lower().replace("-", "_").replace(" ", "_")
 
 
 class FactGuard:
@@ -115,25 +118,37 @@ class FactGuard:
             if not isinstance(claim, dict):
                 reasons.append("malformed_claim")
                 continue
-            claim_type = claim.get("type", "unknown")
-            if not isinstance(claim_type, str):
+            claim_type = claim.get("type")
+            claim_text = claim.get("text")
+            supported_by = claim.get("supported_by")
+            if (
+                not isinstance(claim_type, str)
+                or not claim_type.strip()
+                or not isinstance(claim_text, str)
+                or not claim_text.strip()
+                or not isinstance(supported_by, list)
+                or any(not valid_source_id(value) for value in supported_by)
+            ):
                 reasons.append("malformed_claim")
                 continue
+            claim_type = claim_type.strip()
             required = REQUIRED_SOURCE_TYPES.get(claim_type)
             if required is None:
                 reasons.append("unsupported_claim_type:" + claim_type)
                 continue
-            supported_by = claim.get("supported_by", [])
-            if not isinstance(supported_by, list):
-                supported_by = []
+            subtype = None
+            if claim_type == "incident":
+                subtype = normalize_incident_subtype(claim.get("subtype"))
+                if subtype is None:
+                    reasons.append("invalid_incident_subtype")
+                    continue
             supporting = [by_id.get(str(value)) for value in supported_by]
             valid = [source for source in supporting if _source_is_valid(source, required)]
             if not valid:
                 reasons.append("unsupported_claim:" + claim_type)
                 continue
 
-            subtype = _incident_subtype(claim) if claim_type == "incident" else None
-            if subtype in SENSITIVE_INCIDENT_SUBTYPES and not any(
+            if subtype is not None and not any(
                 source.get("metadata", {}).get("disclosure_approved") is True
                 for source in valid
             ):
