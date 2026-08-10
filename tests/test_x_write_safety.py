@@ -2,6 +2,7 @@ import importlib
 import inspect
 
 import config
+import dotenv
 from modules.twitter_client import TwitterClient
 
 
@@ -20,8 +21,15 @@ def test_twitter_client_exposes_only_approved_post_write():
 
 
 def test_rollout_defaults_are_safe(monkeypatch):
-    monkeypatch.delenv("DRY_RUN", raising=False)
-    monkeypatch.delenv("CONTENT_SLOTS", raising=False)
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda: False)
+    for name in (
+        "DRY_RUN",
+        "APPROVAL_REQUIRED",
+        "BOT_TIMEZONE",
+        "CONTENT_SLOTS",
+        "MAX_LINKS_PER_WEEK",
+    ):
+        monkeypatch.delenv(name, raising=False)
     reloaded = importlib.reload(config)
     assert reloaded.DRY_RUN is True
     assert reloaded.APPROVAL_REQUIRED is True
