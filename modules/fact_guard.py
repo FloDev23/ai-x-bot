@@ -20,6 +20,7 @@ REQUIRED_SOURCE_TYPES = {
     "named_entity": {"founder_note", "product_fact", "verified_news"},
     "named_current_event": {"verified_news"},
 }
+SUPPORTED_CLAIM_TYPES = frozenset(REQUIRED_SOURCE_TYPES)
 
 INCIDENT_SUBTYPES = frozenset({
     "payment",
@@ -64,6 +65,13 @@ def valid_source_id(value):
     if isinstance(value, str):
         return bool(value.strip())
     return False
+
+
+def normalize_claim_type(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    return normalized if normalized in SUPPORTED_CLAIM_TYPES else None
 
 
 def normalize_incident_subtype(value):
@@ -131,11 +139,12 @@ class FactGuard:
             ):
                 reasons.append("malformed_claim")
                 continue
-            claim_type = claim_type.strip()
-            required = REQUIRED_SOURCE_TYPES.get(claim_type)
-            if required is None:
-                reasons.append("unsupported_claim_type:" + claim_type)
+            raw_claim_type = claim_type.strip()
+            claim_type = normalize_claim_type(raw_claim_type)
+            if claim_type is None:
+                reasons.append("unsupported_claim_type:" + raw_claim_type)
                 continue
+            required = REQUIRED_SOURCE_TYPES[claim_type]
             subtype = None
             if claim_type == "incident":
                 subtype = normalize_incident_subtype(claim.get("subtype"))

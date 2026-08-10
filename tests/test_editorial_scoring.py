@@ -102,6 +102,35 @@ def test_claim_analysis_requires_known_incident_subtype(fake_ai):
     assert fake_ai.analyze_claims("Incident.", [{"id": 5}]) is None
 
 
+def test_claim_analysis_accepts_only_supported_claim_types(fake_ai):
+    unsupported = {
+        "claims": [{"type": "rumor", "text": "A rumor", "supported_by": [1]}],
+    }
+    valid_types = (
+        "first_person",
+        "number",
+        "product_claim",
+        "incident",
+        "medical",
+        "testimonial",
+        "named_entity",
+        "named_current_event",
+    )
+    valid_analyses = []
+    for claim_type in valid_types:
+        claim = {"type": claim_type, "text": "A claim", "supported_by": [1]}
+        if claim_type == "incident":
+            claim["subtype"] = "security"
+        valid_analyses.append({"claims": [claim]})
+
+    fake_ai.responses = [json.dumps(unsupported)] + [
+        json.dumps(analysis) for analysis in valid_analyses
+    ]
+    assert fake_ai.analyze_claims("A rumor.", [{"id": 1}]) is None
+    for analysis in valid_analyses:
+        assert fake_ai.analyze_claims("A claim.", [{"id": 1}]) == analysis
+
+
 def test_score_draft_normalizes_seven_axes_to_one_hundred():
     payload = {axis: 10 for axis in SCORE_AXES}
     result = _scorer(json.dumps(payload)).score_draft("Useful draft")
