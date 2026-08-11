@@ -43,6 +43,13 @@ MEDIA_LIBRARY_DIR = os.getenv(
 # smette di funzionare, controlla i modelli vision disponibili su
 # https://console.groq.com/docs/vision e aggiorna GROQ_VISION_MODEL nel .env.
 GROQ_VISION_MODEL = os.getenv('GROQ_VISION_MODEL', 'qwen/qwen3.6-27b')
+TELEGRAM_MAX_IMAGE_BYTES = int(os.getenv(
+    'TELEGRAM_MAX_IMAGE_BYTES', str(10 * 1024 * 1024)
+))
+TELEGRAM_MAX_VIDEO_BYTES = int(os.getenv(
+    'TELEGRAM_MAX_VIDEO_BYTES', str(50 * 1024 * 1024)
+))
+MEDIA_MATCH_THRESHOLD = int(os.getenv('MEDIA_MATCH_THRESHOLD', '80'))
 
 # ========== Approval-only publishing rollout ==========
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Rome")

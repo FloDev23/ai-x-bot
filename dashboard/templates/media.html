@@ -4,7 +4,7 @@
 
 {% block content %}
 <h1 class="page-title">Libreria media</h1>
-<p class="page-sub">Carica foto e video reali: l'AI li analizza, li categorizza e propone una didascalia. Ogni file viene usato una sola volta nei post, poi resta segnato come "usato".</p>
+<p class="page-sub">Carica foto e video reali: vengono conservati e analizzati, senza generare o pubblicare subito. Il matching avviene soltanto dopo la creazione di una bozza.</p>
 
 <div class="section" style="margin-bottom: 20px;">
   <div class="section-header">
@@ -12,14 +12,16 @@
   </div>
   <form method="post" action="{{ url_for('media_upload') }}" enctype="multipart/form-data" style="padding: 18px; display: flex; gap: 12px; align-items: center;">
     <input type="file" name="file" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,.m4v" required>
+    <input type="text" name="user_context" maxlength="2000" placeholder="Contesto del contenuto (opzionale)">
     <button class="btn" type="submit" style="background: var(--teal-dim); color: var(--teal); border-color: transparent;">Carica e analizza</button>
   </form>
 </div>
 
 <div class="filters">
   <a class="filter-chip {{ 'active' if status_filter == 'tutti' }}" href="{{ url_for('media_view', status='tutti') }}">Tutti</a>
-  <a class="filter-chip {{ 'active' if status_filter == 'non_usati' }}" href="{{ url_for('media_view', status='non_usati') }}">Non usati</a>
-  <a class="filter-chip {{ 'active' if status_filter == 'usati' }}" href="{{ url_for('media_view', status='usati') }}">Usati</a>
+  {% for state in ["available", "reserved", "used", "archived", "deleted"] %}
+  <a class="filter-chip {{ 'active' if status_filter == state }}" href="{{ url_for('media_view', status=state) }}">{{ state }}</a>
+  {% endfor %}
 </div>
 
 {% if items %}
@@ -27,7 +29,9 @@
   {% for m in items %}
   <div class="media-card">
     <div class="media-thumb">
-      {% if m.media_type == 'video' %}
+      {% if m.file_deleted %}
+        <div class="media-thumb-placeholder">file eliminato</div>
+      {% elif m.media_type == 'video' %}
         <video src="{{ url_for('media_file', filename=m.filename) }}" controls preload="metadata"></video>
       {% else %}
         <img src="{{ url_for('media_file', filename=m.filename) }}" alt="{{ m.filename }}">
@@ -35,8 +39,9 @@
     </div>
     <div class="media-body">
       <div class="media-top-row">
-        <span class="pill pill-{{ 'gestito' if m.used else 'nuovo' }}">{{ "usato" if m.used else "non usato" }}</span>
+        <span class="pill pill-{{ 'gestito' if m.lifecycle_state in ['used', 'archived', 'deleted'] else 'nuovo' }}">{{ m.lifecycle_state }}</span>
         <span class="pill pill-ignora">{{ m.media_type }}</span>
+        <span class="pill pill-ignora">{{ "riutilizzabile" if m.reusable else "uso singolo" }}</span>
       </div>
       <div class="media-filename mono">{{ m.filename }}</div>
       {% if m.ai_description %}<div class="media-desc">{{ m.ai_description }}</div>{% endif %}
@@ -54,9 +59,22 @@
         <button class="btn" type="submit">Salva</button>
       </form>
 
-      <form method="post" action="{{ url_for('media_delete', media_id=m.id) }}" onsubmit="return confirm('Eliminare definitivamente questo file?');">
-        <button class="btn" type="submit" style="color: var(--red);">Elimina</button>
-      </form>
+      {% if m.lifecycle_state == 'available' %}
+        <form method="post" action="{{ url_for('media_archive', media_id=m.id) }}">
+          <button class="btn" type="submit">Archivia</button>
+        </form>
+      {% endif %}
+      {% if m.lifecycle_state == 'used' %}
+        <form method="post" action="{{ url_for('media_reusable', media_id=m.id) }}">
+          <input type="hidden" name="reusable" value="{{ 0 if m.reusable else 1 }}">
+          <button class="btn" type="submit">{{ "Disattiva riuso" if m.reusable else "Rendi riutilizzabile" }}</button>
+        </form>
+      {% endif %}
+      {% if not m.file_deleted %}
+        <form method="post" action="{{ url_for('media_delete', media_id=m.id) }}" onsubmit="return confirm('Cancellare PERMANENTEMENTE il file? Questa è l’unica azione distruttiva.');">
+          <button class="btn" type="submit" style="color: var(--red);">Elimina permanentemente</button>
+        </form>
+      {% endif %}
     </div>
   </div>
   {% endfor %}

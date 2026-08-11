@@ -352,14 +352,14 @@ Pick "category" as the single best fit from the list."""
             return None
 
     def select_best_media(self, category: str, topic_hint: str,
-                           candidates: List[Dict]) -> Optional[int]:
+                           candidates: List[Dict]) -> Optional[Dict]:
         """
         Sceglie, tra i media non ancora usati, quello più adatto al post di
         OGGI in base al contenuto (categoria + argomento) — non il più
         vecchio. Ragiona sulle descrizioni già prodotte dall'analisi vision
         al momento dell'upload, non rianalizza le immagini.
 
-        Ritorna l'id del media scelto, o None se nessuno è genuinamente
+        Ritorna scelta, rilevanza e motivazione, o None se nessuno è genuinamente
         adatto: in quel caso il post resta solo testo, non forziamo mai un
         abbinamento casuale pur di allegare qualcosa.
         """
@@ -368,7 +368,9 @@ Pick "category" as the single best fit from the list."""
 
         options_block = "\n".join(
             f'- id {c["id"]}: type={c["media_type"]}, category={c["category"]}, '
-            f'description="{c["ai_description"] or "n/a"}", tags={c["ai_tags"] or "n/a"}'
+            f'description="{c.get("ai_description") or "n/a"}", '
+            f'tags={c.get("ai_tags") or "n/a"}, '
+            f'user_context="{c.get("user_context") or "n/a"}"'
             for c in candidates
         )
 
@@ -385,7 +387,8 @@ Available unused media in the library:
 Pick the id of the single best-matching media for THIS post's topic, based
 on its description/tags. If nothing genuinely fits well, don't force it.
 
-Reply ONLY with a JSON object, no other text: {{"media_id": <id or null>}}"""
+Reply ONLY with a JSON object, no other text, using this exact schema:
+{{"media_id": <id or null>, "relevance": <integer 0-100>, "reason": "<brief reason>"}}"""
 
         raw = self._complete(FOUNDER_PERSONA, prompt, max_tokens=100, temperature=0.2)
         if not raw:
@@ -393,8 +396,27 @@ Reply ONLY with a JSON object, no other text: {{"media_id": <id or null>}}"""
         try:
             raw_clean = raw.strip().replace('```json', '').replace('```', '').strip()
             data = json.loads(raw_clean)
-            media_id = data.get('media_id')
-            return int(media_id) if media_id else None
+            media_id = data.get("media_id")
+            relevance = data.get("relevance")
+            reason = data.get("reason")
+            if media_id is None:
+                return None
+            media_id = int(media_id)
+            if media_id not in {candidate["id"] for candidate in candidates}:
+                return None
+            if (
+                isinstance(relevance, bool)
+                or not isinstance(relevance, int)
+                or not 0 <= relevance <= 100
+                or not isinstance(reason, str)
+                or not reason.strip()
+            ):
+                return None
+            return {
+                "media_id": media_id,
+                "relevance": relevance,
+                "reason": reason.strip()[:500],
+            }
         except Exception as e:
             logger.warning(f"⚠️ Impossibile interpretare la scelta media dell'AI (raw: {raw[:150]}): {e}")
             return None

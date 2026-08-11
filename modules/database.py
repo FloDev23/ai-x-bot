@@ -750,12 +750,14 @@ class Database:
                 rows = conn.execute("""
                     SELECT * FROM content_sources
                     WHERE trust_state = 'verified' AND source_type = ?
+                      AND source_type != 'media_context'
                     ORDER BY created_at DESC
                 """, (source_type,)).fetchall()
             else:
                 rows = conn.execute("""
                     SELECT * FROM content_sources
                     WHERE trust_state = 'verified'
+                      AND source_type != 'media_context'
                     ORDER BY created_at DESC
                 """).fetchall()
 
@@ -1430,6 +1432,58 @@ class Database:
             """, (filename, filepath, media_type, category, ai_description, ai_tags))
             return cur.lastrowid
 
+    def add_media_with_context(
+        self,
+        filename: str,
+        filepath: str,
+        media_type: str,
+        category: str = "other",
+        ai_description: str = "",
+        ai_tags: str = "",
+        user_context: str = "",
+        mime_type: Optional[str] = None,
+        file_size: int = 0,
+    ) -> int:
+        """Atomically persist an available media row and its audit source."""
+        now = self._now_iso()
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                INSERT INTO media_library (
+                    filename, filepath, media_type, category, ai_description,
+                    ai_tags, lifecycle_state, user_context, mime_type, file_size
+                ) VALUES (?, ?, ?, ?, ?, ?, 'available', ?, ?, ?)
+            """, (
+                filename, filepath, media_type, category, ai_description,
+                ai_tags, user_context, mime_type, file_size,
+            ))
+            media_id = cursor.lastrowid
+            source_text = user_context or ai_description or filename
+            conn.execute("""
+                INSERT INTO content_sources (
+                    source_type, text, metadata_json, trust_state,
+                    created_at, updated_at
+                ) VALUES ('media_context', ?, ?, 'verified', ?, ?)
+            """, (
+                source_text,
+                json.dumps({"media_id": media_id}),
+                now,
+                now,
+            ))
+            return media_id
+
+    def get_media_context_source(self, media_id: int) -> Optional[Dict]:
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM content_sources
+                WHERE source_type = 'media_context'
+                ORDER BY id ASC
+            """).fetchall()
+        for row in rows:
+            decoded = self._decode_json_fields(row, {"metadata_json": "metadata"})
+            if decoded["metadata"].get("media_id") == media_id:
+                return decoded
+        return None
+
     def get_media_by_id(self, media_id: int) -> Optional[Dict]:
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM media_library WHERE id = ?", (media_id,)).fetchone()
@@ -1499,13 +1553,99 @@ class Database:
             """, (draft_id, media_id))
             return cursor.rowcount == 1
 
+    def attach_media_to_draft(self, media_id: int, draft_id: int) -> bool:
+        """Atomically reserve media and append its trace source to a draft."""
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+            media = conn.execute(
+                "SELECT * FROM media_library WHERE id = ?", (media_id,)
+            ).fetchone()
+            if (
+                not draft
+                or draft["status"] != "pending_approval"
+                or draft["media_id"] is not None
+                or not media
+                or media["lifecycle_state"] != "available"
+                or media["file_deleted"]
+            ):
+                return False
+            context_source_id = None
+            for source in conn.execute("""
+                SELECT id, metadata_json FROM content_sources
+                WHERE source_type = 'media_context'
+                ORDER BY id ASC
+            """).fetchall():
+                try:
+                    metadata = json.loads(source["metadata_json"])
+                except (TypeError, ValueError):
+                    continue
+                if metadata.get("media_id") == media_id:
+                    context_source_id = source["id"]
+                    break
+            if context_source_id is None:
+                return False
+            reserved = conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
+                WHERE id = ? AND lifecycle_state = 'available'
+                  AND file_deleted = 0
+            """, (draft_id, media_id))
+            if reserved.rowcount != 1:
+                return False
+            source_ids = json.loads(draft["source_ids_json"])
+            if context_source_id not in source_ids:
+                source_ids.append(context_source_id)
+            now = self._now_iso()
+            updated = conn.execute("""
+                UPDATE post_drafts
+                SET media_id = ?, source_ids_json = ?, updated_at = ?,
+                    revision = revision + 1
+                WHERE id = ? AND status = 'pending_approval'
+                  AND media_id IS NULL AND revision = ?
+            """, (
+                media_id, json.dumps(source_ids), now, draft_id, draft["revision"],
+            ))
+            if updated.rowcount != 1:
+                raise sqlite3.IntegrityError("draft changed during media attach")
+            self._insert_draft_evaluation_in_conn(
+                conn,
+                draft["intended_slot"],
+                draft["category"],
+                "media_reserved",
+                {"draft_id": draft_id, "media_id": media_id},
+                now,
+            )
+            return True
+
     def release_media_for_draft(self, draft_id: int) -> None:
         with self._conn() as conn:
+            draft = conn.execute(
+                "SELECT intended_slot, category FROM post_drafts WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            media_ids = [row["id"] for row in conn.execute("""
+                SELECT id FROM media_library
+                WHERE reserved_by_draft_id = ? AND lifecycle_state = 'reserved'
+            """, (draft_id,)).fetchall()]
             conn.execute("""
                 UPDATE media_library
                 SET lifecycle_state = 'available', reserved_by_draft_id = NULL
                 WHERE reserved_by_draft_id = ? AND lifecycle_state = 'reserved'
             """, (draft_id,))
+            if draft:
+                now = self._now_iso()
+                for media_id in media_ids:
+                    self._insert_draft_evaluation_in_conn(
+                        conn,
+                        draft["intended_slot"],
+                        draft["category"],
+                        "media_released",
+                        {"draft_id": draft_id, "media_id": media_id},
+                        now,
+                    )
 
     def mark_media_used(self, media_id: int, tweet_id: str = ''):
         with self._conn() as conn:
@@ -1522,7 +1662,7 @@ class Database:
             cursor = conn.execute("""
                 UPDATE media_library
                 SET lifecycle_state = 'archived', reserved_by_draft_id = NULL
-                WHERE id = ? AND lifecycle_state IN ('available', 'reserved')
+                WHERE id = ? AND lifecycle_state = 'available'
             """, (media_id,))
             return cursor.rowcount == 1
 

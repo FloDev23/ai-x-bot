@@ -19,14 +19,18 @@ import sys
 from pathlib import Path
 
 from flask import Flask, render_template, request, redirect, url_for, send_from_directory
-from werkzeug.utils import secure_filename
 
 # Permette di importare modules.database anche eseguendo questo file
 # direttamente dalla cartella dashboard/
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from modules.database import Database  # noqa: E402
-from modules.media_processor import MediaProcessor  # noqa: E402
+from modules.media_processor import (  # noqa: E402
+    MediaProcessor,
+    media_content_matches,
+    sanitize_media_filename,
+    validate_media_upload,
+)
 from config import MEDIA_LIBRARY_DIR  # noqa: E402
 
 app = Flask(__name__)
@@ -39,7 +43,6 @@ db = Database(db_path=BOT_DB_PATH)
 
 MEDIA_DIR = MEDIA_LIBRARY_DIR
 os.makedirs(MEDIA_DIR, exist_ok=True)
-ALLOWED_MEDIA_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v"}
 
 # L'analisi AI richiede GROQ_API_KEY: se non configurata o Groq non
 # raggiungibile dalla dashboard, i file vengono comunque salvati e
@@ -138,14 +141,9 @@ def logs_view():
 @app.route("/media")
 def media_view():
     status_filter = request.args.get("status", "tutti")
-    # I file già eliminati dal disco (usati e ripuliti da main.py) non hanno
-    # più nulla da mostrare: il record resta nel DB come storico, ma non
-    # occupa più spazio inutile nella dashboard.
-    items = [m for m in db.get_all_media(limit=300) if not m["file_deleted"]]
-    if status_filter == "non_usati":
-        items = [m for m in items if not m["used"]]
-    elif status_filter == "usati":
-        items = [m for m in items if m["used"]]
+    items = db.get_all_media(limit=300)
+    if status_filter != "tutti":
+        items = [m for m in items if m["lifecycle_state"] == status_filter]
     return render_template("media.html", items=items, status_filter=status_filter, service=SERVICE_NAME)
 
 
@@ -155,11 +153,17 @@ def media_upload():
     if not file or file.filename == "":
         return redirect(url_for("media_view"))
 
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    if ext not in ALLOWED_MEDIA_EXTENSIONS:
-        return redirect(url_for("media_view"))
+    file.stream.seek(0, os.SEEK_END)
+    file_size = file.stream.tell()
+    file.stream.seek(0)
+    mime_type = file.mimetype
+    valid, reason = validate_media_upload(file.filename, mime_type, file_size)
+    if not valid or not media_content_matches(file.stream, mime_type):
+        if valid:
+            reason = "mime_content_mismatch"
+        return f"Invalid media upload: {reason}", 400
 
-    safe_name = secure_filename(file.filename)
+    safe_name = sanitize_media_filename(file.filename)
     # Evita di sovrascrivere un file già esistente con lo stesso nome
     base, extension = os.path.splitext(safe_name)
     final_name = safe_name
@@ -172,7 +176,13 @@ def media_upload():
     file.save(filepath)
 
     # Analisi AI + registrazione nel database (non blocca l'upload se fallisce)
-    media_processor.process_new_file(filepath, final_name)
+    media_processor.process_new_file(
+        filepath,
+        final_name,
+        mime_type,
+        file_size,
+        request.form.get("user_context", ""),
+    )
 
     return redirect(url_for("media_view"))
 
@@ -188,12 +198,30 @@ def media_update(media_id):
 @app.route("/media/<int:media_id>/delete", methods=["POST"])
 def media_delete(media_id):
     item = db.get_media_by_id(media_id)
-    if item and os.path.exists(item["filepath"]):
+    if not item:
+        return redirect(url_for("media_view"))
+    media_root = Path(MEDIA_DIR).resolve()
+    item_path = Path(item["filepath"]).resolve()
+    if media_root not in item_path.parents:
+        return "Refusing to delete a path outside the media library", 400
+    if item_path.exists():
         try:
-            os.remove(item["filepath"])
+            item_path.unlink()
         except OSError:
-            pass
-    db.delete_media(media_id)
+            return "Unable to delete media file", 500
+    db.mark_media_file_deleted(media_id)
+    return redirect(url_for("media_view"))
+
+
+@app.route("/media/<int:media_id>/archive", methods=["POST"])
+def media_archive(media_id):
+    db.archive_media(media_id)
+    return redirect(url_for("media_view"))
+
+
+@app.route("/media/<int:media_id>/reusable", methods=["POST"])
+def media_reusable(media_id):
+    db.set_media_reusable(media_id, request.form.get("reusable") == "1")
     return redirect(url_for("media_view"))
 
 
