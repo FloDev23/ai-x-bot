@@ -1236,6 +1236,144 @@ class Database:
         except sqlite3.IntegrityError:
             return False
 
+    def finalize_post_draft_publication(
+        self,
+        draft_id: int,
+        tweet_id: str,
+    ) -> bool:
+        """Atomically persist a confirmed tweet, media use and draft state."""
+        if type(tweet_id) is not str or not tweet_id:
+            raise ValueError("invalid_tweet_id")
+        with self._media_store_mutation_lock(
+            "draft_reservations", draft_id,
+        ) as conn:
+            draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+            if (
+                draft is None
+                or draft["status"] != "publishing"
+                or draft["published_tweet_id"]
+            ):
+                return False
+
+            reserved_media = conn.execute("""
+                SELECT * FROM media_library
+                WHERE reserved_by_draft_id = ?
+                  AND lifecycle_state = 'reserved'
+                ORDER BY id
+            """, (draft_id,)).fetchall()
+            media_id = draft["media_id"]
+            if media_id is None:
+                if reserved_media:
+                    return False
+            elif (
+                len(reserved_media) != 1
+                or reserved_media[0]["id"] != media_id
+                or reserved_media[0]["file_deleted"]
+                or not record_has_media_identity(dict(reserved_media[0]))
+            ):
+                return False
+
+            try:
+                score_data = json.loads(draft["score_json"] or "{}")
+            except (TypeError, ValueError):
+                score_data = {}
+            score_total = (
+                score_data.get("total")
+                if isinstance(score_data, dict)
+                else None
+            )
+            created_at = self._now_iso()
+            conn.execute("""
+                INSERT INTO posted_tweets (
+                    tweet_id, text, category, topic, has_link, score_total,
+                    agent_used, created_at
+                ) VALUES (?, ?, ?, '', ?, ?, 'approved_publisher', ?)
+            """, (
+                tweet_id,
+                draft["text"],
+                draft["category"],
+                int(bool(re.search(r"https?://", draft["text"]))),
+                score_total,
+                created_at,
+            ))
+
+            if media_id is not None:
+                media_update = conn.execute("""
+                    UPDATE media_library
+                    SET used = 1, used_at = ?, used_in_tweet_id = ?,
+                        lifecycle_state = 'used', reserved_by_draft_id = NULL
+                    WHERE id = ? AND lifecycle_state = 'reserved'
+                      AND reserved_by_draft_id = ? AND file_deleted = 0
+                """, (created_at, tweet_id, media_id, draft_id))
+                if media_update.rowcount != 1:
+                    raise sqlite3.IntegrityError(
+                        "media changed during publication finalization"
+                    )
+
+            draft_update = conn.execute("""
+                UPDATE post_drafts
+                SET status = 'published', published_tweet_id = ?, error = NULL,
+                    updated_at = ?, revision = revision + 1
+                WHERE id = ? AND status = 'publishing'
+                  AND published_tweet_id IS NULL
+            """, (tweet_id, created_at, draft_id))
+            if draft_update.rowcount != 1:
+                raise sqlite3.IntegrityError(
+                    "draft changed during publication finalization"
+                )
+            return True
+
+    def fail_post_draft_publication(
+        self,
+        draft_id: int,
+        safe_error: str,
+    ) -> bool:
+        """Atomically record a definite failure and release its reservation."""
+        safe_error = self._sanitize_persisted_text(safe_error)
+        with self._media_store_mutation_lock(
+            "draft_reservations", draft_id,
+        ) as conn:
+            draft = conn.execute(
+                "SELECT intended_slot, category, status FROM post_drafts "
+                "WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            if draft is None or draft["status"] != "publishing":
+                return False
+            media_ids = [row["id"] for row in conn.execute("""
+                SELECT id FROM media_library
+                WHERE reserved_by_draft_id = ?
+                  AND lifecycle_state = 'reserved'
+                ORDER BY id
+            """, (draft_id,)).fetchall()]
+            now = self._now_iso()
+            updated = conn.execute("""
+                UPDATE post_drafts
+                SET status = 'publication_failed', error = ?, updated_at = ?,
+                    revision = revision + 1
+                WHERE id = ? AND status = 'publishing'
+            """, (safe_error, now, draft_id))
+            if updated.rowcount != 1:
+                return False
+            conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                WHERE reserved_by_draft_id = ?
+                  AND lifecycle_state = 'reserved'
+            """, (draft_id,))
+            for media_id in media_ids:
+                self._insert_draft_evaluation_in_conn(
+                    conn,
+                    draft["intended_slot"],
+                    draft["category"],
+                    "media_released",
+                    {"draft_id": draft_id, "media_id": media_id},
+                    now,
+                )
+            return True
+
     def record_draft_evaluation(
         self,
         intended_slot: str,

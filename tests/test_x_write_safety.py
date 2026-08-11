@@ -17,6 +17,7 @@ def test_twitter_client_exposes_only_approved_post_write():
     }
     assert prohibited.isdisjoint(set(dir(TwitterClient)))
     assert hasattr(TwitterClient, "post_tweet")
+    assert not hasattr(TwitterClient, "upload_media")
     assert "reply_to" not in inspect.signature(TwitterClient.post_tweet).parameters
 
 

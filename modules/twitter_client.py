@@ -1,5 +1,7 @@
 import logging
+import os
 import tweepy
+from requests import exceptions as requests_exceptions
 from config import (
     TWITTER_API_KEY,
     TWITTER_API_SECRET,
@@ -7,9 +9,65 @@ from config import (
     TWITTER_ACCESS_TOKEN_SECRET,
     TWITTER_BEARER_TOKEN
 )
-from typing import Dict, List, Optional
+from typing import BinaryIO, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class XPublicationError(RuntimeError):
+    """Base class for failures at the X publication boundary."""
+
+
+class XPublicationUnknown(XPublicationError):
+    """X may have accepted the write, so an automatic retry is unsafe."""
+
+
+class XPublicationRejected(XPublicationError):
+    """X definitively rejected the write before a tweet was created."""
+
+
+class XPublicationPaused(XPublicationError):
+    """The final publication gate closed before tweet creation."""
+
+
+def _publication_outcome_is_unknown(error: BaseException) -> bool:
+    """Classify transport/server failures conservatively, including wrappers."""
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(
+            current,
+            (
+                TimeoutError,
+                ConnectionError,
+                requests_exceptions.Timeout,
+                requests_exceptions.ConnectionError,
+            ),
+        ):
+            return True
+        response = getattr(current, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if type(status_code) is int and status_code >= 500:
+            return True
+        for related in (
+            getattr(current, "__cause__", None),
+            getattr(current, "__context__", None),
+        ):
+            if isinstance(related, BaseException):
+                pending.append(related)
+    return False
+
+
+def _raise_publication_error(error: BaseException) -> None:
+    if isinstance(error, XPublicationError):
+        raise error
+    if _publication_outcome_is_unknown(error):
+        raise XPublicationUnknown("x_publication_outcome_unknown") from error
+    raise XPublicationRejected("x_rejected_publication") from error
 
 class TwitterClient:
     """Gestisce l'interazione con X (Twitter) API"""
@@ -30,56 +88,88 @@ class TwitterClient:
         auth.set_access_token(TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET)
         self.api = tweepy.API(auth, wait_on_rate_limit=True)
     
-    def upload_media(self, filepath: str, media_type: str = "image") -> Optional[str]:
-        """
-        Carica un'immagine o un video su X (API v1.1, richiede l'auth OAuth1
-        già configurata in self.api) e ritorna il media_id da allegare al
-        tweet. Per i video usa l'upload chunked con media_category
-        'tweet_video' (obbligatorio per X, gestisce anche l'attesa del
-        processing lato server tramite tweepy).
-        """
+    def _upload_media(
+        self,
+        media_file: BinaryIO,
+        media_type: str = "image",
+        filename: Optional[str] = None,
+    ) -> str:
+        """Upload an already-open verified stream without reopening a path."""
+        if not callable(getattr(media_file, "read", None)):
+            raise XPublicationRejected("verified_media_stream_required")
+        safe_filename = filename or (
+            "approved-video.mp4" if media_type == "video" else "approved-image.jpg"
+        )
+        if (
+            type(safe_filename) is not str
+            or safe_filename in {"", ".", ".."}
+            or os.path.basename(safe_filename) != safe_filename
+        ):
+            raise XPublicationRejected("invalid_media_filename")
         try:
             if media_type == "video":
-                media = self.api.media_upload(filepath, chunked=True, media_category="tweet_video")
+                media = self.api.media_upload(
+                    safe_filename,
+                    file=media_file,
+                    chunked=True,
+                    media_category="tweet_video",
+                )
             else:
-                media = self.api.media_upload(filepath)
-            return media.media_id_string
-        except Exception as e:
-            logger.error(f"❌ Errore upload media ({filepath}): {e}")
-            return None
+                media = self.api.media_upload(safe_filename, file=media_file)
+        except Exception as error:
+            logger.error(
+                "x_media_upload_failed error_type=%s", type(error).__name__
+            )
+            _raise_publication_error(error)
+        media_id = getattr(media, "media_id_string", None)
+        if not media_id:
+            raise XPublicationRejected("x_media_upload_rejected")
+        return str(media_id)
 
-    def post_tweet(self, text: str, media_path: Optional[str] = None,
-                    media_type: str = "image") -> Optional[Dict]:
+    def post_tweet(
+        self,
+        text: str,
+        media_path: Optional[BinaryIO] = None,
+        media_type: str = "image",
+        *,
+        before_write: Optional[Callable[[], bool]] = None,
+        media_filename: Optional[str] = None,
+    ):
         """
-        Posta un tweet, opzionalmente con un'immagine o un video allegato
-        (dalla libreria media). Se l'upload del media fallisce, il tweet
-        viene comunque pubblicato solo testo, invece di bloccare tutto.
+        Create one tweet, optionally from an already verified media stream.
 
-        Args:
-            text: Testo del tweet
-            media_path: percorso locale del file da allegare (opzionale)
-            media_type: 'image' o 'video', per scegliere il tipo di upload corretto
-        
-        Returns:
-            Risposta dell'API
+        ``before_write`` runs after any media upload and immediately before
+        ``create_tweet``.  A false or unavailable gate prevents the write.
         """
+        params = {"text": text}
+        if media_path is not None:
+            if not callable(getattr(media_path, "read", None)):
+                raise XPublicationRejected("verified_media_stream_required")
+            media_id = self._upload_media(
+                media_path, media_type, filename=media_filename
+            )
+            params["media_ids"] = [media_id]
+
+        if before_write is not None:
+            try:
+                allowed = before_write()
+            except Exception as error:
+                raise XPublicationPaused("publication_gate_unavailable") from error
+            if allowed is not True:
+                raise XPublicationPaused("publication_paused")
+
         try:
-            params = {"text": text}
-
-            if media_path:
-                media_id = self.upload_media(media_path, media_type)
-                if media_id:
-                    params["media_ids"] = [media_id]
-                else:
-                    logger.warning(f"⚠️ Upload media fallito per {media_path}: pubblico solo il testo")
-
             response = self.client.create_tweet(**params)
-            logger.info(f"✅ Tweet postato: {response}")
-            return response
-        
-        except Exception as e:
-            logger.error(f"❌ Errore nel posting del tweet: {e}")
-            return None
+        except Exception as error:
+            logger.error("x_tweet_write_failed error_type=%s", type(error).__name__)
+            _raise_publication_error(error)
+
+        data = getattr(response, "data", response)
+        tweet_id = data.get("id") if isinstance(data, dict) else None
+        if not tweet_id:
+            raise XPublicationUnknown("x_publication_response_missing_id")
+        logger.info("x_tweet_published tweet_id=%s", tweet_id)
+        return response
     
     def search_tweets(self, query: str, limit: int = 10) -> List[Dict]:
         """

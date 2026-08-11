@@ -24,7 +24,6 @@ per contenere il costo delle letture/post a pagamento. Vedi config.py.
 """
 
 import logging
-import os
 import random
 import sys
 from datetime import datetime
@@ -227,32 +226,8 @@ class FlexDropinGrowthAgent:
         return self.db.get_media_by_id(media_id)
 
     def _publish(self, text, category, topic, has_link, score_total, agent_used, media=None):
-        media_path = media['filepath'] if media else None
-        media_type = media['media_type'] if media else 'image'
-
-        result = self.twitter_client.post_tweet(text, media_path=media_path, media_type=media_type)
-        if not result or not getattr(result, 'data', None):
-            logger.error(f"❌ Pubblicazione fallita [{category}/{agent_used}]: {text[:80]}...")
-            return
-
-        tweet_id = result.data.get('id', '')
-        self.db.log_posted_tweet(
-            text=text, category=category, topic=topic, tweet_id=tweet_id,
-            has_link=has_link, score_total=score_total, agent_used=agent_used,
-        )
-        if media:
-            self.db.mark_media_used(media['id'], tweet_id)
-            # Il file fisico viene rimosso dal disco per risparmiare spazio:
-            # il record nel DB resta (storico/audit visibile in dashboard),
-            # solo il file viene eliminato una volta pubblicato con successo.
-            try:
-                if os.path.exists(media['filepath']):
-                    os.remove(media['filepath'])
-                    self.db.mark_media_file_deleted(media['id'])
-                    logger.info(f"🗑️ Media usato e rimosso dal disco: {media['filename']}")
-            except OSError as e:
-                logger.warning(f"⚠️ Impossibile eliminare il file media {media['filepath']}: {e}")
-        logger.info(f"✅ Tweet pubblicato [{category}/{agent_used}]: {text[:80]}...")
+        """Disabled legacy bypass; Task 12 will wire scheduled draft publishing."""
+        raise RuntimeError("legacy_direct_publication_disabled")
 
     # ------------------------------------------------------------------
     # Ciclo 3: opportunity detector / lead (punto 19)
