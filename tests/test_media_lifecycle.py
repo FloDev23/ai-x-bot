@@ -1458,40 +1458,76 @@ def test_concurrent_schema_init_reconciles_column_without_marker(
 
     path = tmp_path / "legacy-concurrent.sqlite"
     _create_legacy_media_database(path, lifecycle_column=True)
-    constructor_start = threading.Barrier(2)
-    begin_attempt_lock = threading.Lock()
-    begin_attempt_threads = set()
-    concurrent_begin_attempted = threading.Event()
+    owner_at_marker = threading.Event()
+    owner_contention_observed = threading.Event()
+    allow_owner_commit = threading.Event()
+    owner_schema_commit_attempted = threading.Event()
+    owner_schema_committed = threading.Event()
+    contender_before_sqlite = threading.Event()
+    allow_contender_into_sqlite = threading.Event()
+    contender_begin_traced = threading.Event()
+    contender_begin_returned = threading.Event()
     real_connect = sqlite3.connect
 
-    class MarkerBarrierCursor(sqlite3.Cursor):
+    class SchemaRaceCursor(sqlite3.Cursor):
         def execute(self, sql, parameters=()):
             normalized = " ".join(sql.upper().split())
-            if normalized == "BEGIN IMMEDIATE":
-                with begin_attempt_lock:
-                    begin_attempt_threads.add(threading.get_ident())
-                    if len(begin_attempt_threads) == 2:
-                        concurrent_begin_attempted.set()
+            contender_begin = (
+                normalized == "BEGIN IMMEDIATE"
+                and threading.current_thread().name == "schema-init-contender"
+                and not contender_before_sqlite.is_set()
+            )
+            if contender_begin:
+                contender_before_sqlite.set()
+                assert allow_contender_into_sqlite.wait(timeout=10)
             self._lifecycle_marker_read = (
                 normalized
                 == "SELECT VALUE FROM BOT_STATE WHERE KEY = ?"
                 and parameters == ("migration:media_lifecycle_state",)
             )
-            return super().execute(sql, parameters)
+            result = super().execute(sql, parameters)
+            if contender_begin:
+                contender_begin_returned.set()
+            return result
 
         def fetchone(self):
             row = super().fetchone()
-            if self._lifecycle_marker_read and row is None:
-                assert concurrent_begin_attempted.wait(timeout=1)
+            if (
+                self._lifecycle_marker_read
+                and row is None
+                and threading.current_thread().name == "schema-init-owner"
+            ):
+                assert self.connection.in_transaction is True
+                owner_at_marker.set()
+                assert contender_begin_traced.wait(timeout=10)
+                assert self.connection.in_transaction is True
+                assert contender_begin_returned.is_set() is False
+                owner_contention_observed.set()
+                assert allow_owner_commit.wait(timeout=10)
             return row
 
-    class MarkerBarrierConnection(sqlite3.Connection):
-        def cursor(self, factory=MarkerBarrierCursor):
+    class SchemaRaceConnection(sqlite3.Connection):
+        def cursor(self, factory=SchemaRaceCursor):
             return super().cursor(factory=factory)
 
+        def commit(self):
+            if threading.current_thread().name == "schema-init-owner":
+                owner_schema_commit_attempted.set()
+            result = super().commit()
+            if threading.current_thread().name == "schema-init-owner":
+                owner_schema_committed.set()
+            return result
+
     def synchronized_connect(*args, **kwargs):
-        kwargs["factory"] = MarkerBarrierConnection
-        return real_connect(*args, **kwargs)
+        kwargs["factory"] = SchemaRaceConnection
+        conn = real_connect(*args, **kwargs)
+        if threading.current_thread().name == "schema-init-contender":
+            def trace(statement):
+                if " ".join(statement.upper().split()) == "BEGIN IMMEDIATE":
+                    contender_begin_traced.set()
+
+            conn.set_trace_callback(trace)
+        return conn
 
     monkeypatch.setattr(database_module.sqlite3, "connect", synchronized_connect)
     databases = []
@@ -1499,19 +1535,55 @@ def test_concurrent_schema_init_reconciles_column_without_marker(
 
     def construct_database():
         try:
-            constructor_start.wait()
             databases.append(Database(str(path)))
         except BaseException as error:
             errors.append(error)
 
-    threads = [threading.Thread(target=construct_database) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=5)
+    owner = threading.Thread(target=construct_database, name="schema-init-owner")
+    contender = threading.Thread(
+        target=construct_database,
+        name="schema-init-contender",
+    )
+    owner_started = False
+    contender_started = False
+    try:
+        owner.start()
+        owner_started = True
+        assert owner_at_marker.wait(timeout=5)
+        contender.start()
+        contender_started = True
+        assert contender_before_sqlite.wait(timeout=5)
+        owner_released_from_pre_call_signal = owner_schema_commit_attempted.wait(
+            timeout=0.5,
+        )
+        assert contender_begin_traced.is_set() is False
+        allow_contender_into_sqlite.set()
+        assert owner_contention_observed.wait(timeout=5)
+        contender_returned_while_owner_held = contender_begin_returned.wait(
+            timeout=0.5,
+        )
+        blocked_state = (
+            contender_begin_traced.is_set(),
+            contender_returned_while_owner_held,
+            owner_schema_commit_attempted.is_set(),
+            owner_schema_committed.is_set(),
+            owner.is_alive(),
+            contender.is_alive(),
+        )
+    finally:
+        allow_contender_into_sqlite.set()
+        allow_owner_commit.set()
+        if owner_started:
+            owner.join(timeout=10)
+        if contender_started:
+            contender.join(timeout=10)
 
-    assert all(thread.is_alive() is False for thread in threads)
-    assert concurrent_begin_attempted.is_set()
+    assert owner_released_from_pre_call_signal is False
+    assert blocked_state == (True, False, False, False, True, True)
+    assert owner.is_alive() is False
+    assert contender.is_alive() is False
+    assert contender_begin_returned.is_set()
+    assert owner_schema_committed.is_set()
     assert errors == []
     assert len(databases) == 2
     check = real_connect(path)
