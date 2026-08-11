@@ -180,17 +180,40 @@ def stage_media_upload(stream: BinaryIO, directory: str, filename: str) -> str:
     raise FileExistsError("unable_to_allocate_media_staging")
 
 
-def _claim_final_media_path(staged_path: str, filename: str) -> Tuple[str, str]:
-    """Atomically move a regular staged file to an exclusively claimed name."""
+def _copy_file_descriptor(source_fd: int, destination_fd: int) -> None:
+    """Copy from a pinned source inode to an exclusively opened destination."""
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(source_fd, 1024 * 1024)
+        if not chunk:
+            break
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination_fd, view)
+            if written <= 0:
+                raise OSError("media_destination_write_failed")
+            view = view[written:]
+    os.fsync(destination_fd)
+    os.lseek(destination_fd, 0, os.SEEK_SET)
+
+
+def _claim_final_media_path(
+    staged_path: str,
+    filename: str,
+    source_fd: int,
+) -> Tuple[str, str, int]:
+    """Copy a pinned regular inode to an exclusively claimed final file.
+
+    The returned descriptor still refers to the final inode, so callers can
+    validate exactly the bytes that will be retained before persisting a row.
+    """
     safe_name = sanitize_media_filename(filename)
     if not safe_name:
         raise ValueError("invalid_filename")
     staged = Path(staged_path)
     root = staged.parent.resolve(strict=True)
-    if staged.parent.resolve() != root or staged.is_symlink():
-        raise ValueError("invalid_staged_path")
-    staged_stat = os.lstat(staged)
-    if not stat.S_ISREG(staged_stat.st_mode):
+    source_stat = os.fstat(source_fd)
+    if not stat.S_ISREG(source_stat.st_mode):
         raise ValueError("invalid_staged_file")
 
     base, extension = os.path.splitext(safe_name)
@@ -199,29 +222,26 @@ def _claim_final_media_path(staged_path: str, filename: str) -> Tuple[str, str]:
         for counter in range(1000):
             final_name = safe_name if counter == 0 else f"{base}_{counter}{extension}"
             try:
-                placeholder_fd = os.open(
+                final_fd = os.open(
                     final_name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
                     0o600,
                     dir_fd=root_fd,
                 )
             except FileExistsError:
                 continue
-            os.close(placeholder_fd)
             try:
-                os.replace(
-                    staged.name,
-                    final_name,
-                    src_dir_fd=root_fd,
-                    dst_dir_fd=root_fd,
-                )
+                if not stat.S_ISREG(os.fstat(final_fd).st_mode):
+                    raise ValueError("invalid_media_destination")
+                _copy_file_descriptor(source_fd, final_fd)
             except Exception:
+                os.close(final_fd)
                 try:
                     os.unlink(final_name, dir_fd=root_fd)
                 except FileNotFoundError:
                     pass
                 raise
-            return str(root / final_name), final_name
+            return str(root / final_name), final_name, final_fd
     finally:
         os.close(root_fd)
     raise FileExistsError("unable_to_allocate_media_destination")
@@ -304,13 +324,27 @@ class MediaProcessor:
             flags = os.O_RDONLY | _NOFOLLOW
             fd = os.open(staged_path, flags)
             with os.fdopen(fd, "rb") as media_file:
-                actual_size = os.fstat(media_file.fileno()).st_size
+                source_stat = os.fstat(media_file.fileno())
+                if not stat.S_ISREG(source_stat.st_mode):
+                    raise ValueError("invalid_staged_file")
+                actual_size = source_stat.st_size
                 if actual_size != file_size:
                     raise ValueError("file_size_mismatch")
                 if not media_content_matches(media_file, mime_type):
                     raise ValueError("mime_content_mismatch")
+                final_path, final_name, final_fd = _claim_final_media_path(
+                    staged_path, filename, media_file.fileno(),
+                )
+                with os.fdopen(final_fd, "rb") as final_file:
+                    final_stat = os.fstat(final_file.fileno())
+                    if (
+                        not stat.S_ISREG(final_stat.st_mode)
+                        or final_stat.st_size != file_size
+                    ):
+                        raise ValueError("file_size_mismatch")
+                    if not media_content_matches(final_file, mime_type):
+                        raise ValueError("mime_content_mismatch")
 
-            final_path, final_name = _claim_final_media_path(staged_path, filename)
             media_type = detect_media_type(final_name)
             analysis_path = final_path
             if media_type == "video":

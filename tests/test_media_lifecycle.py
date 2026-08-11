@@ -1,5 +1,6 @@
 import io
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -535,3 +536,98 @@ def test_database_transaction_failure_leaves_no_row_or_file(tmp_path):
             "SELECT COUNT(*) FROM content_sources"
         ).fetchone()[0] == 0
     assert [path for path in tmp_path.iterdir() if path.suffix != ".sqlite"] == []
+
+
+def test_staged_symlink_swap_cannot_change_verified_inode(tmp_path, monkeypatch):
+    from modules import media_processor as media_module
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    staged = tmp_path / ".upload-race.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"do-not-touch")
+    original_open = os.open
+    swapped = False
+
+    def swap_before_destination_claim(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if (
+            path == "gym.jpg"
+            and flags & os.O_CREAT
+            and flags & os.O_EXCL
+            and not swapped
+        ):
+            staged.unlink()
+            staged.symlink_to(outside)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(media_module.os, "open", swap_before_destination_claim)
+
+    record = MediaProcessor(db).process_new_file(
+        str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )
+
+    final_path = Path(record["filepath"])
+    assert swapped is True
+    assert final_path.is_file()
+    assert final_path.is_symlink() is False
+    assert final_path.read_bytes() == JPEG_BYTES
+    assert outside.read_bytes() == b"do-not-touch"
+    assert os.path.lexists(staged) is False
+    assert [row["id"] for row in db.get_all_media()] == [record["id"]]
+    with db._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM content_sources WHERE source_type = 'media_context'"
+        ).fetchone()[0] == 1
+
+
+def test_staged_symlink_swap_and_database_failure_leave_no_orphans(
+    tmp_path, monkeypatch,
+):
+    from modules import media_processor as media_module
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    with db._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_media_context_after_swap
+            BEFORE INSERT ON content_sources
+            WHEN NEW.source_type = 'media_context'
+            BEGIN SELECT RAISE(ABORT, 'context failure after swap'); END
+        """)
+    staged = tmp_path / ".upload-race.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"do-not-touch")
+    original_open = os.open
+    swapped = False
+
+    def swap_before_destination_claim(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if (
+            path == "gym.jpg"
+            and flags & os.O_CREAT
+            and flags & os.O_EXCL
+            and not swapped
+        ):
+            staged.unlink()
+            staged.symlink_to(outside)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(media_module.os, "open", swap_before_destination_claim)
+
+    with pytest.raises(Exception, match="context failure after swap"):
+        MediaProcessor(db).process_new_file(
+            str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+        )
+
+    assert swapped is True
+    assert db.get_all_media() == []
+    with db._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM content_sources"
+        ).fetchone()[0] == 0
+    assert outside.read_bytes() == b"do-not-touch"
+    assert os.path.lexists(staged) is False
+    assert list(tmp_path.glob("gym*.jpg")) == []

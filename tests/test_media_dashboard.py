@@ -131,9 +131,9 @@ def test_same_name_concurrent_uploads_get_distinct_files(
     original_claim = media_module._claim_final_media_path
     barrier = threading.Barrier(2)
 
-    def synchronized_claim(staged_path, filename):
+    def synchronized_claim(staged_path, filename, source_fd):
         barrier.wait(timeout=5)
-        return original_claim(staged_path, filename)
+        return original_claim(staged_path, filename, source_fd)
 
     monkeypatch.setattr(media_module, "_claim_final_media_path", synchronized_claim)
     responses = []
@@ -169,9 +169,9 @@ def test_symlink_swap_cannot_redirect_upload_outside_library(
     outside.write_bytes(b"keep-me")
     original_claim = media_module._claim_final_media_path
 
-    def swap_before_claim(staged_path, filename):
+    def swap_before_claim(staged_path, filename, source_fd):
         (media_dir / filename).symlink_to(outside)
-        return original_claim(staged_path, filename)
+        return original_claim(staged_path, filename, source_fd)
 
     monkeypatch.setattr(media_module, "_claim_final_media_path", swap_before_claim)
     response = client.post(
