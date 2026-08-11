@@ -1,7 +1,11 @@
 import io
 import logging
 import os
+import select
+import subprocess
+import sys
 import threading
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -500,6 +504,29 @@ def test_staging_retries_instead_of_following_existing_symlink(tmp_path, monkeyp
     assert outside.read_bytes() == b"keep-me"
 
 
+def test_staging_retries_fsync_after_eintr(tmp_path, monkeypatch):
+    from modules import media_processor as media_module
+
+    original_fsync = os.fsync
+    attempts = 0
+
+    def interrupted_once(fd):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise InterruptedError("staging fsync interrupted")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(media_module.os, "fsync", interrupted_once)
+
+    staged = Path(
+        stage_media_upload(io.BytesIO(JPEG_BYTES), str(tmp_path), "gym.jpg")
+    )
+
+    assert attempts == 2
+    assert staged.read_bytes() == JPEG_BYTES
+
+
 class RaisingAI:
     def analyze_image(self, _file, _filename):
         raise RuntimeError("vision unavailable")
@@ -741,6 +768,177 @@ def test_post_validation_path_swap_aborts_without_persisting_symlink(tmp_path):
     assert outside.read_bytes() == b"do-not-touch"
     assert os.path.lexists(tmp_path / "gym.jpg") is False
     assert os.path.lexists(staged) is False
+
+
+def test_video_extraction_consumes_pinned_fd_when_input_path_is_swapped(
+    tmp_path, monkeypatch,
+):
+    from modules import media_processor as media_module
+
+    original_video = bmff_ftyp(b"isom", (b"mp42",)) + b"original-video"
+    replacement_video = bmff_ftyp(b"isom", (b"mp42",)) + b"replacement-video"
+    staged = tmp_path / ".upload-race.mp4"
+    staged.write_bytes(original_video)
+    replacement = tmp_path / "replacement.mp4"
+    replacement.write_bytes(replacement_video)
+    consumed = {}
+
+    def ffmpeg_probe(command, **kwargs):
+        final_path = tmp_path / "gym.mp4"
+        final_path.unlink()
+        final_path.symlink_to(replacement)
+        input_arg = command[command.index("-i") + 1]
+        consumed["input_arg"] = input_arg
+        input_stream = kwargs.get("stdin")
+        if input_stream is None:
+            consumed["bytes"] = Path(input_arg).read_bytes()
+        else:
+            consumed["bytes"] = input_stream.read()
+        Path(command[-1]).write_bytes(JPEG_BYTES)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(media_module.subprocess, "run", ffmpeg_probe)
+    db = Database(str(tmp_path / "db.sqlite"))
+
+    with pytest.raises(ValueError, match="media_file_identity_changed"):
+        MediaProcessor(db, ai_generator=object()).process_new_file(
+            str(staged), "gym.mp4", "video/mp4", len(original_video), "context",
+        )
+
+    assert consumed == {"input_arg": "pipe:0", "bytes": original_video}
+    assert replacement.read_bytes() == replacement_video
+    assert db.get_all_media() == []
+    assert os.path.lexists(tmp_path / "gym.mp4") is False
+
+
+def test_database_callback_swap_fails_before_identity_commit(tmp_path):
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"do-not-touch")
+
+    class SwapDuringDatabaseCallback(Database):
+        def add_media_with_context(self, **values):
+            locator = Path(values["filepath"])
+            locator.unlink()
+            locator.symlink_to(outside)
+            return super().add_media_with_context(**values)
+
+    db = SwapDuringDatabaseCallback(str(tmp_path / "db.sqlite"))
+    staged = tmp_path / ".upload-race.jpg"
+    staged.write_bytes(JPEG_BYTES)
+
+    with pytest.raises(ValueError, match="media_file_identity_changed"):
+        MediaProcessor(db).process_new_file(
+            str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+        )
+
+    assert db.get_all_media() == []
+    with db._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM content_sources WHERE source_type = 'media_context'"
+        ).fetchone()[0] == 0
+    assert outside.read_bytes() == b"do-not-touch"
+    assert os.path.lexists(tmp_path / "gym.jpg") is False
+
+
+def test_persisted_media_identity_can_be_verified_before_future_use(tmp_path):
+    from modules import media_processor as media_module
+
+    open_verified_media = getattr(media_module, "open_verified_media", None)
+    assert callable(open_verified_media)
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    staged = tmp_path / ".upload-staged.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    record = MediaProcessor(db).process_new_file(
+        str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )
+
+    assert type(record["file_device"]) is int
+    assert type(record["file_inode"]) is int
+    assert record["file_size"] == len(JPEG_BYTES)
+    assert len(record["file_sha256"]) == 64
+    with open_verified_media(record) as media_file:
+        assert media_file.read() == JPEG_BYTES
+
+
+def test_future_use_rejects_same_inode_same_size_content_change(tmp_path):
+    from modules.media_processor import open_verified_media
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    staged = tmp_path / ".upload-staged.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    record = MediaProcessor(db).process_new_file(
+        str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )
+    changed_bytes = b"\xff\xd8\xff\xe1" + b"jpeg-data"
+    assert len(changed_bytes) == len(JPEG_BYTES)
+    Path(record["filepath"]).write_bytes(changed_bytes)
+
+    with pytest.raises(ValueError, match="media_file_identity_changed"):
+        with open_verified_media(record):
+            pass
+
+
+def test_lifecycle_mutation_waits_for_media_store_lock(tmp_path):
+    from modules import media_processor as media_module
+
+    media_store_lock = getattr(media_module, "media_store_lock", None)
+    assert callable(media_store_lock)
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    staged = tmp_path / ".upload-staged.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    record = MediaProcessor(db).process_new_file(
+        str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )
+    started = threading.Event()
+    finished = threading.Event()
+    result = []
+
+    def archive():
+        started.set()
+        result.append(db.archive_media(record["id"]))
+        finished.set()
+
+    with media_store_lock(tmp_path):
+        thread = threading.Thread(target=archive)
+        thread.start()
+        assert started.wait(timeout=1)
+        assert finished.wait(timeout=0.05) is False
+
+    thread.join(timeout=1)
+    assert finished.is_set()
+    assert result == [True]
+
+
+def test_media_store_lock_serializes_separate_process(tmp_path):
+    from modules.media_processor import media_store_lock
+
+    script = """
+import sys
+from pathlib import Path
+from modules.media_store import media_store_lock
+
+print('ready', flush=True)
+with media_store_lock(Path(sys.argv[1])):
+    print('acquired', flush=True)
+"""
+    with media_store_lock(tmp_path):
+        child = subprocess.Popen(
+            [sys.executable, "-c", script, str(tmp_path)],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "ready"
+        readable, _writable, _errors = select.select([child.stdout], [], [], 0.05)
+        assert readable == []
+
+    stdout, stderr = child.communicate(timeout=2)
+    assert child.returncode == 0, stderr
+    assert stdout.strip() == "acquired"
 
 
 def test_missing_nofollow_support_rejects_before_opening_staged_target(

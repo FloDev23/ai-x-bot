@@ -22,6 +22,14 @@ from pathlib import Path
 from typing import BinaryIO, Dict, Optional, Tuple
 
 from config import TELEGRAM_MAX_IMAGE_BYTES, TELEGRAM_MAX_VIDEO_BYTES
+from modules.media_store import (
+    MediaStoreLease,
+    PinnedMediaFile,
+    capture_media_identity,
+    media_store_lock,
+    open_verified_media,
+    verify_pinned_media,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -180,32 +188,43 @@ def stage_media_upload(stream: BinaryIO, directory: str, filename: str) -> str:
     extension = os.path.splitext(safe_name)[1].lower()
     root, root_fd = _open_private_media_directory(Path(directory))
     try:
-        for _attempt in range(20):
-            storage_name = f".upload-{uuid.uuid4().hex}{extension}"
-            try:
-                fd = os.open(
-                    storage_name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _require_nofollow_support(),
-                    0o600,
-                    dir_fd=root_fd,
-                )
-            except FileExistsError:
-                continue
-            try:
-                with os.fdopen(fd, "wb") as staged:
-                    shutil.copyfileobj(stream, staged)
-                    staged.flush()
-                    os.fsync(staged.fileno())
-            except Exception:
+        with MediaStoreLease(root_fd):
+            for _attempt in range(20):
+                storage_name = f".upload-{uuid.uuid4().hex}{extension}"
                 try:
-                    os.unlink(storage_name, dir_fd=root_fd)
-                except FileNotFoundError:
-                    pass
-                raise
-            return str(root / storage_name)
+                    fd = os.open(
+                        storage_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        | _require_nofollow_support(),
+                        0o600,
+                        dir_fd=root_fd,
+                    )
+                except FileExistsError:
+                    continue
+                try:
+                    with os.fdopen(fd, "wb") as staged:
+                        shutil.copyfileobj(stream, staged)
+                        staged.flush()
+                        _fsync_file_descriptor(staged.fileno())
+                except Exception:
+                    try:
+                        os.unlink(storage_name, dir_fd=root_fd)
+                    except FileNotFoundError:
+                        pass
+                    raise
+                return str(root / storage_name)
     finally:
         os.close(root_fd)
     raise FileExistsError("unable_to_allocate_media_staging")
+
+
+def _fsync_file_descriptor(file_fd: int) -> None:
+    while True:
+        try:
+            os.fsync(file_fd)
+            return
+        except InterruptedError:
+            continue
 
 
 def _copy_file_descriptor(source_fd: int, destination_fd: int) -> None:
@@ -227,12 +246,7 @@ def _copy_file_descriptor(source_fd: int, destination_fd: int) -> None:
             if written <= 0:
                 raise OSError("media_destination_write_failed")
             view = view[written:]
-    while True:
-        try:
-            os.fsync(destination_fd)
-            break
-        except InterruptedError:
-            continue
+    _fsync_file_descriptor(destination_fd)
     os.lseek(destination_fd, 0, os.SEEK_SET)
 
 
@@ -240,7 +254,7 @@ def _claim_final_media_path(
     staged_path: str,
     filename: str,
     source_fd: int,
-) -> Tuple[str, str, int, int]:
+) -> Tuple[str, str, int, int, MediaStoreLease]:
     """Copy a pinned regular inode to an exclusively claimed final file.
 
     The returned descriptor still refers to the final inode, so callers can
@@ -256,6 +270,7 @@ def _claim_final_media_path(
 
     base, extension = os.path.splitext(safe_name)
     root, root_fd = _open_private_media_directory(staged.parent)
+    lease = MediaStoreLease(root_fd).acquire()
     keep_root_fd = False
     try:
         for counter in range(1000):
@@ -281,35 +296,12 @@ def _claim_final_media_path(
                     pass
                 raise
             keep_root_fd = True
-            return str(root / final_name), final_name, final_fd, root_fd
+            return str(root / final_name), final_name, final_fd, root_fd, lease
     finally:
         if not keep_root_fd:
+            lease.release()
             os.close(root_fd)
     raise FileExistsError("unable_to_allocate_media_destination")
-
-
-def _verify_final_media_identity(
-    root_fd: int,
-    final_name: str,
-    final_fd: int,
-    expected_size: int,
-) -> None:
-    """Bind the persisted pathname to the pinned, validated final inode."""
-    try:
-        _validate_private_directory(os.fstat(root_fd))
-        descriptor_stat = os.fstat(final_fd)
-        path_stat = os.stat(final_name, dir_fd=root_fd, follow_symlinks=False)
-    except (FileNotFoundError, OSError, PermissionError, ValueError):
-        raise ValueError("media_file_identity_changed") from None
-    if (
-        not stat.S_ISREG(descriptor_stat.st_mode)
-        or not stat.S_ISREG(path_stat.st_mode)
-        or descriptor_stat.st_dev != path_stat.st_dev
-        or descriptor_stat.st_ino != path_stat.st_ino
-        or descriptor_stat.st_size != expected_size
-        or path_stat.st_size != expected_size
-    ):
-        raise ValueError("media_file_identity_changed")
 
 
 def _unlink_regular_file(path: Optional[str]) -> None:
@@ -325,6 +317,17 @@ def _unlink_regular_file(path: Optional[str]) -> None:
         logger.warning("media_cleanup_failed error_type=OSError")
 
 
+def _unlink_media_entry(root_fd: int, name: Optional[str]) -> None:
+    if not name:
+        return
+    try:
+        os.unlink(name, dir_fd=root_fd)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("media_cleanup_failed error_type=OSError")
+
+
 def detect_media_type(filename: str) -> str:
     ext = os.path.splitext(filename)[1].lower()
     if ext in VIDEO_EXTENSIONS:
@@ -334,27 +337,42 @@ def detect_media_type(filename: str) -> str:
     # invece di bloccare l'upload)
 
 
-def extract_video_frame(video_path: str, output_dir: str, timestamp: str = "00:00:01") -> Optional[str]:
+def extract_video_frame(
+    video_file: BinaryIO,
+    output_dir: str,
+    timestamp: str = "00:00:01",
+) -> Optional[str]:
     """Estrae un fotogramma dal video con ffmpeg, da usare come proxy per
     l'analisi AI (Groq vision analizza immagini, non video)."""
     os.makedirs(output_dir, exist_ok=True)
     frame_path = os.path.join(output_dir, f"_frame_{uuid.uuid4().hex[:8]}.jpg")
+    position = video_file.tell()
     try:
+        video_file.seek(0)
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", video_path, "-ss", timestamp, "-vframes", "1", frame_path],
-            capture_output=True, text=True, timeout=30,
+            [
+                "ffmpeg", "-y", "-i", "pipe:0", "-ss", timestamp,
+                "-vframes", "1", frame_path,
+            ],
+            stdin=video_file, capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0 or not os.path.exists(frame_path):
-            logger.error(f"❌ ffmpeg non è riuscito a estrarre un frame da {video_path}: "
-                         f"{result.stderr[-300:] if result.stderr else 'nessun dettaglio'}")
+            logger.error(
+                "video_frame_extraction_failed error_type=FFmpegFailure"
+            )
             return None
         return frame_path
     except FileNotFoundError:
         logger.error("❌ ffmpeg non è installato sul server. Installa con: sudo apt install ffmpeg")
         return None
-    except Exception as e:
-        logger.error(f"❌ Errore estrazione frame video: {e}")
+    except Exception as error:
+        logger.error(
+            "video_frame_extraction_failed error_type=%s",
+            type(error).__name__,
+        )
         return None
+    finally:
+        video_file.seek(position)
 
 
 class MediaProcessor:
@@ -379,16 +397,18 @@ class MediaProcessor:
         'other' e senza descrizione, modificabile a mano dalla dashboard.
         """
         staged_path = filepath
+        staged = Path(staged_path)
         final_path = None
+        final_name = None
         persisted = False
-        frame_to_cleanup = None
+        frame_name = None
         source_root_fd = None
         final_root_fd = None
+        final_lease = None
         try:
             valid, reason = validate_media_upload(filename, mime_type, file_size)
             if not valid:
                 raise ValueError(reason)
-            staged = Path(staged_path)
             source_root, source_root_fd = _open_private_media_directory(staged.parent)
             if staged.parent.resolve(strict=True) != source_root:
                 raise ValueError("invalid_staged_path")
@@ -403,9 +423,13 @@ class MediaProcessor:
                     raise ValueError("file_size_mismatch")
                 if not media_content_matches(media_file, mime_type):
                     raise ValueError("mime_content_mismatch")
-                final_path, final_name, final_fd, final_root_fd = _claim_final_media_path(
-                    staged_path, filename, media_file.fileno(),
-                )
+                (
+                    final_path,
+                    final_name,
+                    final_fd,
+                    final_root_fd,
+                    final_lease,
+                ) = _claim_final_media_path(staged_path, filename, media_file.fileno())
                 with os.fdopen(final_fd, "rb") as final_file:
                     final_stat = os.fstat(final_file.fileno())
                     if (
@@ -415,21 +439,26 @@ class MediaProcessor:
                         raise ValueError("file_size_mismatch")
                     if not media_content_matches(final_file, mime_type):
                         raise ValueError("mime_content_mismatch")
+                    identity = capture_media_identity(final_file.fileno())
+                    if identity.size != file_size:
+                        raise ValueError("file_size_mismatch")
+                    pinned_media = PinnedMediaFile(
+                        root_fd=final_root_fd,
+                        name=final_name,
+                        file_fd=final_file.fileno(),
+                        identity=identity,
+                    )
                     media_type = detect_media_type(final_name)
                     result = None
                     if self.ai and media_type == "video":
-                        _verify_final_media_identity(
-                            final_root_fd, final_name, final_file.fileno(), file_size,
-                        )
+                        verify_pinned_media(pinned_media)
                         frame = extract_video_frame(
-                            final_path, os.path.dirname(final_path),
+                            final_file, os.path.dirname(final_path),
                         )
-                        _verify_final_media_identity(
-                            final_root_fd, final_name, final_file.fileno(), file_size,
-                        )
+                        verify_pinned_media(pinned_media)
                         if frame:
-                            frame_to_cleanup = frame
                             frame_path = Path(frame)
+                            frame_name = frame_path.name
                             if frame_path.parent.resolve(strict=True) != source_root:
                                 raise ValueError("invalid_media_frame_path")
                             frame_fd = os.open(
@@ -451,9 +480,7 @@ class MediaProcessor:
                         result = None
                     tags = result.get("tags", []) if result else []
                     clean_context = " ".join(str(user_context or "").split())[:2000]
-                    _verify_final_media_identity(
-                        final_root_fd, final_name, final_file.fileno(), file_size,
-                    )
+                    verify_pinned_media(pinned_media)
                     record = self.db.add_media_with_context(
                         filename=final_name,
                         filepath=final_path,
@@ -464,6 +491,7 @@ class MediaProcessor:
                         user_context=clean_context,
                         mime_type=mime_type,
                         file_size=file_size,
+                        pinned_media=pinned_media,
                     )
                     persisted = True
                     if not result:
@@ -472,11 +500,26 @@ class MediaProcessor:
                         )
                     return record
         finally:
+            cleanup_lease = None
+            if final_lease is None and source_root_fd is not None:
+                cleanup_lease = MediaStoreLease(source_root_fd).acquire()
+            try:
+                if final_root_fd is not None:
+                    _unlink_media_entry(final_root_fd, frame_name)
+                if source_root_fd is not None:
+                    _unlink_media_entry(source_root_fd, staged.name)
+                else:
+                    _unlink_regular_file(staged_path)
+                if not persisted and final_root_fd is not None:
+                    _unlink_media_entry(final_root_fd, final_name)
+                elif not persisted:
+                    _unlink_regular_file(final_path)
+            finally:
+                if cleanup_lease is not None:
+                    cleanup_lease.release()
+                if final_lease is not None:
+                    final_lease.release()
             if source_root_fd is not None:
                 os.close(source_root_fd)
             if final_root_fd is not None:
                 os.close(final_root_fd)
-            _unlink_regular_file(frame_to_cleanup)
-            _unlink_regular_file(staged_path)
-            if not persisted:
-                _unlink_regular_file(final_path)
