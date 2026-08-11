@@ -1,4 +1,7 @@
+import io
+import logging
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -10,10 +13,20 @@ from config import (
 from modules.ai_generator import AIGenerator
 from modules.database import Database
 from modules.media_matcher import MediaMatcher
-from modules.media_processor import MediaProcessor, validate_media_upload
+from modules.media_processor import (
+    MediaProcessor,
+    media_content_matches,
+    stage_media_upload,
+    validate_media_upload,
+)
 
 
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"jpeg-data"
+
+
+def bmff_ftyp(major_brand, compatible_brands=()):
+    payload = major_brand + b"\x00\x00\x00\x00" + b"".join(compatible_brands)
+    return (8 + len(payload)).to_bytes(4, "big") + b"ftyp" + payload
 
 
 class ChoiceGenerator:
@@ -132,6 +145,131 @@ def test_ai_media_choice_returns_relevance_schema_and_rejects_unknown_id(fake_ai
         "reason": "Shows the class format",
     }
     assert fake_ai.select_best_media("gym_strategy", "Draft", candidates) is None
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "content"),
+    [
+        ("video/mp4", bmff_ftyp(b"isom", (b"mp42",))),
+        ("video/quicktime", bmff_ftyp(b"qt  ", (b"qt  ",))),
+        ("video/x-m4v", bmff_ftyp(b"M4V ", (b"isom",))),
+    ],
+)
+def test_supported_video_ftyp_brands_are_accepted(mime_type, content):
+    assert media_content_matches(io.BytesIO(content), mime_type) is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        bmff_ftyp(b"heic", (b"mif1",)),
+        bmff_ftyp(b"heic", (b"isom",)),
+        bmff_ftyp(b"avif", (b"mif1",)),
+        b"\x00\x00\x00\x0cftypisom",
+        b"\x00\x00\x00\x40ftypisom\x00\x00\x00\x00",
+        b"\x00\x00\x00\x10freeisom\x00\x00\x00\x00",
+        b"\x00\x00\x00\x11ftypisom\x00\x00\x00\x00x",
+    ],
+)
+def test_image_or_malformed_bmff_is_rejected_as_video(content):
+    assert media_content_matches(io.BytesIO(content), "video/mp4") is False
+
+
+@pytest.mark.parametrize(
+    "invalid_media_id",
+    [True, False, "4", 4.0],
+)
+def test_ai_media_choice_rejects_coercible_media_ids(fake_ai, invalid_media_id):
+    candidates = [{
+        "id": 4,
+        "media_type": "image",
+        "category": "gym_visit",
+        "ai_description": "Studio floor",
+        "ai_tags": "studio",
+        "user_context": "visit",
+    }]
+    fake_ai.responses = [
+        '{"media_id": %s, "relevance": 86, "reason": "fit"}'
+        % __import__("json").dumps(invalid_media_id)
+    ]
+    assert fake_ai.select_best_media("gym_strategy", "Draft", candidates) is None
+
+
+@pytest.mark.parametrize(
+    "invalid_fields",
+    [
+        {"relevance": True, "reason": "fit"},
+        {"relevance": 80.5, "reason": "fit"},
+        {"relevance": 101, "reason": "fit"},
+        {"relevance": 80, "reason": ""},
+        {"relevance": 80, "reason": 7},
+        {"relevance": 80, "reason": "x" * 501},
+    ],
+)
+def test_ai_media_choice_rejects_non_exact_relevance_and_reason(
+    fake_ai, invalid_fields,
+):
+    import json
+
+    candidates = [{
+        "id": 4,
+        "media_type": "image",
+        "category": "gym_visit",
+        "ai_description": "Studio floor",
+        "ai_tags": "studio",
+        "user_context": "visit",
+    }]
+    fake_ai.responses = [json.dumps({"media_id": 4, **invalid_fields})]
+    assert fake_ai.select_best_media("gym_strategy", "Draft", candidates) is None
+
+
+@pytest.mark.parametrize(
+    "choice",
+    [
+        {"media_id": True, "relevance": 80, "reason": "fit"},
+        {"media_id": "1", "relevance": 80, "reason": "fit"},
+        {"media_id": 1.0, "relevance": 80, "reason": "fit"},
+        {"media_id": 1, "relevance": True, "reason": "fit"},
+        {"media_id": 1, "relevance": 80.5, "reason": "fit"},
+        {"media_id": 1, "relevance": 101, "reason": "fit"},
+        {"media_id": 1, "relevance": 80, "reason": ""},
+        {"media_id": 1, "relevance": 80, "reason": "x" * 501},
+    ],
+)
+def test_matcher_rejects_non_exact_choice_schema(tmp_path, choice):
+    db = Database(str(tmp_path / "bot.db"))
+    source_id = db.add_content_source("evergreen_idea", "Studio source")
+    draft_id = _draft(db, source_id, "2026-08-12T14:00:00+02:00", "strict")
+    image_path = tmp_path / "gym.jpg"
+    image_path.write_bytes(JPEG_BYTES)
+    media_id = MediaProcessor(db).process_new_file(
+        str(image_path), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )["id"]
+    if type(choice["media_id"]) is int:
+        choice = {**choice, "media_id": media_id}
+
+    assert MediaMatcher(db, ChoiceGenerator(choice)).attach_best(draft_id) is None
+    assert db.get_media_by_id(media_id)["lifecycle_state"] == "available"
+
+
+def test_ai_media_parse_failure_does_not_log_raw_output(fake_ai, caplog):
+    secret = "REFLECTED_USER_CONTEXT_839"
+    fake_ai.responses = ['{"reason":"%s" broken}' % secret]
+    candidates = [{
+        "id": 4,
+        "media_type": "image",
+        "category": "gym_visit",
+        "ai_description": "Studio floor",
+        "ai_tags": "studio",
+        "user_context": secret,
+    }]
+    caplog.set_level(logging.WARNING, logger="modules.ai_generator")
+
+    assert fake_ai.select_best_media("gym_strategy", "Draft", candidates) is None
+
+    assert secret not in caplog.text
+    assert "raw:" not in caplog.text
+    assert "media_choice_invalid" in caplog.text
 
 
 def test_match_below_80_keeps_draft_text_only(tmp_path):
@@ -257,3 +395,143 @@ def test_archive_does_not_break_an_active_reservation(tmp_path):
     record = db.get_media_by_id(media_id)
     assert record["lifecycle_state"] == "reserved"
     assert record["reserved_by_draft_id"] == 11
+
+
+def test_permanent_delete_db_transition_rejects_reserved_atomically(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    media_id = db.add_media("gym.jpg", "/tmp/gym.jpg", "image")
+    assert db.reserve_media(media_id, 11)
+    callback_calls = []
+
+    deleted = db.mark_media_file_deleted(
+        media_id, delete_file=lambda: callback_calls.append(media_id),
+    )
+
+    assert deleted is False
+    assert callback_calls == []
+    record = db.get_media_by_id(media_id)
+    assert record["lifecycle_state"] == "reserved"
+    assert record["reserved_by_draft_id"] == 11
+
+
+def test_permanent_delete_callback_failure_rolls_back_database_state(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    media_id = db.add_media("gym.jpg", "/tmp/gym.jpg", "image")
+
+    with pytest.raises(OSError, match="unlink failed"):
+        db.mark_media_file_deleted(
+            media_id,
+            delete_file=lambda: (_ for _ in ()).throw(OSError("unlink failed")),
+        )
+
+    record = db.get_media_by_id(media_id)
+    assert record["lifecycle_state"] == "available"
+    assert record["file_deleted"] == 0
+
+
+def test_reserve_and_permanent_delete_are_serialized_by_sqlite(tmp_path):
+    path = tmp_path / "bot.db"
+    setup = Database(str(path))
+    media_id = setup.add_media("gym.jpg", "/tmp/gym.jpg", "image")
+    barrier = threading.Barrier(2)
+    outcomes = {}
+
+    def reserve():
+        barrier.wait()
+        outcomes["reserved"] = Database(str(path)).reserve_media(media_id, 11)
+
+    def delete():
+        barrier.wait()
+        outcomes["deleted"] = Database(str(path)).mark_media_file_deleted(
+            media_id, delete_file=lambda: None,
+        )
+
+    threads = [threading.Thread(target=reserve), threading.Thread(target=delete)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcomes in (
+        {"reserved": True, "deleted": False},
+        {"reserved": False, "deleted": True},
+    )
+    state = Database(str(path)).get_media_by_id(media_id)["lifecycle_state"]
+    assert state == ("reserved" if outcomes["reserved"] else "deleted")
+
+
+def test_staging_retries_instead_of_following_existing_symlink(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from modules import media_processor as media_module
+
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"keep-me")
+    symlink = tmp_path / ".upload-collision.jpg"
+    symlink.symlink_to(outside)
+    values = iter((
+        SimpleNamespace(hex="collision"),
+        SimpleNamespace(hex="safe"),
+    ))
+    monkeypatch.setattr(media_module.uuid, "uuid4", lambda: next(values))
+
+    staged = Path(stage_media_upload(io.BytesIO(JPEG_BYTES), str(tmp_path), "gym.jpg"))
+
+    assert staged.name == ".upload-safe.jpg"
+    assert not staged.is_symlink()
+    assert staged.read_bytes() == JPEG_BYTES
+    assert outside.read_bytes() == b"keep-me"
+
+
+class RaisingAI:
+    def analyze_image(self, _path):
+        raise RuntimeError("vision unavailable")
+
+
+class RaisingDatabase:
+    def add_media_with_context(self, **_values):
+        raise RuntimeError("database unavailable")
+
+
+@pytest.mark.parametrize("failure_source", ["ai", "database"])
+def test_processor_failure_removes_staged_and_final_files(tmp_path, failure_source):
+    staged = tmp_path / ".upload-staged.tmp"
+    staged.write_bytes(JPEG_BYTES)
+    processor = MediaProcessor(
+        RaisingDatabase() if failure_source == "database" else Database(str(tmp_path / "db.sqlite")),
+        RaisingAI() if failure_source == "ai" else None,
+    )
+
+    with pytest.raises(RuntimeError):
+        processor.process_new_file(
+            str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+        )
+
+    assert list(tmp_path.glob("*.jpg")) == []
+    assert not staged.exists()
+    if failure_source == "ai":
+        assert processor.db.get_all_media() == []
+
+
+def test_database_transaction_failure_leaves_no_row_or_file(tmp_path):
+    db = Database(str(tmp_path / "db.sqlite"))
+    with db._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_media_context
+            BEFORE INSERT ON content_sources
+            WHEN NEW.source_type = 'media_context'
+            BEGIN SELECT RAISE(ABORT, 'context failure'); END
+        """)
+    staged = tmp_path / ".upload-staged.tmp"
+    staged.write_bytes(JPEG_BYTES)
+
+    with pytest.raises(Exception, match="context failure"):
+        MediaProcessor(db).process_new_file(
+            str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+        )
+
+    assert db.get_all_media() == []
+    with db._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM content_sources"
+        ).fetchone()[0] == 0
+    assert [path for path in tmp_path.iterdir() if path.suffix != ".sqlite"] == []

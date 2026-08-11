@@ -33,6 +33,7 @@ _LIVE_DRAFT_STATUS_SQL = (
     "'pending_approval', 'approved', 'publishing', 'published', "
     "'publication_unknown'"
 )
+MEDIA_FILE_DELETE_SAFE_STATES = ("available", "used", "archived")
 
 
 class Database:
@@ -1443,7 +1444,7 @@ class Database:
         user_context: str = "",
         mime_type: Optional[str] = None,
         file_size: int = 0,
-    ) -> int:
+    ) -> Dict:
         """Atomically persist an available media row and its audit source."""
         now = self._now_iso()
         with self._conn() as conn:
@@ -1469,7 +1470,10 @@ class Database:
                 now,
                 now,
             ))
-            return media_id
+            row = conn.execute(
+                "SELECT * FROM media_library WHERE id = ?", (media_id,)
+            ).fetchone()
+            return dict(row)
 
     def get_media_context_source(self, media_id: int) -> Optional[Dict]:
         with self._conn() as conn:
@@ -1681,16 +1685,33 @@ class Database:
             """, (int(reusable), int(reusable), int(reusable), media_id))
             return cursor.rowcount == 1
 
-    def mark_media_file_deleted(self, media_id: int):
+    def mark_media_file_deleted(self, media_id: int, delete_file=None) -> bool:
         """Segna che il file fisico è stato rimosso dal disco per risparmiare
         spazio (il record resta nel DB come storico/audit)."""
         with self._conn() as conn:
-            conn.execute("""
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT lifecycle_state, file_deleted FROM media_library WHERE id = ?",
+                (media_id,),
+            ).fetchone()
+            if (
+                not row
+                or row["file_deleted"]
+                or row["lifecycle_state"] not in MEDIA_FILE_DELETE_SAFE_STATES
+            ):
+                return False
+            cursor = conn.execute("""
                 UPDATE media_library
                 SET file_deleted = 1, lifecycle_state = 'deleted',
                     reserved_by_draft_id = NULL
-                WHERE id = ?
-            """, (media_id,))
+                WHERE id = ? AND file_deleted = 0
+                  AND lifecycle_state = ?
+            """, (media_id, row["lifecycle_state"]))
+            if cursor.rowcount != 1:
+                return False
+            if delete_file is not None:
+                delete_file()
+            return True
 
     def update_media(self, media_id: int, category: Optional[str] = None,
                       ai_description: Optional[str] = None):

@@ -23,7 +23,15 @@ resta presidiato via Instagram e visite di persona (fuori da questo bot).
 import logging
 import json
 from groq import Groq
-from config import GROQ_API_KEY, GROQ_MODEL, GROQ_VISION_MODEL, FLEXDROPIN_PLAY_STORE, FLEXDROPIN_APP_STORE, FLEXDROPIN_WEBSITE
+from config import (
+    FLEXDROPIN_APP_STORE,
+    FLEXDROPIN_PLAY_STORE,
+    FLEXDROPIN_WEBSITE,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    GROQ_VISION_MODEL,
+    MEDIA_MATCH_REASON_MAX_CHARS,
+)
 from modules import character as character_module
 from modules.fact_guard import (
     normalize_claim_type,
@@ -401,22 +409,29 @@ Reply ONLY with a JSON object, no other text, using this exact schema:
             reason = data.get("reason")
             if media_id is None:
                 return None
-            media_id = int(media_id)
-            if media_id not in {candidate["id"] for candidate in candidates}:
+            if (
+                type(media_id) is not int
+                or media_id <= 0
+                or media_id not in {candidate["id"] for candidate in candidates}
+            ):
                 return None
             if (
-                isinstance(relevance, bool)
-                or not isinstance(relevance, int)
+                type(relevance) is not int
                 or not 0 <= relevance <= 100
-                or not isinstance(reason, str)
+                or type(reason) is not str
                 or not reason.strip()
+                or len(reason.strip()) > MEDIA_MATCH_REASON_MAX_CHARS
             ):
                 return None
             return {
                 "media_id": media_id,
                 "relevance": relevance,
-                "reason": reason.strip()[:500],
+                "reason": reason.strip(),
             }
         except Exception as e:
-            logger.warning(f"⚠️ Impossibile interpretare la scelta media dell'AI (raw: {raw[:150]}): {e}")
+            logger.warning(
+                "media_choice_invalid response_length=%d error_type=%s",
+                len(raw),
+                type(e).__name__,
+            )
             return None

@@ -1,7 +1,7 @@
 """Deferred media matching for an already-created editorial concept."""
 from typing import Dict, Optional
 
-from config import MEDIA_MATCH_THRESHOLD
+from config import MEDIA_MATCH_REASON_MAX_CHARS, MEDIA_MATCH_THRESHOLD
 
 
 class MediaMatcher:
@@ -22,16 +22,19 @@ class MediaMatcher:
         )
         if not isinstance(choice, dict):
             return None
+        media_id = choice.get("media_id")
         relevance = choice.get("relevance", 0)
+        reason = choice.get("reason")
         if (
-            isinstance(relevance, bool)
-            or not isinstance(relevance, (int, float))
+            type(media_id) is not int
+            or media_id <= 0
+            or type(relevance) is not int
+            or not 0 <= relevance <= 100
             or relevance < self.threshold
+            or type(reason) is not str
+            or not reason.strip()
+            or len(reason.strip()) > MEDIA_MATCH_REASON_MAX_CHARS
         ):
-            return None
-        try:
-            media_id = int(choice["media_id"])
-        except (KeyError, TypeError, ValueError):
             return None
         if media_id not in {candidate["id"] for candidate in candidates}:
             return None

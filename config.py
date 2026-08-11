@@ -50,6 +50,7 @@ TELEGRAM_MAX_VIDEO_BYTES = int(os.getenv(
     'TELEGRAM_MAX_VIDEO_BYTES', str(50 * 1024 * 1024)
 ))
 MEDIA_MATCH_THRESHOLD = int(os.getenv('MEDIA_MATCH_THRESHOLD', '80'))
+MEDIA_MATCH_REASON_MAX_CHARS = 500
 
 # ========== Approval-only publishing rollout ==========
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Rome")

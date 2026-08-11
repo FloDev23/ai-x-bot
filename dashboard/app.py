@@ -29,6 +29,7 @@ from modules.media_processor import (  # noqa: E402
     MediaProcessor,
     media_content_matches,
     sanitize_media_filename,
+    stage_media_upload,
     validate_media_upload,
 )
 from config import MEDIA_LIBRARY_DIR  # noqa: E402
@@ -164,25 +165,26 @@ def media_upload():
         return f"Invalid media upload: {reason}", 400
 
     safe_name = sanitize_media_filename(file.filename)
-    # Evita di sovrascrivere un file già esistente con lo stesso nome
-    base, extension = os.path.splitext(safe_name)
-    final_name = safe_name
-    counter = 1
-    while os.path.exists(os.path.join(MEDIA_DIR, final_name)):
-        final_name = f"{base}_{counter}{extension}"
-        counter += 1
-
-    filepath = os.path.join(MEDIA_DIR, final_name)
-    file.save(filepath)
-
-    # Analisi AI + registrazione nel database (non blocca l'upload se fallisce)
-    media_processor.process_new_file(
-        filepath,
-        final_name,
-        mime_type,
-        file_size,
-        request.form.get("user_context", ""),
-    )
+    staged_path = None
+    try:
+        staged_path = stage_media_upload(file.stream, MEDIA_DIR, safe_name)
+        media_processor.process_new_file(
+            staged_path,
+            safe_name,
+            mime_type,
+            file_size,
+            request.form.get("user_context", ""),
+        )
+    except Exception as error:
+        if staged_path:
+            try:
+                Path(staged_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        app.logger.error(
+            "media_upload_failed error_type=%s", type(error).__name__,
+        )
+        return "Unable to store media upload", 500
 
     return redirect(url_for("media_view"))
 
@@ -204,12 +206,16 @@ def media_delete(media_id):
     item_path = Path(item["filepath"]).resolve()
     if media_root not in item_path.parents:
         return "Refusing to delete a path outside the media library", 400
-    if item_path.exists():
-        try:
+    def delete_file():
+        if item_path.exists():
             item_path.unlink()
-        except OSError:
-            return "Unable to delete media file", 500
-    db.mark_media_file_deleted(media_id)
+
+    try:
+        deleted = db.mark_media_file_deleted(media_id, delete_file=delete_file)
+    except OSError:
+        return "Unable to delete media file", 500
+    if not deleted:
+        return "Media lifecycle state conflicts with permanent deletion", 409
     return redirect(url_for("media_view"))
 
 

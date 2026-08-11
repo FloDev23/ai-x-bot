@@ -13,9 +13,12 @@ import logging
 import ntpath
 import os
 import re
+import shutil
+import stat
 import subprocess
 import unicodedata
 import uuid
+from pathlib import Path
 from typing import BinaryIO, Dict, Optional, Tuple
 
 from config import TELEGRAM_MAX_IMAGE_BYTES, TELEGRAM_MAX_VIDEO_BYTES
@@ -33,6 +36,20 @@ MIME_BY_EXTENSION = {
     ".mov": "video/quicktime",
     ".m4v": "video/x-m4v",
 }
+BMFF_BRANDS_BY_MIME = {
+    "video/mp4": {
+        b"isom", b"iso2", b"iso3", b"iso4", b"iso5", b"iso6",
+        b"mp41", b"mp42", b"avc1", b"dash",
+    },
+    "video/quicktime": {b"qt  "},
+    "video/x-m4v": {b"M4V ", b"M4VH", b"M4VP"},
+}
+IMAGE_BMFF_BRANDS = {
+    b"avif", b"avis", b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1",
+}
+MAX_FTYP_BOX_BYTES = 4096
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 def sanitize_media_filename(filename: str) -> str:
@@ -84,23 +101,143 @@ def _sniff_media_kind(header: bytes) -> Optional[str]:
         return "image/png"
     if len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"WEBP":
         return "image/webp"
-    if len(header) >= 12 and header[4:8] == b"ftyp":
-        return "video"
     return None
+
+
+def _bmff_matches_mime(header: bytes, mime_type: str) -> bool:
+    if len(header) < 16:
+        return False
+    box_size = int.from_bytes(header[:4], "big")
+    if (
+        header[4:8] != b"ftyp"
+        or box_size < 16
+        or box_size > MAX_FTYP_BOX_BYTES
+        or box_size > len(header)
+        or (box_size - 16) % 4 != 0
+    ):
+        return False
+    major_brand = header[8:12]
+    compatible_brands = {
+        header[offset:offset + 4]
+        for offset in range(16, box_size, 4)
+    }
+    all_brands = compatible_brands | {major_brand}
+    if all_brands & IMAGE_BMFF_BRANDS:
+        return False
+    return major_brand in BMFF_BRANDS_BY_MIME.get(mime_type, set())
 
 
 def media_content_matches(stream: BinaryIO, mime_type: str) -> bool:
     """Check a small magic-byte signature without consuming the upload stream."""
     position = stream.tell()
     try:
-        header = stream.read(32)
+        header = stream.read(MAX_FTYP_BOX_BYTES)
     finally:
         stream.seek(position)
     detected = _sniff_media_kind(header)
     expected = (mime_type or "").split(";", 1)[0].strip().lower()
     if expected.startswith("video/"):
-        return detected == "video"
+        return _bmff_matches_mime(header, expected)
     return detected == expected
+
+
+def stage_media_upload(stream: BinaryIO, directory: str, filename: str) -> str:
+    """Copy an upload to an exclusive server-generated file in ``directory``."""
+    safe_name = sanitize_media_filename(filename)
+    if not safe_name:
+        raise ValueError("invalid_filename")
+    extension = os.path.splitext(safe_name)[1].lower()
+    root = Path(directory).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("invalid_media_directory")
+    root_fd = os.open(str(root), os.O_RDONLY | _DIRECTORY)
+    try:
+        for _attempt in range(20):
+            storage_name = f".upload-{uuid.uuid4().hex}{extension}"
+            try:
+                fd = os.open(
+                    storage_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+            except FileExistsError:
+                continue
+            try:
+                with os.fdopen(fd, "wb") as staged:
+                    shutil.copyfileobj(stream, staged)
+                    staged.flush()
+                    os.fsync(staged.fileno())
+            except Exception:
+                try:
+                    os.unlink(storage_name, dir_fd=root_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+            return str(root / storage_name)
+    finally:
+        os.close(root_fd)
+    raise FileExistsError("unable_to_allocate_media_staging")
+
+
+def _claim_final_media_path(staged_path: str, filename: str) -> Tuple[str, str]:
+    """Atomically move a regular staged file to an exclusively claimed name."""
+    safe_name = sanitize_media_filename(filename)
+    if not safe_name:
+        raise ValueError("invalid_filename")
+    staged = Path(staged_path)
+    root = staged.parent.resolve(strict=True)
+    if staged.parent.resolve() != root or staged.is_symlink():
+        raise ValueError("invalid_staged_path")
+    staged_stat = os.lstat(staged)
+    if not stat.S_ISREG(staged_stat.st_mode):
+        raise ValueError("invalid_staged_file")
+
+    base, extension = os.path.splitext(safe_name)
+    root_fd = os.open(str(root), os.O_RDONLY | _DIRECTORY)
+    try:
+        for counter in range(1000):
+            final_name = safe_name if counter == 0 else f"{base}_{counter}{extension}"
+            try:
+                placeholder_fd = os.open(
+                    final_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+            except FileExistsError:
+                continue
+            os.close(placeholder_fd)
+            try:
+                os.replace(
+                    staged.name,
+                    final_name,
+                    src_dir_fd=root_fd,
+                    dst_dir_fd=root_fd,
+                )
+            except Exception:
+                try:
+                    os.unlink(final_name, dir_fd=root_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+            return str(root / final_name), final_name
+    finally:
+        os.close(root_fd)
+    raise FileExistsError("unable_to_allocate_media_destination")
+
+
+def _unlink_regular_file(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        candidate = Path(path)
+        if candidate.is_symlink():
+            candidate.unlink()
+        elif candidate.exists() and stat.S_ISREG(os.lstat(candidate).st_mode):
+            candidate.unlink()
+    except OSError:
+        logger.warning("media_cleanup_failed error_type=OSError")
 
 
 def detect_media_type(filename: str) -> str:
@@ -156,47 +293,56 @@ class MediaProcessor:
         anche se l'analisi AI fallisce: in quel caso resta con categoria
         'other' e senza descrizione, modificabile a mano dalla dashboard.
         """
-        valid, reason = validate_media_upload(filename, mime_type, file_size)
-        if not valid:
-            raise ValueError(reason)
-        if os.path.getsize(filepath) != file_size:
-            raise ValueError("file_size_mismatch")
-        with open(filepath, "rb") as media_file:
-            if not media_content_matches(media_file, mime_type):
-                raise ValueError("mime_content_mismatch")
-
-        safe_name = sanitize_media_filename(filename)
-        media_type = detect_media_type(safe_name)
-        analysis_path = filepath
+        staged_path = filepath
+        final_path = None
+        persisted = False
         frame_to_cleanup = None
+        try:
+            valid, reason = validate_media_upload(filename, mime_type, file_size)
+            if not valid:
+                raise ValueError(reason)
+            flags = os.O_RDONLY | _NOFOLLOW
+            fd = os.open(staged_path, flags)
+            with os.fdopen(fd, "rb") as media_file:
+                actual_size = os.fstat(media_file.fileno()).st_size
+                if actual_size != file_size:
+                    raise ValueError("file_size_mismatch")
+                if not media_content_matches(media_file, mime_type):
+                    raise ValueError("mime_content_mismatch")
 
-        if media_type == "video":
-            frame = extract_video_frame(filepath, os.path.dirname(filepath))
-            if frame:
-                analysis_path = frame
-                frame_to_cleanup = frame
+            final_path, final_name = _claim_final_media_path(staged_path, filename)
+            media_type = detect_media_type(final_name)
+            analysis_path = final_path
+            if media_type == "video":
+                frame = extract_video_frame(final_path, os.path.dirname(final_path))
+                if frame:
+                    analysis_path = frame
+                    frame_to_cleanup = frame
 
-        result = None
-        if self.ai:
-            result = self.ai.analyze_image(analysis_path)
-
-        if frame_to_cleanup and os.path.exists(frame_to_cleanup):
-            os.remove(frame_to_cleanup)
-
-        tags = result.get("tags", []) if result else []
-        clean_context = " ".join(str(user_context or "").split())[:2000]
-        media_id = self.db.add_media_with_context(
-            filename=safe_name,
-            filepath=filepath,
-            media_type=media_type,
-            category=(result or {}).get("category", "other"),
-            ai_description=(result or {}).get("description", ""),
-            ai_tags=",".join(tags) if isinstance(tags, list) else str(tags),
-            user_context=clean_context,
-            mime_type=mime_type,
-            file_size=file_size,
-        )
-        record = self.db.get_media_by_id(media_id)
-        if not result:
-            logger.warning(f"⚠️ Analisi AI non disponibile per {safe_name}: registrato con categoria 'other'")
-        return record
+            result = self.ai.analyze_image(analysis_path) if self.ai else None
+            if result is not None and not isinstance(result, dict):
+                result = None
+            tags = result.get("tags", []) if result else []
+            clean_context = " ".join(str(user_context or "").split())[:2000]
+            record = self.db.add_media_with_context(
+                filename=final_name,
+                filepath=final_path,
+                media_type=media_type,
+                category=(result or {}).get("category", "other"),
+                ai_description=(result or {}).get("description", ""),
+                ai_tags=",".join(tags) if isinstance(tags, list) else str(tags),
+                user_context=clean_context,
+                mime_type=mime_type,
+                file_size=file_size,
+            )
+            persisted = True
+            if not result:
+                logger.warning(
+                    "media_analysis_unavailable stored_with_category=other"
+                )
+            return record
+        finally:
+            _unlink_regular_file(frame_to_cleanup)
+            _unlink_regular_file(staged_path)
+            if not persisted:
+                _unlink_regular_file(final_path)
