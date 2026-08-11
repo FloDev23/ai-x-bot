@@ -38,7 +38,7 @@ from modules.fact_guard import (
     normalize_incident_subtype,
     valid_source_id,
 )
-from typing import Dict, Optional, List
+from typing import BinaryIO, Dict, Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +298,7 @@ Reply ONLY with the DM text."""
         text = text.strip()
         return text if text and len(text) <= 500 else None
 
-    def analyze_image(self, image_path: str) -> Optional[Dict]:
+    def analyze_image(self, image_file: BinaryIO, filename: str) -> Optional[Dict]:
         """
         Analizza un'immagine (o un frame estratto da un video) per la
         libreria media: descrizione, categoria suggerita, tag e una bozza
@@ -313,9 +313,13 @@ Reply ONLY with the DM text."""
         import json
 
         try:
-            with open(image_path, 'rb') as f:
-                b64 = base64.b64encode(f.read()).decode('utf-8')
-            ext = image_path.rsplit('.', 1)[-1].lower()
+            position = image_file.tell()
+            try:
+                image_file.seek(0)
+                b64 = base64.b64encode(image_file.read()).decode('utf-8')
+            finally:
+                image_file.seek(position)
+            ext = filename.rsplit('.', 1)[-1].lower()
             mime = 'image/png' if ext == 'png' else 'image/jpeg'
 
             prompt = """Analyze this image for a FlexDropin social media post
@@ -355,8 +359,10 @@ Pick "category" as the single best fit from the list."""
                 return None
             raw = raw.replace('```json', '').replace('```', '').strip()
             return json.loads(raw)
-        except Exception as e:
-            logger.error(f"❌ Errore analisi immagine ({image_path}): {e}")
+        except Exception as error:
+            logger.error(
+                "image_analysis_failed error_type=%s", type(error).__name__,
+            )
             return None
 
     def select_best_media(self, category: str, topic_hint: str,

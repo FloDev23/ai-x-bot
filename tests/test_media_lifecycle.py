@@ -126,6 +126,23 @@ def test_content_signature_spoofing_is_rejected_before_database_storage(tmp_path
     assert db.get_all_media() == []
 
 
+def test_ai_image_stream_failure_returns_none_without_path_reopen():
+    from types import SimpleNamespace
+
+    class FailingCompletions:
+        def create(self, **_kwargs):
+            raise RuntimeError("vision unavailable")
+
+    generator = AIGenerator.__new__(AIGenerator)
+    generator.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=FailingCompletions()),
+    )
+
+    result = generator.analyze_image(io.BytesIO(JPEG_BYTES), "gym.jpg")
+
+    assert result is None
+
+
 def test_ai_media_choice_returns_relevance_schema_and_rejects_unknown_id(fake_ai):
     candidates = [{
         "id": 4,
@@ -484,7 +501,7 @@ def test_staging_retries_instead_of_following_existing_symlink(tmp_path, monkeyp
 
 
 class RaisingAI:
-    def analyze_image(self, _path):
+    def analyze_image(self, _file, _filename):
         raise RuntimeError("vision unavailable")
 
 
@@ -631,3 +648,153 @@ def test_staged_symlink_swap_and_database_failure_leave_no_orphans(
     assert outside.read_bytes() == b"do-not-touch"
     assert os.path.lexists(staged) is False
     assert list(tmp_path.glob("gym*.jpg")) == []
+
+
+def test_descriptor_copy_retries_eintr_without_losing_partial_bytes(
+    tmp_path, monkeypatch,
+):
+    from modules import media_processor as media_module
+
+    payload = b"partial-read-and-write-payload"
+    source_path = tmp_path / "source.bin"
+    destination_path = tmp_path / "destination.bin"
+    source_path.write_bytes(payload)
+    source_fd = os.open(source_path, os.O_RDONLY)
+    destination_fd = os.open(
+        destination_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600,
+    )
+    original_read = os.read
+    original_write = os.write
+    original_fsync = os.fsync
+    read_attempt = 0
+    write_attempt = 0
+    fsync_attempt = 0
+
+    def interrupted_partial_read(fd, size):
+        nonlocal read_attempt
+        read_attempt += 1
+        if read_attempt in {1, 3}:
+            raise InterruptedError("read interrupted")
+        return original_read(fd, min(size, 3))
+
+    def interrupted_partial_write(fd, data):
+        nonlocal write_attempt
+        write_attempt += 1
+        if write_attempt in {2, 5}:
+            raise InterruptedError("write interrupted")
+        return original_write(fd, data[:2])
+
+    def interrupted_fsync(fd):
+        nonlocal fsync_attempt
+        fsync_attempt += 1
+        if fsync_attempt == 1:
+            raise InterruptedError("fsync interrupted")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(media_module.os, "read", interrupted_partial_read)
+    monkeypatch.setattr(media_module.os, "write", interrupted_partial_write)
+    monkeypatch.setattr(media_module.os, "fsync", interrupted_fsync)
+    try:
+        media_module._copy_file_descriptor(source_fd, destination_fd)
+    finally:
+        os.close(source_fd)
+        os.close(destination_fd)
+
+    assert destination_path.read_bytes() == payload
+
+
+def test_post_validation_path_swap_aborts_without_persisting_symlink(tmp_path):
+    db = Database(str(tmp_path / "db.sqlite"))
+    staged = tmp_path / ".upload-race.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"do-not-touch")
+
+    class SwapAfterValidationAI:
+        consumed = None
+
+        def analyze_image(self, media, filename=None):
+            if filename is None:
+                final_path = Path(media)
+                self.consumed = final_path.read_bytes()
+            else:
+                final_path = tmp_path / filename
+                media.seek(0)
+                self.consumed = media.read()
+            final_path.unlink()
+            final_path.symlink_to(outside)
+            return None
+
+    ai = SwapAfterValidationAI()
+
+    with pytest.raises(ValueError, match="media_file_identity_changed"):
+        MediaProcessor(db, ai).process_new_file(
+            str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+        )
+
+    assert ai.consumed == JPEG_BYTES
+    assert db.get_all_media() == []
+    with db._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM content_sources"
+        ).fetchone()[0] == 0
+    assert outside.read_bytes() == b"do-not-touch"
+    assert os.path.lexists(tmp_path / "gym.jpg") is False
+    assert os.path.lexists(staged) is False
+
+
+def test_missing_nofollow_support_rejects_before_opening_staged_target(
+    tmp_path, monkeypatch,
+):
+    from modules import media_processor as media_module
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(JPEG_BYTES)
+    staged = tmp_path / ".upload-link.jpg"
+    staged.symlink_to(outside)
+    open_attempts = []
+
+    def forbidden_open(*args, **kwargs):
+        open_attempts.append((args, kwargs))
+        raise AssertionError("staged target must not be opened")
+
+    monkeypatch.setattr(media_module, "_NOFOLLOW", 0)
+    monkeypatch.setattr(media_module.os, "open", forbidden_open)
+
+    with pytest.raises(RuntimeError, match="secure_nofollow_unavailable"):
+        MediaProcessor(db).process_new_file(
+            str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+        )
+
+    assert open_attempts == []
+    assert outside.read_bytes() == JPEG_BYTES
+    assert db.get_all_media() == []
+
+
+@pytest.mark.parametrize("trust_failure", ["permissions", "ownership"])
+def test_untrusted_media_directory_is_rejected_before_staged_open(
+    tmp_path, monkeypatch, trust_failure,
+):
+    from modules import media_processor as media_module
+
+    media_dir = tmp_path / "media"
+    media_dir.mkdir(mode=0o700)
+    staged = media_dir / ".upload-staged.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    if trust_failure == "permissions":
+        media_dir.chmod(0o755)
+        expected = "insecure_media_directory_permissions"
+    else:
+        real_euid = os.geteuid()
+        monkeypatch.setattr(media_module.os, "geteuid", lambda: real_euid + 1)
+        expected = "insecure_media_directory_owner"
+    db = Database(str(tmp_path / "db.sqlite"))
+
+    with pytest.raises(PermissionError, match=expected):
+        MediaProcessor(db).process_new_file(
+            str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+        )
+
+    assert db.get_all_media() == []
+    assert os.path.lexists(staged) is False

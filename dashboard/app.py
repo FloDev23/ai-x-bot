@@ -43,7 +43,7 @@ BOT_DB_PATH = str(REPO_ROOT / "bot_data.db")
 db = Database(db_path=BOT_DB_PATH)
 
 MEDIA_DIR = MEDIA_LIBRARY_DIR
-os.makedirs(MEDIA_DIR, exist_ok=True)
+os.makedirs(MEDIA_DIR, mode=0o700, exist_ok=True)
 
 # L'analisi AI richiede GROQ_API_KEY: se non configurata o Groq non
 # raggiungibile dalla dashboard, i file vengono comunque salvati e

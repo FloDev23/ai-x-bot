@@ -22,7 +22,7 @@ def dashboard_client(tmp_path, monkeypatch):
     monkeypatch.setattr(werkzeug, "__version__", "test", raising=False)
     database = Database(str(tmp_path / "dashboard.db"))
     media_dir = tmp_path / "media"
-    media_dir.mkdir()
+    media_dir.mkdir(mode=0o700)
     monkeypatch.setattr(dashboard_app, "db", database)
     monkeypatch.setattr(dashboard_app, "MEDIA_DIR", str(media_dir))
     monkeypatch.setattr(

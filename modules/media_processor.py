@@ -48,7 +48,7 @@ IMAGE_BMFF_BRANDS = {
     b"avif", b"avis", b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1",
 }
 MAX_FTYP_BOX_BYTES = 4096
-_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
@@ -141,23 +141,51 @@ def media_content_matches(stream: BinaryIO, mime_type: str) -> bool:
     return detected == expected
 
 
+def _require_nofollow_support() -> int:
+    if not isinstance(_NOFOLLOW, int) or _NOFOLLOW == 0:
+        raise RuntimeError("secure_nofollow_unavailable")
+    return _NOFOLLOW
+
+
+def _validate_private_directory(directory_stat: os.stat_result) -> None:
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise ValueError("invalid_media_directory")
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        raise RuntimeError("secure_owner_check_unavailable")
+    if directory_stat.st_uid != geteuid():
+        raise PermissionError("insecure_media_directory_owner")
+    permissions = stat.S_IMODE(directory_stat.st_mode)
+    if permissions & 0o077 or permissions & 0o700 != 0o700:
+        raise PermissionError("insecure_media_directory_permissions")
+
+
+def _open_private_media_directory(directory: Path) -> Tuple[Path, int]:
+    nofollow = _require_nofollow_support()
+    root = directory.resolve(strict=True)
+    root_fd = os.open(str(root), os.O_RDONLY | _DIRECTORY | nofollow)
+    try:
+        _validate_private_directory(os.fstat(root_fd))
+    except Exception:
+        os.close(root_fd)
+        raise
+    return root, root_fd
+
+
 def stage_media_upload(stream: BinaryIO, directory: str, filename: str) -> str:
     """Copy an upload to an exclusive server-generated file in ``directory``."""
     safe_name = sanitize_media_filename(filename)
     if not safe_name:
         raise ValueError("invalid_filename")
     extension = os.path.splitext(safe_name)[1].lower()
-    root = Path(directory).resolve(strict=True)
-    if not root.is_dir():
-        raise ValueError("invalid_media_directory")
-    root_fd = os.open(str(root), os.O_RDONLY | _DIRECTORY)
+    root, root_fd = _open_private_media_directory(Path(directory))
     try:
         for _attempt in range(20):
             storage_name = f".upload-{uuid.uuid4().hex}{extension}"
             try:
                 fd = os.open(
                     storage_name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _require_nofollow_support(),
                     0o600,
                     dir_fd=root_fd,
                 )
@@ -184,16 +212,27 @@ def _copy_file_descriptor(source_fd: int, destination_fd: int) -> None:
     """Copy from a pinned source inode to an exclusively opened destination."""
     os.lseek(source_fd, 0, os.SEEK_SET)
     while True:
-        chunk = os.read(source_fd, 1024 * 1024)
+        try:
+            chunk = os.read(source_fd, 1024 * 1024)
+        except InterruptedError:
+            continue
         if not chunk:
             break
         view = memoryview(chunk)
         while view:
-            written = os.write(destination_fd, view)
+            try:
+                written = os.write(destination_fd, view)
+            except InterruptedError:
+                continue
             if written <= 0:
                 raise OSError("media_destination_write_failed")
             view = view[written:]
-    os.fsync(destination_fd)
+    while True:
+        try:
+            os.fsync(destination_fd)
+            break
+        except InterruptedError:
+            continue
     os.lseek(destination_fd, 0, os.SEEK_SET)
 
 
@@ -201,7 +240,7 @@ def _claim_final_media_path(
     staged_path: str,
     filename: str,
     source_fd: int,
-) -> Tuple[str, str, int]:
+) -> Tuple[str, str, int, int]:
     """Copy a pinned regular inode to an exclusively claimed final file.
 
     The returned descriptor still refers to the final inode, so callers can
@@ -211,20 +250,20 @@ def _claim_final_media_path(
     if not safe_name:
         raise ValueError("invalid_filename")
     staged = Path(staged_path)
-    root = staged.parent.resolve(strict=True)
     source_stat = os.fstat(source_fd)
     if not stat.S_ISREG(source_stat.st_mode):
         raise ValueError("invalid_staged_file")
 
     base, extension = os.path.splitext(safe_name)
-    root_fd = os.open(str(root), os.O_RDONLY | _DIRECTORY)
+    root, root_fd = _open_private_media_directory(staged.parent)
+    keep_root_fd = False
     try:
         for counter in range(1000):
             final_name = safe_name if counter == 0 else f"{base}_{counter}{extension}"
             try:
                 final_fd = os.open(
                     final_name,
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | _require_nofollow_support(),
                     0o600,
                     dir_fd=root_fd,
                 )
@@ -241,10 +280,36 @@ def _claim_final_media_path(
                 except FileNotFoundError:
                     pass
                 raise
-            return str(root / final_name), final_name, final_fd
+            keep_root_fd = True
+            return str(root / final_name), final_name, final_fd, root_fd
     finally:
-        os.close(root_fd)
+        if not keep_root_fd:
+            os.close(root_fd)
     raise FileExistsError("unable_to_allocate_media_destination")
+
+
+def _verify_final_media_identity(
+    root_fd: int,
+    final_name: str,
+    final_fd: int,
+    expected_size: int,
+) -> None:
+    """Bind the persisted pathname to the pinned, validated final inode."""
+    try:
+        _validate_private_directory(os.fstat(root_fd))
+        descriptor_stat = os.fstat(final_fd)
+        path_stat = os.stat(final_name, dir_fd=root_fd, follow_symlinks=False)
+    except (FileNotFoundError, OSError, PermissionError, ValueError):
+        raise ValueError("media_file_identity_changed") from None
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or not stat.S_ISREG(path_stat.st_mode)
+        or descriptor_stat.st_dev != path_stat.st_dev
+        or descriptor_stat.st_ino != path_stat.st_ino
+        or descriptor_stat.st_size != expected_size
+        or path_stat.st_size != expected_size
+    ):
+        raise ValueError("media_file_identity_changed")
 
 
 def _unlink_regular_file(path: Optional[str]) -> None:
@@ -317,12 +382,18 @@ class MediaProcessor:
         final_path = None
         persisted = False
         frame_to_cleanup = None
+        source_root_fd = None
+        final_root_fd = None
         try:
             valid, reason = validate_media_upload(filename, mime_type, file_size)
             if not valid:
                 raise ValueError(reason)
-            flags = os.O_RDONLY | _NOFOLLOW
-            fd = os.open(staged_path, flags)
+            staged = Path(staged_path)
+            source_root, source_root_fd = _open_private_media_directory(staged.parent)
+            if staged.parent.resolve(strict=True) != source_root:
+                raise ValueError("invalid_staged_path")
+            flags = os.O_RDONLY | _require_nofollow_support()
+            fd = os.open(staged.name, flags, dir_fd=source_root_fd)
             with os.fdopen(fd, "rb") as media_file:
                 source_stat = os.fstat(media_file.fileno())
                 if not stat.S_ISREG(source_stat.st_mode):
@@ -332,7 +403,7 @@ class MediaProcessor:
                     raise ValueError("file_size_mismatch")
                 if not media_content_matches(media_file, mime_type):
                     raise ValueError("mime_content_mismatch")
-                final_path, final_name, final_fd = _claim_final_media_path(
+                final_path, final_name, final_fd, final_root_fd = _claim_final_media_path(
                     staged_path, filename, media_file.fileno(),
                 )
                 with os.fdopen(final_fd, "rb") as final_file:
@@ -344,38 +415,67 @@ class MediaProcessor:
                         raise ValueError("file_size_mismatch")
                     if not media_content_matches(final_file, mime_type):
                         raise ValueError("mime_content_mismatch")
+                    media_type = detect_media_type(final_name)
+                    result = None
+                    if self.ai and media_type == "video":
+                        _verify_final_media_identity(
+                            final_root_fd, final_name, final_file.fileno(), file_size,
+                        )
+                        frame = extract_video_frame(
+                            final_path, os.path.dirname(final_path),
+                        )
+                        _verify_final_media_identity(
+                            final_root_fd, final_name, final_file.fileno(), file_size,
+                        )
+                        if frame:
+                            frame_to_cleanup = frame
+                            frame_path = Path(frame)
+                            if frame_path.parent.resolve(strict=True) != source_root:
+                                raise ValueError("invalid_media_frame_path")
+                            frame_fd = os.open(
+                                frame_path.name,
+                                os.O_RDONLY | _require_nofollow_support(),
+                                dir_fd=final_root_fd,
+                            )
+                            with os.fdopen(frame_fd, "rb") as frame_file:
+                                if not stat.S_ISREG(os.fstat(frame_file.fileno()).st_mode):
+                                    raise ValueError("invalid_media_frame")
+                                result = self.ai.analyze_image(
+                                    frame_file, frame_path.name,
+                                )
+                    elif self.ai:
+                        final_file.seek(0)
+                        result = self.ai.analyze_image(final_file, final_name)
 
-            media_type = detect_media_type(final_name)
-            analysis_path = final_path
-            if media_type == "video":
-                frame = extract_video_frame(final_path, os.path.dirname(final_path))
-                if frame:
-                    analysis_path = frame
-                    frame_to_cleanup = frame
-
-            result = self.ai.analyze_image(analysis_path) if self.ai else None
-            if result is not None and not isinstance(result, dict):
-                result = None
-            tags = result.get("tags", []) if result else []
-            clean_context = " ".join(str(user_context or "").split())[:2000]
-            record = self.db.add_media_with_context(
-                filename=final_name,
-                filepath=final_path,
-                media_type=media_type,
-                category=(result or {}).get("category", "other"),
-                ai_description=(result or {}).get("description", ""),
-                ai_tags=",".join(tags) if isinstance(tags, list) else str(tags),
-                user_context=clean_context,
-                mime_type=mime_type,
-                file_size=file_size,
-            )
-            persisted = True
-            if not result:
-                logger.warning(
-                    "media_analysis_unavailable stored_with_category=other"
-                )
-            return record
+                    if result is not None and not isinstance(result, dict):
+                        result = None
+                    tags = result.get("tags", []) if result else []
+                    clean_context = " ".join(str(user_context or "").split())[:2000]
+                    _verify_final_media_identity(
+                        final_root_fd, final_name, final_file.fileno(), file_size,
+                    )
+                    record = self.db.add_media_with_context(
+                        filename=final_name,
+                        filepath=final_path,
+                        media_type=media_type,
+                        category=(result or {}).get("category", "other"),
+                        ai_description=(result or {}).get("description", ""),
+                        ai_tags=",".join(tags) if isinstance(tags, list) else str(tags),
+                        user_context=clean_context,
+                        mime_type=mime_type,
+                        file_size=file_size,
+                    )
+                    persisted = True
+                    if not result:
+                        logger.warning(
+                            "media_analysis_unavailable stored_with_category=other"
+                        )
+                    return record
         finally:
+            if source_root_fd is not None:
+                os.close(source_root_fd)
+            if final_root_fd is not None:
+                os.close(final_root_fd)
             _unlink_regular_file(frame_to_cleanup)
             _unlink_regular_file(staged_path)
             if not persisted:
