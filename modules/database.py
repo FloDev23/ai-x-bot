@@ -153,6 +153,7 @@ class Database:
     def _init_schema(self):
         with self._conn() as conn:
             c = conn.cursor()
+            c.execute("BEGIN IMMEDIATE")
 
             # Storico tweet pubblicati (memoria a lungo termine, punto 1)
             c.execute("""
@@ -439,7 +440,7 @@ class Database:
                 "SELECT value FROM bot_state WHERE key = ?",
                 (_MEDIA_LIFECYCLE_MIGRATION_KEY,),
             ).fetchone()
-            if lifecycle_added:
+            if lifecycle_added or lifecycle_migration is None:
                 c.execute("""
                     INSERT INTO bot_state (key, value, updated_at)
                     VALUES (?, 'pending', ?)
@@ -447,12 +448,6 @@ class Database:
                         value = 'pending', updated_at = excluded.updated_at
                 """, (_MEDIA_LIFECYCLE_MIGRATION_KEY, self._now_iso()))
                 lifecycle_migration_pending = True
-            elif lifecycle_migration is None:
-                c.execute("""
-                    INSERT INTO bot_state (key, value, updated_at)
-                    VALUES (?, 'complete', ?)
-                """, (_MEDIA_LIFECYCLE_MIGRATION_KEY, self._now_iso()))
-                lifecycle_migration_pending = False
             else:
                 lifecycle_migration_pending = (
                     lifecycle_migration["value"] == "pending"

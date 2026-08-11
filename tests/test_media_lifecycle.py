@@ -63,6 +63,32 @@ def _insert_identity_media(
     )
 
 
+def _create_legacy_media_database(path, *, lifecycle_column):
+    lifecycle_definition = (
+        ", lifecycle_state TEXT DEFAULT 'available'"
+        if lifecycle_column
+        else ""
+    )
+    conn = sqlite3.connect(path)
+    conn.executescript(f"""
+        CREATE TABLE media_library (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            filepath TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            used INTEGER DEFAULT 0,
+            file_deleted INTEGER DEFAULT 0
+            {lifecycle_definition}
+        );
+        INSERT INTO media_library (filename, filepath, media_type, used)
+        VALUES ('used.jpg', '/legacy/used.jpg', 'image', 1);
+        INSERT INTO media_library (
+            filename, filepath, media_type, used, file_deleted
+        ) VALUES ('deleted.jpg', '/legacy/deleted.jpg', 'image', 1, 1);
+    """)
+    conn.close()
+
+
 def bmff_ftyp(major_brand, compatible_brands=()):
     payload = major_brand + b"\x00\x00\x00\x00" + b"".join(compatible_brands)
     return (8 + len(payload)).to_bytes(4, "big") + b"ftyp" + payload
@@ -1350,7 +1376,164 @@ def test_interrupted_lifecycle_schema_migration_resumes_from_pending_marker(
     assert marker["value"] == "complete"
 
 
-def test_noop_schema_init_does_not_resolve_historical_media_roots(tmp_path):
+def test_hard_crash_after_lifecycle_alter_rolls_back_and_restart_backfills(
+    tmp_path,
+):
+    path = tmp_path / "legacy-hard-crash.sqlite"
+    _create_legacy_media_database(path, lifecycle_column=False)
+    child_code = r'''
+import os
+import sqlite3
+import sys
+
+from modules import database as database_module
+
+
+class CrashAfterLifecycleAlterCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=()):
+        result = super().execute(sql, parameters)
+        normalized = " ".join(sql.upper().split())
+        if normalized.startswith(
+            "ALTER TABLE MEDIA_LIBRARY ADD COLUMN LIFECYCLE_STATE"
+        ):
+            print("lifecycle_alter_finished", flush=True)
+            os._exit(91)
+        return result
+
+
+class CrashAfterLifecycleAlterConnection(sqlite3.Connection):
+    def cursor(self, factory=CrashAfterLifecycleAlterCursor):
+        return super().cursor(factory=factory)
+
+
+real_connect = database_module.sqlite3.connect
+
+
+def crash_connect(*args, **kwargs):
+    kwargs["factory"] = CrashAfterLifecycleAlterConnection
+    return real_connect(*args, **kwargs)
+
+
+database_module.sqlite3.connect = crash_connect
+database_module.Database(sys.argv[1])
+'''
+
+    crashed = subprocess.run(
+        [sys.executable, "-c", child_code, str(path)],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert crashed.returncode == 91
+    assert crashed.stdout.strip() == "lifecycle_alter_finished"
+
+    check = sqlite3.connect(path)
+    columns_after_crash = {
+        row[1] for row in check.execute("PRAGMA table_info(media_library)")
+    }
+    check.close()
+
+    recovered = Database(str(path))
+    with recovered._conn() as check:
+        states = check.execute(
+            "SELECT lifecycle_state FROM media_library ORDER BY id"
+        ).fetchall()
+        marker = check.execute(
+            "SELECT value FROM bot_state "
+            "WHERE key = 'migration:media_lifecycle_state'"
+        ).fetchone()
+
+    assert (
+        "lifecycle_state" in columns_after_crash,
+        [row["lifecycle_state"] for row in states],
+        marker["value"],
+    ) == (False, ["used", "deleted"], "complete")
+
+
+def test_concurrent_schema_init_reconciles_column_without_marker(
+    tmp_path, monkeypatch,
+):
+    from modules import database as database_module
+
+    path = tmp_path / "legacy-concurrent.sqlite"
+    _create_legacy_media_database(path, lifecycle_column=True)
+    constructor_start = threading.Barrier(2)
+    begin_attempt_lock = threading.Lock()
+    begin_attempt_threads = set()
+    concurrent_begin_attempted = threading.Event()
+    real_connect = sqlite3.connect
+
+    class MarkerBarrierCursor(sqlite3.Cursor):
+        def execute(self, sql, parameters=()):
+            normalized = " ".join(sql.upper().split())
+            if normalized == "BEGIN IMMEDIATE":
+                with begin_attempt_lock:
+                    begin_attempt_threads.add(threading.get_ident())
+                    if len(begin_attempt_threads) == 2:
+                        concurrent_begin_attempted.set()
+            self._lifecycle_marker_read = (
+                normalized
+                == "SELECT VALUE FROM BOT_STATE WHERE KEY = ?"
+                and parameters == ("migration:media_lifecycle_state",)
+            )
+            return super().execute(sql, parameters)
+
+        def fetchone(self):
+            row = super().fetchone()
+            if self._lifecycle_marker_read and row is None:
+                assert concurrent_begin_attempted.wait(timeout=1)
+            return row
+
+    class MarkerBarrierConnection(sqlite3.Connection):
+        def cursor(self, factory=MarkerBarrierCursor):
+            return super().cursor(factory=factory)
+
+    def synchronized_connect(*args, **kwargs):
+        kwargs["factory"] = MarkerBarrierConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(database_module.sqlite3, "connect", synchronized_connect)
+    databases = []
+    errors = []
+
+    def construct_database():
+        try:
+            constructor_start.wait()
+            databases.append(Database(str(path)))
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=construct_database) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(thread.is_alive() is False for thread in threads)
+    assert concurrent_begin_attempted.is_set()
+    assert errors == []
+    assert len(databases) == 2
+    check = real_connect(path)
+    states = [
+        row[0]
+        for row in check.execute(
+            "SELECT lifecycle_state FROM media_library ORDER BY id"
+        ).fetchall()
+    ]
+    marker = check.execute(
+        "SELECT value FROM bot_state "
+        "WHERE key = 'migration:media_lifecycle_state'"
+    ).fetchone()
+    check.close()
+    assert states == ["used", "deleted"]
+    assert marker == ("complete",)
+
+
+def test_noop_schema_init_does_not_resolve_historical_media_roots(
+    tmp_path, monkeypatch,
+):
+    original_media_mutation_roots = Database._media_mutation_roots
     root = tmp_path / "historical-root"
     root.mkdir(mode=0o700)
     path = str(tmp_path / "db.sqlite")
@@ -1363,9 +1546,23 @@ def test_noop_schema_init_does_not_resolve_historical_media_roots(tmp_path):
     Path(record["filepath"]).unlink()
     root.rmdir()
 
+    root_scans = []
+
+    def observe_media_mutation_roots(snapshot):
+        root_scans.append(snapshot)
+        return original_media_mutation_roots(snapshot)
+
+    monkeypatch.setattr(
+        Database,
+        "_media_mutation_roots",
+        staticmethod(observe_media_mutation_roots),
+    )
     reopened = Database(path)
+    reopened_again = Database(path)
 
     assert reopened.get_media_by_id(record["id"])["id"] == record["id"]
+    assert reopened_again.get_media_by_id(record["id"])["id"] == record["id"]
+    assert root_scans == []
 
 
 def test_mutation_snapshot_churn_is_bounded_and_fails_closed(
