@@ -1,13 +1,14 @@
 from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+import json
 import threading
 from types import SimpleNamespace
 
 import pytest
 from requests import exceptions as requests_exceptions
 
-from modules.database import Database
+from modules.database import Database, PostDraftPublicationClaim
 from modules.media_processor import MediaProcessor
 from modules.publisher import Publisher
 from modules.twitter_client import TwitterClient
@@ -49,6 +50,71 @@ class FakePublisherDatabase:
             return False
         self.draft.update(changes)
         self.draft["status"] = new_status
+        self.draft["revision"] += 1
+        return True
+
+    def claim_post_draft_for_publication(self, draft_id, expected_revision):
+        if (
+            draft_id != self.draft["id"]
+            or self.draft["status"] != "approved"
+            or self.draft["revision"] != expected_revision
+        ):
+            return None
+        self.draft["status"] = "publishing"
+        self.draft["revision"] += 1
+        claim = PostDraftPublicationClaim(
+            draft_id=self.draft["id"],
+            revision=self.draft["revision"],
+            publication_key=self.draft["publication_key"],
+            text=self.draft["text"],
+            category=self.draft["category"],
+            source_ids_json=json.dumps(self.draft["source_ids"]),
+            score_json=json.dumps(self.draft["score_data"]),
+            intended_slot=self.draft["intended_slot"],
+            media_id=self.draft["media_id"],
+            approved_at=None,
+            approved_by=None,
+        )
+        return deepcopy(self.draft), claim
+
+    def _claim_matches(self, claim):
+        return (
+            self.draft["id"] == claim.draft_id
+            and self.draft["status"] == "publishing"
+            and self.draft["revision"] == claim.revision
+            and self.draft["text"] == claim.text
+        )
+
+    def finalize_post_draft_publication(
+        self, claim, tweet_id, expected_media=None
+    ):
+        if expected_media is not None or not self._claim_matches(claim):
+            return False
+        self.draft["status"] = "published"
+        self.draft["published_tweet_id"] = tweet_id
+        self.draft["revision"] += 1
+        return True
+
+    def fail_post_draft_publication(self, claim, safe_error):
+        if not self._claim_matches(claim):
+            return False
+        self.draft["status"] = "publication_failed"
+        self.draft["error"] = safe_error
+        self.draft["revision"] += 1
+        return True
+
+    def restore_post_draft_publication_claim(self, claim):
+        if not self._claim_matches(claim):
+            return False
+        self.draft["status"] = "approved"
+        self.draft["revision"] += 1
+        return True
+
+    def mark_post_draft_publication_unknown(self, claim, safe_error):
+        if not self._claim_matches(claim):
+            return False
+        self.draft["status"] = "publication_unknown"
+        self.draft["error"] = safe_error
         self.draft["revision"] += 1
         return True
 
@@ -211,6 +277,75 @@ class BarrierReadDatabase(Database):
         return draft
 
 
+class PauseAfterApprovedReadDatabase(Database):
+    def __init__(self, db_path, draft_read, continue_publish):
+        self._draft_read = draft_read
+        self._continue_publish = continue_publish
+        self._paused_once = False
+        super().__init__(db_path)
+
+    def get_post_draft(self, draft_id):
+        draft = super().get_post_draft(draft_id)
+        if (
+            draft
+            and draft["status"] == "approved"
+            and not self._paused_once
+        ):
+            self._paused_once = True
+            self._draft_read.set()
+            assert self._continue_publish.wait(timeout=5)
+        return draft
+
+
+def test_revision_change_between_read_and_claim_never_publishes_stale_text(
+    tmp_path,
+):
+    path = str(tmp_path / "bot.db")
+    setup = Database(path)
+    draft_id = _approved_sqlite_draft(
+        setup, slot=SLOT, key="publisher-revision-race"
+    )
+    draft_read = threading.Event()
+    continue_publish = threading.Event()
+    publisher_db = PauseAfterApprovedReadDatabase(
+        path, draft_read, continue_publish
+    )
+    x_client = RecordingXClient()
+    outcome = {}
+
+    def publish():
+        try:
+            outcome["result"] = Publisher(
+                publisher_db, x_client, dry_run=False
+            ).publish(draft_id, SLOT)
+        except Exception as error:  # pragma: no cover - surfaced below
+            outcome["error"] = error
+
+    thread = threading.Thread(target=publish)
+    thread.start()
+    try:
+        assert draft_read.wait(timeout=5)
+        assert setup.transition_post_draft(
+            draft_id,
+            ["approved"],
+            "approved",
+            text="NEW approved text",
+        )
+    finally:
+        continue_publish.set()
+        thread.join(timeout=8)
+
+    assert not thread.is_alive()
+    assert "error" not in outcome
+    assert outcome["result"].status == "already_claimed"
+    assert x_client.posts == []
+    stored = setup.get_post_draft(draft_id)
+    assert stored["status"] == "approved"
+    assert stored["text"] == "NEW approved text"
+    with setup._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM posted_tweets").fetchone()[0] == 0
+
+
 def test_two_sqlite_workers_make_at_most_one_x_call(tmp_path):
     path = str(tmp_path / "bot.db")
     setup = Database(path)
@@ -292,6 +427,77 @@ def test_verified_reserved_media_is_uploaded_and_preserved_on_success(tmp_path):
     assert [tuple(row) for row in posted] == [
         ("tweet-with-media", "A useful, approved post.", "gym_strategy")
     ]
+
+
+def test_media_reassigned_before_root_lease_is_never_uploaded(
+    tmp_path, monkeypatch
+):
+    from modules import publisher as publisher_module
+
+    path = str(tmp_path / "bot.db")
+    setup = Database(path)
+    media = _stored_media(setup, tmp_path)
+    draft_a = _approved_sqlite_draft(
+        setup,
+        slot=SLOT,
+        key="publisher-media-race-a",
+        media_record=media,
+    )
+    draft_b = setup.create_post_draft(
+        text="Draft B owns the media now.",
+        category="gym_strategy",
+        source_ids=[setup.add_content_source("evergreen_idea", "Source B.")],
+        score_data={"total": 77},
+        intended_slot=(SLOT + timedelta(days=1)).isoformat(),
+        publication_key="publisher-media-race-b",
+    )
+    before_root_open = threading.Event()
+    continue_open = threading.Event()
+    real_open_verified_media = publisher_module.open_verified_media
+
+    @contextmanager
+    def pause_before_root_lease(record):
+        before_root_open.set()
+        assert continue_open.wait(timeout=5)
+        with real_open_verified_media(record) as media_file:
+            yield media_file
+
+    monkeypatch.setattr(
+        publisher_module, "open_verified_media", pause_before_root_lease
+    )
+    x_client = RecordingXClient()
+    outcome = {}
+
+    def publish():
+        try:
+            outcome["result"] = Publisher(
+                Database(path), x_client, dry_run=False
+            ).publish(draft_a, SLOT)
+        except Exception as error:  # pragma: no cover - surfaced below
+            outcome["error"] = error
+
+    thread = threading.Thread(target=publish)
+    thread.start()
+    try:
+        assert before_root_open.wait(timeout=5)
+        setup.release_media_for_draft(draft_a)
+        assert setup.attach_media_to_draft(media["id"], draft_b)
+    finally:
+        continue_open.set()
+        thread.join(timeout=8)
+
+    assert not thread.is_alive()
+    assert "error" not in outcome
+    assert outcome["result"].status == "publication_failed"
+    assert x_client.posts == []
+    assert x_client.media_bytes is None
+    assert setup.get_post_draft(draft_a)["status"] == "publication_failed"
+    assert setup.get_post_draft(draft_b)["media_id"] == media["id"]
+    stored_media = setup.get_media_by_id(media["id"])
+    assert stored_media["lifecycle_state"] == "reserved"
+    assert stored_media["reserved_by_draft_id"] == draft_b
+    with setup._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM posted_tweets").fetchone()[0] == 0
 
 
 class RejectingXClient(RecordingXClient):

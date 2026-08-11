@@ -67,8 +67,8 @@ class Publisher:
             return PublishResult("dry_run")
 
         try:
-            claimed = self.db.transition_post_draft(
-                draft_id, ["approved"], "publishing"
+            claimed = self.db.claim_post_draft_for_publication(
+                draft_id, draft.get("revision")
             )
         except Exception as error:
             logger.error(
@@ -79,7 +79,8 @@ class Publisher:
             return PublishResult("publication_failed")
         if not claimed:
             return PublishResult("already_claimed")
-        return self._write_claimed_draft(draft)
+        claimed_draft, claim = claimed
+        return self._write_claimed_draft(claimed_draft, claim)
 
     def _as_aware(self, value):
         if isinstance(value, str):
@@ -99,15 +100,17 @@ class Publisher:
     def _publication_gate_open(self):
         return not self._publication_is_paused()
 
-    def _write_claimed_draft(self, draft):
+    def _write_claimed_draft(self, draft, claim):
         media_id = draft.get("media_id")
         if media_id is None:
-            return self._write_to_x(draft, None, "image", None)
+            return self._write_to_x(
+                draft, claim, None, "image", None, None,
+            )
 
         try:
             media = self.db.get_media_by_id(media_id)
         except Exception as error:
-            return self._definite_local_failure(draft, error)
+            return self._definite_local_failure(claim, error)
         if (
             not media
             or media.get("id") != media_id
@@ -116,61 +119,86 @@ class Publisher:
             or media.get("file_deleted")
         ):
             return self._definite_local_failure(
-                draft, ValueError("invalid_media_reservation")
+                claim, ValueError("invalid_media_reservation")
             )
 
-        media_opened = False
+        x_attempted = False
         write_result = None
         try:
             with open_verified_media(media) as media_file:
-                media_opened = True
+                try:
+                    reservation_valid = (
+                        self.db.validate_post_draft_publication_media(
+                            claim, media,
+                        )
+                    )
+                except Exception as error:
+                    return self._definite_local_failure(claim, error)
+                if not reservation_valid:
+                    return self._definite_local_failure(
+                        claim,
+                        ValueError("media_reservation_changed_under_lease"),
+                    )
+                x_attempted = True
                 write_result = self._write_to_x(
                     draft,
+                    claim,
                     media_file,
                     media.get("media_type") or "image",
                     media.get("filename"),
+                    media,
                 )
                 return write_result
         except (OSError, PermissionError, RuntimeError, ValueError) as error:
             if write_result is not None:
                 if write_result.status == "published":
-                    return self._unknown_outcome(draft["id"], error)
+                    return self._unknown_outcome(claim, error)
                 return write_result
-            if media_opened:
-                return self._unknown_outcome(draft["id"], error)
-            return self._definite_local_failure(draft, error)
+            if x_attempted:
+                return self._unknown_outcome(claim, error)
+            return self._definite_local_failure(claim, error)
 
-    def _write_to_x(self, draft, media_file, media_type, media_filename):
+    def _write_to_x(
+        self,
+        draft,
+        claim,
+        media_file,
+        media_type,
+        media_filename,
+        expected_media,
+    ):
         if self._publication_is_paused():
-            return self._restore_after_pause(draft["id"])
+            return self._restore_after_pause(claim)
 
         try:
             response = self._call_post_tweet(
                 draft["text"], media_file, media_type, media_filename
             )
         except XPublicationPaused:
-            return self._restore_after_pause(draft["id"])
+            return self._restore_after_pause(claim)
         except XPublicationRejected as error:
-            return self._definite_x_failure(draft, error)
+            return self._definite_x_failure(claim, error)
         except (XPublicationUnknown, TimeoutError, ConnectionError) as error:
-            return self._unknown_outcome(draft["id"], error)
+            return self._unknown_outcome(claim, error)
         except Exception as error:
             # An arbitrary client error may have happened after the write.  It
             # is therefore unsafe to reinterpret it as a definite rejection.
-            return self._unknown_outcome(draft["id"], error)
+            return self._unknown_outcome(claim, error)
 
         tweet_id = self._tweet_id(response)
         if not tweet_id:
             return self._unknown_outcome(
-                draft["id"], ValueError("publication_response_missing_id")
+                claim, ValueError("publication_response_missing_id")
             )
         try:
-            finalized = self._finalize_success(draft, tweet_id)
+            finalized = self._finalize_success(
+                claim, tweet_id, expected_media,
+            )
         except Exception as error:
-            return self._unknown_outcome(draft["id"], error)
+            return self._unknown_outcome(claim, error)
         if not finalized:
             return self._unknown_outcome(
-                draft["id"], RuntimeError("publication_finalization_conflict")
+                claim, RuntimeError("publication_finalization_conflict")
             )
         return PublishResult("published", tweet_id)
 
@@ -204,76 +232,44 @@ class Publisher:
         tweet_id = data.get("id")
         return str(tweet_id) if tweet_id else ""
 
-    def _finalize_success(self, draft, tweet_id):
-        finalize = getattr(
-            self.db, "finalize_post_draft_publication", None
-        )
-        if callable(finalize):
-            return finalize(draft["id"], tweet_id)
-
-        if draft.get("media_id") is not None:
-            mark_used = getattr(self.db, "mark_media_used", None)
-            if not callable(mark_used):
-                return False
-            mark_used(draft["media_id"], tweet_id)
-        return self.db.transition_post_draft(
-            draft["id"],
-            ["publishing"],
-            "published",
-            published_tweet_id=tweet_id,
+    def _finalize_success(self, claim, tweet_id, expected_media):
+        return self.db.finalize_post_draft_publication(
+            claim, tweet_id, expected_media,
         )
 
-    def _restore_after_pause(self, draft_id):
+    def _restore_after_pause(self, claim):
         try:
-            self.db.transition_post_draft(
-                draft_id, ["publishing"], "approved", error=None
-            )
+            self.db.restore_post_draft_publication_claim(claim)
         except Exception:
             pass
         return PublishResult("paused")
 
-    def _definite_local_failure(self, draft, error):
-        return self._definite_x_failure(draft, error)
+    def _definite_local_failure(self, claim, error):
+        return self._definite_x_failure(claim, error)
 
-    def _definite_x_failure(self, draft, error):
+    def _definite_x_failure(self, claim, error):
         safe_error = type(error).__name__
-        fail = getattr(self.db, "fail_post_draft_publication", None)
         try:
-            if callable(fail):
-                fail(draft["id"], safe_error)
-            else:
-                changed = self.db.transition_post_draft(
-                    draft["id"],
-                    ["publishing"],
-                    "publication_failed",
-                    error=safe_error,
-                )
-                if changed and draft.get("media_id") is not None:
-                    release = getattr(self.db, "release_media_for_draft", None)
-                    if callable(release):
-                        release(draft["id"])
+            self.db.fail_post_draft_publication(claim, safe_error)
         except Exception as persistence_error:
             logger.error(
                 "publication_failure_persistence_failed draft_id=%s "
                 "error_type=%s",
-                draft["id"],
+                claim.draft_id,
                 type(persistence_error).__name__,
             )
         return PublishResult("publication_failed")
 
-    def _unknown_outcome(self, draft_id, error):
+    def _unknown_outcome(self, claim, error):
         try:
-            self.db.transition_post_draft(
-                draft_id,
-                ["publishing"],
-                "publication_unknown",
-                error=type(error).__name__,
+            self.db.mark_post_draft_publication_unknown(
+                claim, type(error).__name__,
             )
         except Exception as persistence_error:
             logger.error(
                 "publication_unknown_persistence_failed draft_id=%s "
                 "error_type=%s",
-                draft_id,
+                claim.draft_id,
                 type(persistence_error).__name__,
             )
         return PublishResult("publication_unknown")

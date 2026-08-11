@@ -15,8 +15,9 @@ import logging
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, List, Dict, Optional, Set, Tuple
+from typing import Any, List, Dict, Mapping, Optional, Set, Tuple
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -59,6 +60,33 @@ _MEDIA_MUTATION_SNAPSHOT_COLUMNS = (
     "used",
     "reusable",
 )
+_PUBLICATION_MEDIA_IDENTITY_COLUMNS = (
+    "id",
+    "filename",
+    "filepath",
+    "media_type",
+    "file_device",
+    "file_inode",
+    "file_size",
+    "file_sha256",
+)
+
+
+@dataclass(frozen=True)
+class PostDraftPublicationClaim:
+    """Immutable identity of the exact draft snapshot authorized for X."""
+
+    draft_id: int
+    revision: int
+    publication_key: str
+    text: str
+    category: str
+    source_ids_json: str
+    score_json: str
+    intended_slot: str
+    media_id: Optional[int]
+    approved_at: Optional[str]
+    approved_by: Optional[str]
 
 
 class Database:
@@ -912,6 +940,81 @@ class Database:
             "score_json": "score_data",
         })
 
+    @staticmethod
+    def _publication_claim_from_row(
+        row: sqlite3.Row,
+    ) -> PostDraftPublicationClaim:
+        return PostDraftPublicationClaim(
+            draft_id=row["id"],
+            revision=row["revision"],
+            publication_key=row["publication_key"],
+            text=row["text"],
+            category=row["category"],
+            source_ids_json=row["source_ids_json"],
+            score_json=row["score_json"],
+            intended_slot=row["intended_slot"],
+            media_id=row["media_id"],
+            approved_at=row["approved_at"],
+            approved_by=row["approved_by"],
+        )
+
+    @staticmethod
+    def _post_draft_matches_publication_claim(
+        row: Optional[sqlite3.Row],
+        claim: PostDraftPublicationClaim,
+    ) -> bool:
+        if row is None or not isinstance(claim, PostDraftPublicationClaim):
+            return False
+        return (
+            row["id"] == claim.draft_id
+            and row["status"] == "publishing"
+            and row["revision"] == claim.revision
+            and row["publication_key"] == claim.publication_key
+            and row["text"] == claim.text
+            and row["category"] == claim.category
+            and row["source_ids_json"] == claim.source_ids_json
+            and row["score_json"] == claim.score_json
+            and row["intended_slot"] == claim.intended_slot
+            and row["media_id"] == claim.media_id
+            and row["approved_at"] == claim.approved_at
+            and row["approved_by"] == claim.approved_by
+            and row["published_tweet_id"] is None
+        )
+
+    @staticmethod
+    def _publication_media_matches_in_conn(
+        conn,
+        claim: PostDraftPublicationClaim,
+        expected_media: Optional[Mapping],
+    ) -> bool:
+        reserved = conn.execute("""
+            SELECT * FROM media_library
+            WHERE reserved_by_draft_id = ?
+              AND lifecycle_state = 'reserved'
+            ORDER BY id
+        """, (claim.draft_id,)).fetchall()
+        if claim.media_id is None:
+            return expected_media is None and not reserved
+        if (
+            not isinstance(expected_media, Mapping)
+            or expected_media.get("id") != claim.media_id
+            or expected_media.get("lifecycle_state") != "reserved"
+            or expected_media.get("reserved_by_draft_id") != claim.draft_id
+            or expected_media.get("file_deleted")
+            or not record_has_media_identity(expected_media)
+            or len(reserved) != 1
+        ):
+            return False
+        row = reserved[0]
+        return (
+            row["id"] == claim.media_id
+            and not row["file_deleted"]
+            and all(
+                row[column] == expected_media.get(column)
+                for column in _PUBLICATION_MEDIA_IDENTITY_COLUMNS
+            )
+        )
+
     def get_post_draft(self, draft_id: int) -> Optional[Dict]:
         with self._conn() as conn:
             row = conn.execute(
@@ -1192,6 +1295,82 @@ class Database:
             ).fetchone()
             return self._decode_post_draft(row), "created"
 
+    def claim_post_draft_for_publication(
+        self,
+        draft_id: int,
+        expected_revision: int,
+    ) -> Optional[Tuple[Dict, PostDraftPublicationClaim]]:
+        """Atomically claim exactly the approved revision the caller read.
+
+        The returned draft is selected after the transition in the same
+        transaction.  Callers must publish only that snapshot and carry the
+        returned token through every terminal transition.
+        """
+        if (
+            isinstance(draft_id, bool)
+            or not isinstance(draft_id, int)
+            or draft_id <= 0
+            or isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            return None
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            candidate = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            if (
+                candidate is None
+                or candidate["status"] != "approved"
+                or candidate["revision"] != expected_revision
+                or candidate["published_tweet_id"] is not None
+            ):
+                return None
+            claimed_at = self._now_iso()
+            updated = conn.execute("""
+                UPDATE post_drafts
+                SET status = 'publishing', updated_at = ?,
+                    revision = revision + 1
+                WHERE id = ? AND status = 'approved' AND revision = ?
+                  AND published_tweet_id IS NULL
+            """, (claimed_at, draft_id, expected_revision))
+            if updated.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            claim = self._publication_claim_from_row(row)
+            return self._decode_post_draft(row), claim
+
+    def validate_post_draft_publication_media(
+        self,
+        claim: PostDraftPublicationClaim,
+        expected_media: Mapping,
+    ) -> bool:
+        """Re-read claim and reservation under the caller's media root lease.
+
+        Publisher calls this only after ``open_verified_media`` has acquired
+        the root lease.  Taking SQLite's write lock second preserves the
+        application-wide root-then-database lock ordering.
+        """
+        if not isinstance(claim, PostDraftPublicationClaim):
+            return False
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?",
+                (claim.draft_id,),
+            ).fetchone()
+            return (
+                self._post_draft_matches_publication_claim(draft, claim)
+                and self._publication_media_matches_in_conn(
+                    conn, claim, expected_media,
+                )
+            )
+
     def transition_post_draft(
         self,
         draft_id: int,
@@ -1238,45 +1417,30 @@ class Database:
 
     def finalize_post_draft_publication(
         self,
-        draft_id: int,
+        claim: PostDraftPublicationClaim,
         tweet_id: str,
+        expected_media: Optional[Mapping] = None,
     ) -> bool:
         """Atomically persist a confirmed tweet, media use and draft state."""
         if type(tweet_id) is not str or not tweet_id:
             raise ValueError("invalid_tweet_id")
+        if not isinstance(claim, PostDraftPublicationClaim):
+            return False
         with self._media_store_mutation_lock(
-            "draft_reservations", draft_id,
+            "draft_reservations", claim.draft_id,
         ) as conn:
             draft = conn.execute(
-                "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
+                "SELECT * FROM post_drafts WHERE id = ?", (claim.draft_id,)
             ).fetchone()
-            if (
-                draft is None
-                or draft["status"] != "publishing"
-                or draft["published_tweet_id"]
-            ):
+            if not self._post_draft_matches_publication_claim(draft, claim):
                 return False
-
-            reserved_media = conn.execute("""
-                SELECT * FROM media_library
-                WHERE reserved_by_draft_id = ?
-                  AND lifecycle_state = 'reserved'
-                ORDER BY id
-            """, (draft_id,)).fetchall()
-            media_id = draft["media_id"]
-            if media_id is None:
-                if reserved_media:
-                    return False
-            elif (
-                len(reserved_media) != 1
-                or reserved_media[0]["id"] != media_id
-                or reserved_media[0]["file_deleted"]
-                or not record_has_media_identity(dict(reserved_media[0]))
+            if not self._publication_media_matches_in_conn(
+                conn, claim, expected_media,
             ):
                 return False
 
             try:
-                score_data = json.loads(draft["score_json"] or "{}")
+                score_data = json.loads(claim.score_json or "{}")
             except (TypeError, ValueError):
                 score_data = {}
             score_total = (
@@ -1292,21 +1456,26 @@ class Database:
                 ) VALUES (?, ?, ?, '', ?, ?, 'approved_publisher', ?)
             """, (
                 tweet_id,
-                draft["text"],
-                draft["category"],
-                int(bool(re.search(r"https?://", draft["text"]))),
+                claim.text,
+                claim.category,
+                int(bool(re.search(r"https?://", claim.text))),
                 score_total,
                 created_at,
             ))
 
-            if media_id is not None:
+            if claim.media_id is not None:
                 media_update = conn.execute("""
                     UPDATE media_library
                     SET used = 1, used_at = ?, used_in_tweet_id = ?,
                         lifecycle_state = 'used', reserved_by_draft_id = NULL
                     WHERE id = ? AND lifecycle_state = 'reserved'
                       AND reserved_by_draft_id = ? AND file_deleted = 0
-                """, (created_at, tweet_id, media_id, draft_id))
+                """, (
+                    created_at,
+                    tweet_id,
+                    claim.media_id,
+                    claim.draft_id,
+                ))
                 if media_update.rowcount != 1:
                     raise sqlite3.IntegrityError(
                         "media changed during publication finalization"
@@ -1317,8 +1486,13 @@ class Database:
                 SET status = 'published', published_tweet_id = ?, error = NULL,
                     updated_at = ?, revision = revision + 1
                 WHERE id = ? AND status = 'publishing'
-                  AND published_tweet_id IS NULL
-            """, (tweet_id, created_at, draft_id))
+                  AND revision = ? AND published_tweet_id IS NULL
+            """, (
+                tweet_id,
+                created_at,
+                claim.draft_id,
+                claim.revision,
+            ))
             if draft_update.rowcount != 1:
                 raise sqlite3.IntegrityError(
                     "draft changed during publication finalization"
@@ -1327,34 +1501,40 @@ class Database:
 
     def fail_post_draft_publication(
         self,
-        draft_id: int,
+        claim: PostDraftPublicationClaim,
         safe_error: str,
     ) -> bool:
         """Atomically record a definite failure and release its reservation."""
+        if not isinstance(claim, PostDraftPublicationClaim):
+            return False
         safe_error = self._sanitize_persisted_text(safe_error)
         with self._media_store_mutation_lock(
-            "draft_reservations", draft_id,
+            "draft_reservations", claim.draft_id,
         ) as conn:
             draft = conn.execute(
-                "SELECT intended_slot, category, status FROM post_drafts "
-                "WHERE id = ?",
-                (draft_id,),
+                "SELECT * FROM post_drafts WHERE id = ?",
+                (claim.draft_id,),
             ).fetchone()
-            if draft is None or draft["status"] != "publishing":
+            if not self._post_draft_matches_publication_claim(draft, claim):
                 return False
             media_ids = [row["id"] for row in conn.execute("""
                 SELECT id FROM media_library
                 WHERE reserved_by_draft_id = ?
                   AND lifecycle_state = 'reserved'
                 ORDER BY id
-            """, (draft_id,)).fetchall()]
+            """, (claim.draft_id,)).fetchall()]
             now = self._now_iso()
             updated = conn.execute("""
                 UPDATE post_drafts
                 SET status = 'publication_failed', error = ?, updated_at = ?,
                     revision = revision + 1
-                WHERE id = ? AND status = 'publishing'
-            """, (safe_error, now, draft_id))
+                WHERE id = ? AND status = 'publishing' AND revision = ?
+            """, (
+                safe_error,
+                now,
+                claim.draft_id,
+                claim.revision,
+            ))
             if updated.rowcount != 1:
                 return False
             conn.execute("""
@@ -1362,17 +1542,72 @@ class Database:
                 SET lifecycle_state = 'available', reserved_by_draft_id = NULL
                 WHERE reserved_by_draft_id = ?
                   AND lifecycle_state = 'reserved'
-            """, (draft_id,))
+            """, (claim.draft_id,))
             for media_id in media_ids:
                 self._insert_draft_evaluation_in_conn(
                     conn,
-                    draft["intended_slot"],
-                    draft["category"],
+                    claim.intended_slot,
+                    claim.category,
                     "media_released",
-                    {"draft_id": draft_id, "media_id": media_id},
+                    {"draft_id": claim.draft_id, "media_id": media_id},
                     now,
                 )
             return True
+
+    def _transition_post_draft_publication_claim(
+        self,
+        claim: PostDraftPublicationClaim,
+        new_status: str,
+        safe_error: Optional[str],
+    ) -> bool:
+        if (
+            not isinstance(claim, PostDraftPublicationClaim)
+            or new_status not in {"approved", "publication_unknown"}
+        ):
+            return False
+        if safe_error is not None:
+            safe_error = self._sanitize_persisted_text(safe_error)
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?",
+                (claim.draft_id,),
+            ).fetchone()
+            if not self._post_draft_matches_publication_claim(draft, claim):
+                return False
+            updated = conn.execute("""
+                UPDATE post_drafts
+                SET status = ?, error = ?, updated_at = ?,
+                    revision = revision + 1
+                WHERE id = ? AND status = 'publishing' AND revision = ?
+                  AND published_tweet_id IS NULL
+            """, (
+                new_status,
+                safe_error,
+                self._now_iso(),
+                claim.draft_id,
+                claim.revision,
+            ))
+            return updated.rowcount == 1
+
+    def restore_post_draft_publication_claim(
+        self,
+        claim: PostDraftPublicationClaim,
+    ) -> bool:
+        """Return the exact unspent claim to approved after a late pause."""
+        return self._transition_post_draft_publication_claim(
+            claim, "approved", None,
+        )
+
+    def mark_post_draft_publication_unknown(
+        self,
+        claim: PostDraftPublicationClaim,
+        safe_error: str,
+    ) -> bool:
+        """Persist ambiguity only for the exact claim that attempted X."""
+        return self._transition_post_draft_publication_claim(
+            claim, "publication_unknown", safe_error,
+        )
 
     def record_draft_evaluation(
         self,
