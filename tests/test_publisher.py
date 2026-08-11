@@ -5,6 +5,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from requests import exceptions as requests_exceptions
 
 from modules.database import Database
 from modules.media_processor import MediaProcessor
@@ -423,7 +424,10 @@ def test_pause_after_media_upload_prevents_the_actual_tweet_write(tmp_path):
 
 class FailingMediaUploadApi:
     def media_upload(self, *_args, **_kwargs):
-        raise RuntimeError("media rejected")
+        raise requests_exceptions.HTTPError(
+            "media rejected",
+            response=SimpleNamespace(status_code=400),
+        )
 
 
 def test_media_upload_rejection_never_falls_back_to_text_only(tmp_path):
@@ -457,13 +461,48 @@ def test_twitter_client_classifies_transport_failures_as_unknown(
 
 def test_twitter_client_classifies_definite_api_error_as_rejected():
     x_client = _twitter_client(
-        object(), RecordingCreateTweetApi(RuntimeError("bad request"))
+        object(),
+        RecordingCreateTweetApi(
+            requests_exceptions.HTTPError(
+                "bad request",
+                response=SimpleNamespace(status_code=400),
+            )
+        ),
     )
 
     with pytest.raises(Exception) as caught:
         x_client.post_tweet("Approved text")
 
     assert type(caught.value).__name__ == "XPublicationRejected"
+
+
+class SuccessfulMediaUploadApi:
+    def media_upload(self, *_args, **_kwargs):
+        return SimpleNamespace(media_id_string="uploaded-media-id")
+
+
+def test_truncated_x_response_is_unknown_and_keeps_media_reserved(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    media = _stored_media(db, tmp_path)
+    draft_id = _approved_sqlite_draft(
+        db, slot=SLOT, key="publisher-truncated-response", media_record=media
+    )
+    create_api = RecordingCreateTweetApi(
+        requests_exceptions.ChunkedEncodingError("response truncated")
+    )
+    x_client = _twitter_client(SuccessfulMediaUploadApi(), create_api)
+    publisher = Publisher(db, x_client, dry_run=False)
+
+    first = publisher.publish(draft_id, SLOT)
+    second = publisher.publish(draft_id, SLOT)
+
+    assert first.status == "publication_unknown"
+    assert second.status == "not_publishable"
+    assert len(create_api.calls) == 1
+    assert db.get_post_draft(draft_id)["status"] == "publication_unknown"
+    stored_media = db.get_media_by_id(media["id"])
+    assert stored_media["lifecycle_state"] == "reserved"
+    assert stored_media["reserved_by_draft_id"] == draft_id
 
 
 def test_twitter_client_rejects_a_media_path_instead_of_reopening_it(tmp_path):

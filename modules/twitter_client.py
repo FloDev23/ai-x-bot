@@ -62,12 +62,39 @@ def _publication_outcome_is_unknown(error: BaseException) -> bool:
     return False
 
 
+def _publication_rejection_is_definite(error: BaseException) -> bool:
+    """Only a concrete 4xx response proves that X rejected the write."""
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if (
+            type(status_code) is int
+            and 400 <= status_code < 500
+        ):
+            return True
+        for related in (
+            getattr(current, "__cause__", None),
+            getattr(current, "__context__", None),
+        ):
+            if isinstance(related, BaseException):
+                pending.append(related)
+    return False
+
+
 def _raise_publication_error(error: BaseException) -> None:
     if isinstance(error, XPublicationError):
         raise error
     if _publication_outcome_is_unknown(error):
         raise XPublicationUnknown("x_publication_outcome_unknown") from error
-    raise XPublicationRejected("x_rejected_publication") from error
+    if _publication_rejection_is_definite(error):
+        raise XPublicationRejected("x_rejected_publication") from error
+    raise XPublicationUnknown("x_publication_outcome_unknown") from error
 
 class TwitterClient:
     """Gestisce l'interazione con X (Twitter) API"""
