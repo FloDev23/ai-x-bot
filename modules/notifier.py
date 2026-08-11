@@ -1,83 +1,58 @@
-"""
-Telegram Notifier - notifiche in tempo reale su Telegram per:
+"""Outbound Telegram notifications through the shared safe transport."""
 
-- Nuovi lead commerciali trovati dall'opportunity detector (punto 19):
-  punteggio, azione suggerita, link al tweet, link al profilo autore e,
-  quando l'azione lo prevede (Commenta/Commenta+DM/DM), una bozza di
-  testo già pronta da copiare.
-- Riepilogo del ciclo di engagement mirato (punti 7-8-9): per ogni account
-  target, quale azione è stata eseguita (Like / Like+Follow / Retweet con
-  commento), con link diretto al tweet/profilo.
-- Errori nei cicli del bot (post, engagement, opportunity, performance),
-  per accorgersi subito se qualcosa si rompe senza dover controllare i log
-  via SSH.
-
-Setup (vedi SETUP.md):
-1. Scrivi a @BotFather su Telegram -> /newbot -> copia il token.
-2. Scrivi un qualsiasi messaggio al tuo nuovo bot (obbligatorio prima del
-   passo successivo, altrimenti getUpdates resta vuoto).
-3. Apri nel browser:
-   https://api.telegram.org/bot<IL_TUO_TOKEN>/getUpdates
-   e leggi il campo "chat":{"id": ...} -> è il tuo TELEGRAM_CHAT_ID.
-4. Aggiungi nel .env:
-   TELEGRAM_BOT_TOKEN=...
-   TELEGRAM_CHAT_ID=...
-
-Se le variabili non sono configurate, il notifier resta silenziosamente
-disabilitato (self.enabled = False) e il bot continua a funzionare
-normalmente: nessun crash per Telegram assente.
-"""
 import logging
-import requests
+
+from modules.telegram_api import TelegramApi, sanitize_error
+
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
-
 
 class TelegramNotifier:
-    def __init__(self, bot_token: str, chat_id: str):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
+    def __init__(
+        self,
+        bot_token: str,
+        chat_id: str,
+        database=None,
+        telegram_api=None,
+    ):
+        self.bot_token = str(bot_token)
+        self.chat_id = str(chat_id)
+        self.database = database
         self.enabled = bool(bot_token and chat_id)
+        self.telegram_api = telegram_api
+        if self.enabled and self.telegram_api is None:
+            self.telegram_api = TelegramApi(self.bot_token)
         if not self.enabled:
             logger.info(
-                "ℹ️ Telegram non configurato (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID "
-                "mancanti in .env): notifiche disattivate."
+                "Telegram non configurato (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID "
+                "mancanti): notifiche disattivate."
             )
 
     def _send(self, text: str):
         if not self.enabled:
-            return
+            return None
         try:
-            url = TELEGRAM_API_URL.format(token=self.bot_token)
-            resp = requests.post(
-                url,
-                data={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": False,
-                },
-                timeout=10,
+            return self.telegram_api.send_message(
+                self.chat_id,
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=False,
             )
-            if resp.status_code != 200:
-                logger.warning(f"⚠️ Telegram ha risposto {resp.status_code}: {resp.text[:200]}")
-        except Exception as e:
-            # Una notifica Telegram fallita non deve mai bloccare il ciclo del bot
-            logger.warning(f"⚠️ Errore invio notifica Telegram: {e}")
+        except Exception as exc:
+            logger.warning(
+                "Telegram notification delivery failed: %s",
+                sanitize_error(exc, secrets=[self.bot_token]),
+            )
+            return None
 
     @staticmethod
     def _escape(text: str) -> str:
-        """Escape minimo per HTML parse_mode di Telegram"""
+        """Escape minimal Telegram HTML markup."""
         return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def notify_lead(self, lead: dict, suggested_text: str = None):
-        """
-        lead: dict con tweet_id, text, score, action, keyword, author_username
-        suggested_text: bozza di commento o DM pronta da copiare (se l'azione
-        suggerita è Commenta / Commenta+DM / DM)
-        """
+        """Send one read-only lead suggestion when optional discovery is enabled."""
         username = lead.get("author_username", "")
         tweet_id = lead.get("tweet_id", "")
         tweet_url = (
@@ -100,59 +75,29 @@ class TelegramNotifier:
             lines.append(f"👤 Profilo: {profile_url}")
         if suggested_text:
             lines.append("")
-            lines.append(f"💬 <b>Bozza pronta da copiare:</b>\n{self._escape(suggested_text)}")
-
-        self._send("\n".join(lines))
-
-    def notify_engagement_summary(self, actions: list):
-        """
-        actions: lista di dict {username, action, tweet_id}
-        Una sola azione per riga, con link diretto al tweet interessato.
-        """
-        real_actions = [a for a in actions if a.get("action") and a["action"] != "Ignora"]
-        if not real_actions:
-            return
-
-        lines = ["💬 <b>Ciclo engagement mirato completato</b>", ""]
-        for a in real_actions:
-            username = a.get("username", "")
-            tweet_id = a.get("tweet_id", "")
-            url = (
-                f"https://x.com/{username}/status/{tweet_id}"
-                if username and tweet_id
-                else f"https://x.com/{username}"
+            lines.append(
+                "💬 <b>Bozza pronta da copiare:</b>\n"
+                f"{self._escape(suggested_text)}"
             )
-            lines.append(f"• @{username} → <b>{self._escape(a.get('action', ''))}</b> — {url}")
 
         self._send("\n".join(lines))
 
     def notify_error(self, context: str, error: Exception):
-        text = f"🚨 <b>Errore bot</b> ({self._escape(context)})\n\n{self._escape(str(error))[:500]}"
-        self._send(text)
-
-    def notify_growth_summary(self, followed: list, unfollowed: list = None):
-        """
-        Riepilogo del ciclo di crescita rete: chi è stato seguito oggi (per
-        costruire seguito reale) e, se presente, chi è stato rimosso perché
-        non ha ricambiato entro la finestra prevista.
-        """
-        unfollowed = unfollowed or []
-        if not followed and not unfollowed:
-            return
-
-        lines = ["🌱 <b>Ciclo crescita rete</b>", ""]
-        if followed:
-            lines.append(f"➕ Seguiti oggi ({len(followed)}):")
-            for f in followed:
-                username = f['username']
-                lines.append(
-                    f"  • @{username} ({f.get('followers', 0)} follower) — https://x.com/{username}"
+        """Persist one sanitized event, then attempt one sanitized notification."""
+        safe_context = sanitize_error(context, secrets=[self.bot_token])
+        safe_message = sanitize_error(error, secrets=[self.bot_token])
+        error_type = sanitize_error(type(error).__name__, secrets=[self.bot_token])
+        if self.database is not None:
+            try:
+                self.database.log_error(safe_context, error_type, safe_message)
+            except Exception as exc:
+                logger.warning(
+                    "Telegram error persistence failed: %s",
+                    sanitize_error(exc, secrets=[self.bot_token]),
                 )
-        if unfollowed:
-            lines.append("")
-            lines.append(f"➖ Rimossi (non ricambiato, {len(unfollowed)}):")
-            for u in unfollowed:
-                username = u['username']
-                lines.append(f"  • @{username} — https://x.com/{username}")
 
-        self._send("\n".join(lines))
+        text = (
+            f"🚨 <b>Errore bot</b> ({self._escape(safe_context)})\n\n"
+            f"{self._escape(safe_message)[:500]}"
+        )
+        self._send(text)

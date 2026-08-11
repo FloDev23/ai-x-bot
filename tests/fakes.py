@@ -10,6 +10,9 @@ class FakeDatabase:
         self.drafts_today = 0
         self.links_last_days = 0
         self.added_sources = []
+        self.telegram_updates = {}
+        self.operational_mutations = []
+        self.logged_errors = []
 
     def get_eligible_sources(self):
         return list(self.sources)
@@ -36,6 +39,25 @@ class FakeDatabase:
         self.sources.append(stored)
         self.added_sources.append(stored)
         return source_id
+
+    def claim_telegram_update(self, update_id, chat_id):
+        if update_id in self.telegram_updates:
+            return False
+        self.telegram_updates[update_id] = {
+            "chat_id": str(chat_id),
+            "state": "processing",
+            "result": {},
+        }
+        return True
+
+    def complete_telegram_update(self, update_id, state, result):
+        update = self.telegram_updates[update_id]
+        if update["state"] == "processing":
+            update.update(state=state, result=dict(result))
+
+    def log_error(self, context, error_type, safe_message):
+        self.logged_errors.append((context, error_type, safe_message))
+        return len(self.logged_errors)
 
 
 class FakeNewsFetcher:
