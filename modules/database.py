@@ -16,7 +16,7 @@ import json
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, List, Dict, Optional, Set
+from typing import Any, List, Dict, Optional, Set, Tuple
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -43,6 +43,22 @@ _LIVE_DRAFT_STATUS_SQL = (
     "'publication_unknown'"
 )
 MEDIA_FILE_DELETE_SAFE_STATES = ("available", "used", "archived")
+_MEDIA_STORE_MUTATION_MAX_ATTEMPTS = 5
+_MEDIA_LIFECYCLE_MIGRATION_KEY = "migration:media_lifecycle_state"
+_MEDIA_MUTATION_SNAPSHOT_COLUMNS = (
+    "id",
+    "filename",
+    "filepath",
+    "file_device",
+    "file_inode",
+    "file_size",
+    "file_sha256",
+    "lifecycle_state",
+    "reserved_by_draft_id",
+    "file_deleted",
+    "used",
+    "reusable",
+)
 
 
 class Database:
@@ -290,24 +306,6 @@ class Database:
                     c.execute(
                         f"ALTER TABLE media_library ADD COLUMN {column} {definition}"
                     )
-            if lifecycle_added:
-                c.execute("""
-                    UPDATE media_library
-                    SET lifecycle_state = CASE
-                        WHEN file_deleted = 1 THEN 'deleted'
-                        WHEN used = 1 THEN 'used'
-                        ELSE 'available'
-                    END
-                """)
-            else:
-                c.execute("""
-                    UPDATE media_library SET lifecycle_state = CASE
-                        WHEN file_deleted = 1 THEN 'deleted'
-                        WHEN used = 1 THEN 'used'
-                        ELSE 'available'
-                    END
-                    WHERE lifecycle_state IS NULL OR lifecycle_state = ''
-                """)
 
             # Crescita rete: account seguiti dal ciclo di growth, per capire
             # chi ha ricambiato e decidere l'unfollow automatico se non lo
@@ -437,6 +435,28 @@ class Database:
                     updated_at TEXT NOT NULL
                 )
             """)
+            lifecycle_migration = c.execute(
+                "SELECT value FROM bot_state WHERE key = ?",
+                (_MEDIA_LIFECYCLE_MIGRATION_KEY,),
+            ).fetchone()
+            if lifecycle_added:
+                c.execute("""
+                    INSERT INTO bot_state (key, value, updated_at)
+                    VALUES (?, 'pending', ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = 'pending', updated_at = excluded.updated_at
+                """, (_MEDIA_LIFECYCLE_MIGRATION_KEY, self._now_iso()))
+                lifecycle_migration_pending = True
+            elif lifecycle_migration is None:
+                c.execute("""
+                    INSERT INTO bot_state (key, value, updated_at)
+                    VALUES (?, 'complete', ?)
+                """, (_MEDIA_LIFECYCLE_MIGRATION_KEY, self._now_iso()))
+                lifecycle_migration_pending = False
+            else:
+                lifecycle_migration_pending = (
+                    lifecycle_migration["value"] == "pending"
+                )
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS error_events (
@@ -460,59 +480,28 @@ class Database:
                 )
             """)
 
-            duplicate_slots = c.execute(
-                "SELECT intended_slot FROM post_drafts "
+            duplicate_slot_exists = c.execute(
+                "SELECT 1 FROM post_drafts "
                 "WHERE status IN (" + _LIVE_DRAFT_STATUS_SQL + ") "
-                "GROUP BY intended_slot HAVING COUNT(*) > 1"
-            ).fetchall()
-            for duplicate in duplicate_slots:
-                rows = c.execute(
-                    "SELECT id, category FROM post_drafts "
-                    "WHERE intended_slot = ? AND status IN ("
+                "GROUP BY intended_slot HAVING COUNT(*) > 1 LIMIT 1"
+            ).fetchone() is not None
+            if not duplicate_slot_exists:
+                c.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_post_drafts_live_intended_slot "
+                    "ON post_drafts(intended_slot) WHERE status IN ("
                     + _LIVE_DRAFT_STATUS_SQL
-                    + ") ORDER BY CASE status "
-                    "WHEN 'published' THEN 5 "
-                    "WHEN 'publication_unknown' THEN 4 "
-                    "WHEN 'publishing' THEN 3 "
-                    "WHEN 'approved' THEN 2 ELSE 1 END DESC, id ASC",
-                    (duplicate["intended_slot"],),
-                ).fetchall()
-                keeper_id = rows[0]["id"]
-                for stale in rows[1:]:
-                    now = self._now_iso()
-                    c.execute(
-                        "UPDATE post_drafts SET status = 'superseded', "
-                        "error = 'migration_duplicate_slot', updated_at = ?, "
-                        "revision = revision + 1 WHERE id = ?",
-                        (now, stale["id"]),
-                    )
-                    c.execute("""
-                        UPDATE media_library
-                        SET lifecycle_state = 'available',
-                            reserved_by_draft_id = NULL
-                        WHERE reserved_by_draft_id = ?
-                          AND lifecycle_state = 'reserved'
-                    """, (stale["id"],))
-                    c.execute("""
-                        INSERT INTO draft_evaluations (
-                            intended_slot, category, outcome, details_json,
-                            created_at
-                        ) VALUES (?, ?, 'migration_duplicate_slot', ?, ?)
-                    """, (
-                        duplicate["intended_slot"],
-                        stale["category"],
-                        json.dumps({
-                            "draft_id": stale["id"],
-                            "kept_draft_id": keeper_id,
-                        }),
-                        now,
-                    ))
-            c.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS "
-                "uq_post_drafts_live_intended_slot "
-                "ON post_drafts(intended_slot) WHERE status IN ("
-                + _LIVE_DRAFT_STATUS_SQL
-                + ")"
+                    + ")"
+                )
+            lifecycle_repair_needed = c.execute("""
+                SELECT 1 FROM media_library
+                WHERE lifecycle_state IS NULL OR lifecycle_state = ''
+                LIMIT 1
+            """).fetchone() is not None
+            media_schema_reconciliation_needed = (
+                lifecycle_migration_pending
+                or lifecycle_repair_needed
+                or duplicate_slot_exists
             )
 
             migration_key = "migration:legacy_ideas_to_sources"
@@ -544,6 +533,8 @@ class Database:
                 """, (migration_key, now))
 
             conn.commit()
+        if media_schema_reconciliation_needed:
+            self._reconcile_media_schema(lifecycle_migration_pending)
         logger.info("✅ Database inizializzato (bot_data.db)")
 
     # ---------- Posted tweets / memoria a lungo termine ----------
@@ -1135,8 +1126,9 @@ class Database:
         """Supersede and replace one exact draft in a single transaction."""
         expected_slot = self._normalize_datetime_iso(expected_slot)
         now = self._now_iso()
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._media_store_mutation_lock(
+            "draft_reservations", prior_draft_id,
+        ) as conn:
             prior = conn.execute(
                 "SELECT * FROM post_drafts WHERE id = ?", (prior_draft_id,)
             ).fetchone()
@@ -1438,26 +1430,190 @@ class Database:
 
     # ---------- Libreria media (foto/video reali per i post) ----------
 
-    @contextmanager
-    def _media_store_mutation_lock(self):
-        """Serialize application lifecycle writers for identity-bound rows."""
-        with self._conn() as conn:
-            rows = conn.execute("""
-                SELECT filepath, file_device, file_inode, file_size, file_sha256
-                FROM media_library
-                WHERE file_device IS NOT NULL
-                  AND file_inode IS NOT NULL
-                  AND file_sha256 IS NOT NULL
-            """).fetchall()
-        roots = {
-            str(Path(row["filepath"]).parent)
+    @staticmethod
+    def _media_mutation_snapshot(
+        conn: sqlite3.Connection,
+        target_kind: str,
+        target_id: int,
+    ) -> Tuple[Tuple[Any, ...], ...]:
+        columns = ", ".join(_MEDIA_MUTATION_SNAPSHOT_COLUMNS)
+        if target_kind == "media":
+            rows = conn.execute(
+                f"SELECT {columns} FROM media_library WHERE id = ? ORDER BY id",
+                (target_id,),
+            ).fetchall()
+        elif target_kind == "draft_reservations":
+            rows = conn.execute(
+                f"""
+                SELECT {columns} FROM media_library
+                WHERE reserved_by_draft_id = ?
+                  AND lifecycle_state = 'reserved'
+                ORDER BY id
+                """,
+                (target_id,),
+            ).fetchall()
+        elif target_kind == "all_media":
+            rows = conn.execute(
+                f"SELECT {columns} FROM media_library ORDER BY id"
+            ).fetchall()
+        else:
+            raise ValueError("invalid_media_mutation_target")
+        return tuple(
+            tuple(row[column] for column in _MEDIA_MUTATION_SNAPSHOT_COLUMNS)
             for row in rows
-            if record_has_media_identity(dict(row))
-        }
-        with ExitStack() as stack:
-            for root in sorted(roots):
-                stack.enter_context(media_store_lock(Path(root)))
-            yield
+        )
+
+    @staticmethod
+    def _media_mutation_roots(
+        snapshot: Tuple[Tuple[Any, ...], ...],
+    ) -> Tuple[str, ...]:
+        roots = set()
+        for values in snapshot:
+            record = dict(zip(_MEDIA_MUTATION_SNAPSHOT_COLUMNS, values))
+            identity_values = (
+                record["file_device"],
+                record["file_inode"],
+                record["file_sha256"],
+            )
+            if all(value is None for value in identity_values):
+                continue
+            if not record_has_media_identity(record):
+                raise ValueError("media_identity_unavailable")
+            filepath = record["filepath"]
+            filename = record["filename"]
+            if type(filepath) is not str or type(filename) is not str:
+                raise ValueError("invalid_media_locator")
+            locator = Path(filepath)
+            if locator.name != filename or filename in {"", ".", ".."}:
+                raise ValueError("invalid_media_locator")
+            roots.add(str(locator.parent.resolve(strict=True)))
+        return tuple(sorted(roots))
+
+    @contextmanager
+    def _media_store_mutation_lock(
+        self,
+        target_kind: str,
+        target_id: int,
+    ):
+        """Lock and revalidate a target snapshot before mutating it.
+
+        Root locks are never awaited while a SQLite transaction is open.  The
+        connection yielded to the caller owns the BEGIN IMMEDIATE transaction
+        that validated the target, so the mutation cannot outlive that
+        validated identity/lifecycle snapshot.
+        """
+        for _attempt in range(_MEDIA_STORE_MUTATION_MAX_ATTEMPTS):
+            with self._conn() as snapshot_conn:
+                candidate = self._media_mutation_snapshot(
+                    snapshot_conn, target_kind, target_id,
+                )
+            roots = self._media_mutation_roots(candidate)
+
+            with ExitStack() as stack:
+                for root in roots:
+                    stack.enter_context(media_store_lock(Path(root)))
+                with self._conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    validated = self._media_mutation_snapshot(
+                        conn, target_kind, target_id,
+                    )
+                    if validated != candidate:
+                        conn.rollback()
+                        continue
+                    yield conn
+                    return
+        raise RuntimeError("media_store_snapshot_unstable")
+
+    def _reconcile_media_schema(self, lifecycle_migration_pending: bool) -> None:
+        """Run lifecycle-writing migrations under every affected root lock."""
+        with self._media_store_mutation_lock("all_media", 0) as conn:
+            migration = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?",
+                (_MEDIA_LIFECYCLE_MIGRATION_KEY,),
+            ).fetchone()
+            migration_still_pending = (
+                lifecycle_migration_pending
+                and migration is not None
+                and migration["value"] == "pending"
+            )
+            if migration_still_pending:
+                conn.execute("""
+                    UPDATE media_library
+                    SET lifecycle_state = CASE
+                        WHEN file_deleted = 1 THEN 'deleted'
+                        WHEN used = 1 THEN 'used'
+                        ELSE 'available'
+                    END
+                """)
+                conn.execute("""
+                    UPDATE bot_state
+                    SET value = 'complete', updated_at = ?
+                    WHERE key = ? AND value = 'pending'
+                """, (self._now_iso(), _MEDIA_LIFECYCLE_MIGRATION_KEY))
+            else:
+                conn.execute("""
+                    UPDATE media_library SET lifecycle_state = CASE
+                        WHEN file_deleted = 1 THEN 'deleted'
+                        WHEN used = 1 THEN 'used'
+                        ELSE 'available'
+                    END
+                    WHERE lifecycle_state IS NULL OR lifecycle_state = ''
+                """)
+
+            duplicate_slots = conn.execute(
+                "SELECT intended_slot FROM post_drafts "
+                "WHERE status IN (" + _LIVE_DRAFT_STATUS_SQL + ") "
+                "GROUP BY intended_slot HAVING COUNT(*) > 1"
+            ).fetchall()
+            for duplicate in duplicate_slots:
+                rows = conn.execute(
+                    "SELECT id, category FROM post_drafts "
+                    "WHERE intended_slot = ? AND status IN ("
+                    + _LIVE_DRAFT_STATUS_SQL
+                    + ") ORDER BY CASE status "
+                    "WHEN 'published' THEN 5 "
+                    "WHEN 'publication_unknown' THEN 4 "
+                    "WHEN 'publishing' THEN 3 "
+                    "WHEN 'approved' THEN 2 ELSE 1 END DESC, id ASC",
+                    (duplicate["intended_slot"],),
+                ).fetchall()
+                keeper_id = rows[0]["id"]
+                for stale in rows[1:]:
+                    now = self._now_iso()
+                    conn.execute(
+                        "UPDATE post_drafts SET status = 'superseded', "
+                        "error = 'migration_duplicate_slot', updated_at = ?, "
+                        "revision = revision + 1 WHERE id = ?",
+                        (now, stale["id"]),
+                    )
+                    conn.execute("""
+                        UPDATE media_library
+                        SET lifecycle_state = 'available',
+                            reserved_by_draft_id = NULL
+                        WHERE reserved_by_draft_id = ?
+                          AND lifecycle_state = 'reserved'
+                    """, (stale["id"],))
+                    conn.execute("""
+                        INSERT INTO draft_evaluations (
+                            intended_slot, category, outcome, details_json,
+                            created_at
+                        ) VALUES (?, ?, 'migration_duplicate_slot', ?, ?)
+                    """, (
+                        duplicate["intended_slot"],
+                        stale["category"],
+                        json.dumps({
+                            "draft_id": stale["id"],
+                            "kept_draft_id": keeper_id,
+                        }),
+                        now,
+                    ))
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_post_drafts_live_intended_slot "
+                "ON post_drafts(intended_slot) WHERE status IN ("
+                + _LIVE_DRAFT_STATUS_SQL
+                + ")"
+            )
 
     def add_media(self, filename: str, filepath: str, media_type: str,
                   category: str = 'other', ai_description: str = '',
@@ -1606,201 +1762,192 @@ class Database:
             return [dict(row) for row in rows]
 
     def reserve_media(self, media_id: int, draft_id: int) -> bool:
-        with self._media_store_mutation_lock():
-            with self._conn() as conn:
-                cursor = conn.execute("""
-                    UPDATE media_library
-                    SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
-                    WHERE id = ? AND lifecycle_state = 'available'
-                      AND file_deleted = 0
-                """, (draft_id, media_id))
-                return cursor.rowcount == 1
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
+                WHERE id = ? AND lifecycle_state = 'available'
+                  AND file_deleted = 0
+            """, (draft_id, media_id))
+            return cursor.rowcount == 1
 
     def attach_media_to_draft(self, media_id: int, draft_id: int) -> bool:
         """Atomically reserve media and append its trace source to a draft."""
-        with self._media_store_mutation_lock():
-            with self._conn() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                draft = conn.execute(
-                    "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
-                ).fetchone()
-                media = conn.execute(
-                    "SELECT * FROM media_library WHERE id = ?", (media_id,)
-                ).fetchone()
-                if (
-                    not draft
-                    or draft["status"] != "pending_approval"
-                    or draft["media_id"] is not None
-                    or not media
-                    or media["lifecycle_state"] != "available"
-                    or media["file_deleted"]
-                ):
-                    return False
-                context_source_id = None
-                for source in conn.execute("""
-                    SELECT id, metadata_json FROM content_sources
-                    WHERE source_type = 'media_context'
-                    ORDER BY id ASC
-                """).fetchall():
-                    try:
-                        metadata = json.loads(source["metadata_json"])
-                    except (TypeError, ValueError):
-                        continue
-                    if metadata.get("media_id") == media_id:
-                        context_source_id = source["id"]
-                        break
-                if context_source_id is None:
-                    return False
-                reserved = conn.execute("""
-                    UPDATE media_library
-                    SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
-                    WHERE id = ? AND lifecycle_state = 'available'
-                      AND file_deleted = 0
-                """, (draft_id, media_id))
-                if reserved.rowcount != 1:
-                    return False
-                source_ids = json.loads(draft["source_ids_json"])
-                if context_source_id not in source_ids:
-                    source_ids.append(context_source_id)
-                now = self._now_iso()
-                updated = conn.execute("""
-                    UPDATE post_drafts
-                    SET media_id = ?, source_ids_json = ?, updated_at = ?,
-                        revision = revision + 1
-                    WHERE id = ? AND status = 'pending_approval'
-                      AND media_id IS NULL AND revision = ?
-                """, (
-                    media_id, json.dumps(source_ids), now, draft_id,
-                    draft["revision"],
-                ))
-                if updated.rowcount != 1:
-                    raise sqlite3.IntegrityError("draft changed during media attach")
-                self._insert_draft_evaluation_in_conn(
-                    conn,
-                    draft["intended_slot"],
-                    draft["category"],
-                    "media_reserved",
-                    {"draft_id": draft_id, "media_id": media_id},
-                    now,
-                )
-                return True
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+            media = conn.execute(
+                "SELECT * FROM media_library WHERE id = ?", (media_id,)
+            ).fetchone()
+            if (
+                not draft
+                or draft["status"] != "pending_approval"
+                or draft["media_id"] is not None
+                or not media
+                or media["lifecycle_state"] != "available"
+                or media["file_deleted"]
+            ):
+                return False
+            context_source_id = None
+            for source in conn.execute("""
+                SELECT id, metadata_json FROM content_sources
+                WHERE source_type = 'media_context'
+                ORDER BY id ASC
+            """).fetchall():
+                try:
+                    metadata = json.loads(source["metadata_json"])
+                except (TypeError, ValueError):
+                    continue
+                if metadata.get("media_id") == media_id:
+                    context_source_id = source["id"]
+                    break
+            if context_source_id is None:
+                return False
+            reserved = conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
+                WHERE id = ? AND lifecycle_state = 'available'
+                  AND file_deleted = 0
+            """, (draft_id, media_id))
+            if reserved.rowcount != 1:
+                return False
+            source_ids = json.loads(draft["source_ids_json"])
+            if context_source_id not in source_ids:
+                source_ids.append(context_source_id)
+            now = self._now_iso()
+            updated = conn.execute("""
+                UPDATE post_drafts
+                SET media_id = ?, source_ids_json = ?, updated_at = ?,
+                    revision = revision + 1
+                WHERE id = ? AND status = 'pending_approval'
+                  AND media_id IS NULL AND revision = ?
+            """, (
+                media_id, json.dumps(source_ids), now, draft_id,
+                draft["revision"],
+            ))
+            if updated.rowcount != 1:
+                raise sqlite3.IntegrityError("draft changed during media attach")
+            self._insert_draft_evaluation_in_conn(
+                conn,
+                draft["intended_slot"],
+                draft["category"],
+                "media_reserved",
+                {"draft_id": draft_id, "media_id": media_id},
+                now,
+            )
+            return True
 
     def release_media_for_draft(self, draft_id: int) -> None:
-        with self._media_store_mutation_lock():
-            with self._conn() as conn:
-                draft = conn.execute(
-                    "SELECT intended_slot, category FROM post_drafts WHERE id = ?",
-                    (draft_id,),
-                ).fetchone()
-                media_ids = [row["id"] for row in conn.execute("""
-                    SELECT id FROM media_library
-                    WHERE reserved_by_draft_id = ?
-                      AND lifecycle_state = 'reserved'
-                """, (draft_id,)).fetchall()]
-                conn.execute("""
-                    UPDATE media_library
-                    SET lifecycle_state = 'available', reserved_by_draft_id = NULL
-                    WHERE reserved_by_draft_id = ?
-                      AND lifecycle_state = 'reserved'
-                """, (draft_id,))
-                if draft:
-                    now = self._now_iso()
-                    for media_id in media_ids:
-                        self._insert_draft_evaluation_in_conn(
-                            conn,
-                            draft["intended_slot"],
-                            draft["category"],
-                            "media_released",
-                            {"draft_id": draft_id, "media_id": media_id},
-                            now,
-                        )
+        with self._media_store_mutation_lock(
+            "draft_reservations", draft_id,
+        ) as conn:
+            draft = conn.execute(
+                "SELECT intended_slot, category FROM post_drafts WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            media_ids = [row["id"] for row in conn.execute("""
+                SELECT id FROM media_library
+                WHERE reserved_by_draft_id = ?
+                  AND lifecycle_state = 'reserved'
+            """, (draft_id,)).fetchall()]
+            conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                WHERE reserved_by_draft_id = ?
+                  AND lifecycle_state = 'reserved'
+            """, (draft_id,))
+            if draft:
+                now = self._now_iso()
+                for media_id in media_ids:
+                    self._insert_draft_evaluation_in_conn(
+                        conn,
+                        draft["intended_slot"],
+                        draft["category"],
+                        "media_released",
+                        {"draft_id": draft_id, "media_id": media_id},
+                        now,
+                    )
 
     def mark_media_used(self, media_id: int, tweet_id: str = ''):
-        with self._media_store_mutation_lock():
-            with self._conn() as conn:
-                conn.execute("""
-                    UPDATE media_library
-                    SET used = 1, used_at = ?, used_in_tweet_id = ?,
-                        lifecycle_state = 'used', reserved_by_draft_id = NULL
-                    WHERE id = ? AND lifecycle_state IN ('available', 'reserved')
-                      AND file_deleted = 0
-                """, (self._now_iso(), tweet_id, media_id))
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            conn.execute("""
+                UPDATE media_library
+                SET used = 1, used_at = ?, used_in_tweet_id = ?,
+                    lifecycle_state = 'used', reserved_by_draft_id = NULL
+                WHERE id = ? AND lifecycle_state IN ('available', 'reserved')
+                  AND file_deleted = 0
+            """, (self._now_iso(), tweet_id, media_id))
 
     def archive_media(self, media_id: int) -> bool:
-        with self._media_store_mutation_lock():
-            with self._conn() as conn:
-                cursor = conn.execute("""
-                    UPDATE media_library
-                    SET lifecycle_state = 'archived', reserved_by_draft_id = NULL
-                    WHERE id = ? AND lifecycle_state = 'available'
-                """, (media_id,))
-                return cursor.rowcount == 1
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'archived', reserved_by_draft_id = NULL
+                WHERE id = ? AND lifecycle_state = 'available'
+            """, (media_id,))
+            return cursor.rowcount == 1
 
     def set_media_reusable(self, media_id: int, reusable: bool) -> bool:
-        with self._media_store_mutation_lock():
-            with self._conn() as conn:
-                cursor = conn.execute("""
-                    UPDATE media_library
-                    SET reusable = ?,
-                        lifecycle_state = CASE
-                            WHEN ? = 1 AND lifecycle_state = 'used' THEN 'available'
-                            WHEN ? = 0 AND used = 1
-                                 AND lifecycle_state = 'available' THEN 'used'
-                            ELSE lifecycle_state
-                        END
-                    WHERE id = ?
-                """, (int(reusable), int(reusable), int(reusable), media_id))
-                return cursor.rowcount == 1
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET reusable = ?,
+                    lifecycle_state = CASE
+                        WHEN ? = 1 AND lifecycle_state = 'used' THEN 'available'
+                        WHEN ? = 0 AND used = 1
+                             AND lifecycle_state = 'available' THEN 'used'
+                        ELSE lifecycle_state
+                    END
+                WHERE id = ?
+            """, (int(reusable), int(reusable), int(reusable), media_id))
+            return cursor.rowcount == 1
 
     def mark_media_file_deleted(self, media_id: int, delete_file=None) -> bool:
         """Segna che il file fisico è stato rimosso dal disco per risparmiare
         spazio (il record resta nel DB come storico/audit)."""
-        with self._media_store_mutation_lock():
-            with self._conn() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    "SELECT lifecycle_state, file_deleted "
-                    "FROM media_library WHERE id = ?",
-                    (media_id,),
-                ).fetchone()
-                if (
-                    not row
-                    or row["file_deleted"]
-                    or row["lifecycle_state"] not in MEDIA_FILE_DELETE_SAFE_STATES
-                ):
-                    return False
-                cursor = conn.execute("""
-                    UPDATE media_library
-                    SET file_deleted = 1, lifecycle_state = 'deleted',
-                        reserved_by_draft_id = NULL
-                    WHERE id = ? AND file_deleted = 0
-                      AND lifecycle_state = ?
-                """, (media_id, row["lifecycle_state"]))
-                if cursor.rowcount != 1:
-                    return False
-                if delete_file is not None:
-                    delete_file()
-                return True
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            row = conn.execute(
+                "SELECT lifecycle_state, file_deleted "
+                "FROM media_library WHERE id = ?",
+                (media_id,),
+            ).fetchone()
+            if (
+                not row
+                or row["file_deleted"]
+                or row["lifecycle_state"] not in MEDIA_FILE_DELETE_SAFE_STATES
+            ):
+                return False
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET file_deleted = 1, lifecycle_state = 'deleted',
+                    reserved_by_draft_id = NULL
+                WHERE id = ? AND file_deleted = 0
+                  AND lifecycle_state = ?
+            """, (media_id, row["lifecycle_state"]))
+            if cursor.rowcount != 1:
+                return False
+            if delete_file is not None:
+                delete_file()
+            return True
 
     def update_media(self, media_id: int, category: Optional[str] = None,
                       ai_description: Optional[str] = None):
-        with self._media_store_mutation_lock():
-            with self._conn() as conn:
-                if category is not None:
-                    conn.execute(
-                        "UPDATE media_library SET category = ? WHERE id = ?",
-                        (category, media_id),
-                    )
-                if ai_description is not None:
-                    conn.execute(
-                        "UPDATE media_library SET ai_description = ? WHERE id = ?",
-                        (ai_description, media_id),
-                    )
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            if category is not None:
+                conn.execute(
+                    "UPDATE media_library SET category = ? WHERE id = ?",
+                    (category, media_id),
+                )
+            if ai_description is not None:
+                conn.execute(
+                    "UPDATE media_library SET ai_description = ? WHERE id = ?",
+                    (ai_description, media_id),
+                )
 
     def delete_media(self, media_id: int):
-        with self._media_store_mutation_lock():
-            with self._conn() as conn:
-                conn.execute("DELETE FROM media_library WHERE id = ?", (media_id,))
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            conn.execute("DELETE FROM media_library WHERE id = ?", (media_id,))
 
     # ---------- Crescita rete (follow/unfollow per costruire seguito reale) ----------
 

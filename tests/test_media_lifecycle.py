@@ -1,10 +1,13 @@
 import io
+import hashlib
 import logging
 import os
 import select
+import sqlite3
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -27,6 +30,37 @@ from modules.media_processor import (
 
 
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"jpeg-data"
+
+
+def _insert_identity_media(
+    conn,
+    media_id,
+    filepath,
+    *,
+    lifecycle_state="available",
+    reserved_by_draft_id=None,
+):
+    file_stat = filepath.stat()
+    conn.execute(
+        """
+        INSERT INTO media_library (
+            id, filename, filepath, media_type, lifecycle_state,
+            reserved_by_draft_id, file_size, file_device, file_inode,
+            file_sha256
+        ) VALUES (?, ?, ?, 'image', ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            media_id,
+            filepath.name,
+            str(filepath),
+            lifecycle_state,
+            reserved_by_draft_id,
+            file_stat.st_size,
+            file_stat.st_dev,
+            file_stat.st_ino,
+            hashlib.sha256(filepath.read_bytes()).hexdigest(),
+        ),
+    )
 
 
 def bmff_ftyp(major_brand, compatible_brands=()):
@@ -879,6 +913,511 @@ def test_future_use_rejects_same_inode_same_size_content_change(tmp_path):
             pass
 
 
+def test_mutation_revalidates_empty_snapshot_after_insert_commit(
+    tmp_path, monkeypatch,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    snapshot_read = threading.Event()
+    write_attempted = threading.Event()
+    root_lock_attempted = threading.Event()
+    callback_called = threading.Event()
+
+    class ObservedDatabase(Database):
+        @contextmanager
+        def _conn(self):
+            with super()._conn() as conn:
+                if threading.current_thread().name == "media-mutation":
+                    def trace(statement):
+                        normalized = " ".join(statement.upper().split())
+                        if (
+                            normalized.startswith("SELECT")
+                            and "FROM MEDIA_LIBRARY" in normalized
+                            and "FILE_DEVICE" in normalized
+                        ):
+                            snapshot_read.set()
+                        if normalized == "BEGIN IMMEDIATE":
+                            write_attempted.set()
+
+                    conn.set_trace_callback(trace)
+                yield conn
+
+    db = ObservedDatabase(str(tmp_path / "db.sqlite"))
+    media_path = tmp_path / "gym.jpg"
+    media_path.write_bytes(JPEG_BYTES)
+    writer = sqlite3.connect(db.db_path)
+    result = []
+    errors = []
+
+    @contextmanager
+    def observed_media_store_lock(directory):
+        if Path(directory).resolve() == tmp_path.resolve():
+            root_lock_attempted.set()
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module, "media_store_lock", observed_media_store_lock,
+    )
+
+    def delete_media():
+        try:
+            result.append(
+                db.mark_media_file_deleted(1, delete_file=callback_called.set)
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=delete_media, name="media-mutation")
+    retry_observed = False
+    callback_during_lock = False
+    try:
+        with real_media_store_lock(tmp_path):
+            writer.execute("BEGIN IMMEDIATE")
+            _insert_identity_media(writer, 1, media_path)
+            thread.start()
+            assert snapshot_read.wait(timeout=1)
+            assert write_attempted.wait(timeout=1)
+
+            writer.commit()
+            retry_observed = root_lock_attempted.wait(timeout=1)
+            callback_during_lock = callback_called.is_set()
+    finally:
+        writer.close()
+        thread.join(timeout=2)
+
+    assert retry_observed, "committed target root was not locked on retry"
+    assert callback_during_lock is False
+    assert thread.is_alive() is False
+    assert errors == []
+    assert result == [True]
+    assert callback_called.is_set()
+    assert db.get_media_by_id(1)["lifecycle_state"] == "deleted"
+
+
+def test_mutation_retries_when_target_identity_moves_to_another_root(
+    tmp_path, monkeypatch,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    root_a = tmp_path / "a-root"
+    root_b = tmp_path / "b-root"
+    root_a.mkdir(mode=0o700)
+    root_b.mkdir(mode=0o700)
+    staged = root_a / ".upload-staged.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    db = Database(str(tmp_path / "db.sqlite"))
+    record = MediaProcessor(db).process_new_file(
+        str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )
+    replacement = root_b / "gym.jpg"
+    replacement.write_bytes(JPEG_BYTES)
+
+    root_a_attempted = threading.Event()
+    root_b_attempted = threading.Event()
+    finished = threading.Event()
+    attempts = []
+    result = []
+    errors = []
+
+    @contextmanager
+    def observed_media_store_lock(directory):
+        root = Path(directory).resolve()
+        attempts.append(root)
+        if root == root_a.resolve():
+            root_a_attempted.set()
+        if root == root_b.resolve():
+            root_b_attempted.set()
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module, "media_store_lock", observed_media_store_lock,
+    )
+
+    def archive_media():
+        try:
+            result.append(db.archive_media(record["id"]))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=archive_media)
+    root_a_guard = real_media_store_lock(root_a)
+    root_b_guard = real_media_store_lock(root_b)
+    root_a_guard.__enter__()
+    root_a_held = True
+    root_b_held = False
+    retried_to_root_b = False
+    finished_while_root_b_locked = False
+    try:
+        thread.start()
+        assert root_a_attempted.wait(timeout=1)
+        replacement_stat = replacement.stat()
+        with db._conn() as conn:
+            conn.execute(
+                """
+                UPDATE media_library
+                SET filepath = ?, file_device = ?, file_inode = ?,
+                    file_size = ?, file_sha256 = ?
+                WHERE id = ?
+                """,
+                (
+                    str(replacement),
+                    replacement_stat.st_dev,
+                    replacement_stat.st_ino,
+                    replacement_stat.st_size,
+                    hashlib.sha256(replacement.read_bytes()).hexdigest(),
+                    record["id"],
+                ),
+            )
+
+        root_b_guard.__enter__()
+        root_b_held = True
+        root_a_guard.__exit__(None, None, None)
+        root_a_held = False
+        retried_to_root_b = root_b_attempted.wait(timeout=1)
+        finished_while_root_b_locked = finished.is_set()
+    finally:
+        if root_a_held:
+            root_a_guard.__exit__(None, None, None)
+        if root_b_held:
+            root_b_guard.__exit__(None, None, None)
+        thread.join(timeout=2)
+
+    assert retried_to_root_b, "changed target root was never acquired"
+    assert finished_while_root_b_locked is False
+    assert thread.is_alive() is False
+    assert errors == []
+    assert result == [True]
+    assert attempts[:2] == [root_a.resolve(), root_b.resolve()]
+    moved = db.get_media_by_id(record["id"])
+    assert moved["filepath"] == str(replacement)
+    assert moved["lifecycle_state"] == "archived"
+
+
+def test_release_locks_only_target_roots_in_sorted_order(tmp_path, monkeypatch):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    roots = {
+        name: tmp_path / name
+        for name in ("z-target", "a-target", "m-unrelated")
+    }
+    records = {}
+    for name, root in roots.items():
+        root.mkdir(mode=0o700)
+        staged = root / f".upload-{name}.jpg"
+        staged.write_bytes(JPEG_BYTES)
+        records[name] = MediaProcessor(db).process_new_file(
+            str(staged), f"{name}.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+        )
+    with db._conn() as conn:
+        conn.execute(
+            """
+            UPDATE media_library
+            SET lifecycle_state = 'reserved', reserved_by_draft_id = 17
+            WHERE id IN (?, ?)
+            """,
+            (records["z-target"]["id"], records["a-target"]["id"]),
+        )
+
+    attempts = []
+
+    @contextmanager
+    def observed_media_store_lock(directory):
+        attempts.append(Path(directory).resolve())
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module, "media_store_lock", observed_media_store_lock,
+    )
+
+    db.release_media_for_draft(17)
+
+    expected = sorted(
+        [roots["a-target"].resolve(), roots["z-target"].resolve()],
+        key=str,
+    )
+    assert attempts == expected
+    assert db.get_media_by_id(records["a-target"]["id"])[
+        "lifecycle_state"
+    ] == "available"
+    assert db.get_media_by_id(records["z-target"]["id"])[
+        "lifecycle_state"
+    ] == "available"
+    assert db.get_media_by_id(records["m-unrelated"]["id"])[
+        "lifecycle_state"
+    ] == "available"
+
+
+def test_atomic_draft_replacement_locks_reserved_media_root(
+    tmp_path, monkeypatch,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    source_id = db.add_content_source("evergreen_idea", "Verified source")
+    draft_id = _draft(
+        db, source_id, "2026-08-12T14:00:00+02:00", "replace-old",
+    )
+    staged = tmp_path / ".upload-staged.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    record = MediaProcessor(db).process_new_file(
+        str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )
+    assert db.transition_post_draft(
+        draft_id,
+        ["pending_approval"],
+        "pending_approval",
+        media_id=record["id"],
+    )
+    assert db.reserve_media(record["id"], draft_id)
+    prior = db.get_post_draft(draft_id)
+
+    root_attempted = threading.Event()
+    finished = threading.Event()
+    result = []
+    errors = []
+
+    @contextmanager
+    def observed_media_store_lock(directory):
+        root_attempted.set()
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module, "media_store_lock", observed_media_store_lock,
+    )
+
+    def replace_draft():
+        try:
+            result.append(db.replace_post_draft_atomic(
+                prior_draft_id=draft_id,
+                expected_revision=prior["revision"],
+                expected_slot=prior["intended_slot"],
+                expected_category=prior["category"],
+                expected_source_ids=prior["source_ids"],
+                text="Replacement text",
+                score_data={"total": 91},
+                publication_key="replace-new",
+            ))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=replace_draft)
+    with real_media_store_lock(tmp_path):
+        thread.start()
+        lock_was_attempted = root_attempted.wait(timeout=1)
+        finished_while_locked = finished.is_set()
+    thread.join(timeout=2)
+
+    assert lock_was_attempted
+    assert finished_while_locked is False
+    assert thread.is_alive() is False
+    assert errors == []
+    replacement, outcome = result[0]
+    assert outcome == "created"
+    assert replacement["status"] == "pending_approval"
+    assert db.get_media_by_id(record["id"])["lifecycle_state"] == "available"
+
+
+def test_duplicate_slot_migration_locks_reserved_media_root(
+    tmp_path, monkeypatch,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    path = str(tmp_path / "db.sqlite")
+    db = Database(path)
+    source_id = db.add_content_source("evergreen_idea", "Verified source")
+    with db._conn() as conn:
+        conn.execute("DROP INDEX uq_post_drafts_live_intended_slot")
+    slot = "2026-08-12T14:00:00+02:00"
+    keeper_id = _draft(db, source_id, slot, "migration-keeper")
+    stale_id = _draft(db, source_id, slot, "migration-stale")
+    staged = tmp_path / ".upload-staged.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    record = MediaProcessor(db).process_new_file(
+        str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )
+    assert db.transition_post_draft(
+        stale_id,
+        ["pending_approval"],
+        "pending_approval",
+        media_id=record["id"],
+    )
+    assert db.reserve_media(record["id"], stale_id)
+
+    root_attempted = threading.Event()
+    finished = threading.Event()
+    migrated = []
+    errors = []
+
+    @contextmanager
+    def observed_media_store_lock(directory):
+        root_attempted.set()
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module, "media_store_lock", observed_media_store_lock,
+    )
+
+    def migrate_schema():
+        try:
+            migrated.append(Database(path))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=migrate_schema)
+    with real_media_store_lock(tmp_path):
+        thread.start()
+        lock_was_attempted = root_attempted.wait(timeout=1)
+        finished_while_locked = finished.is_set()
+    thread.join(timeout=2)
+
+    assert lock_was_attempted
+    assert finished_while_locked is False
+    assert thread.is_alive() is False
+    assert errors == []
+    assert len(migrated) == 1
+    assert migrated[0].get_active_draft_for_slot(slot)["id"] == keeper_id
+    assert migrated[0].get_post_draft(stale_id)["status"] == "superseded"
+    media = migrated[0].get_media_by_id(record["id"])
+    assert media["lifecycle_state"] == "available"
+    assert media["reserved_by_draft_id"] is None
+
+
+def test_interrupted_lifecycle_schema_migration_resumes_from_pending_marker(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "legacy.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE media_library (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            filepath TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            used INTEGER DEFAULT 0,
+            file_deleted INTEGER DEFAULT 0
+        );
+        INSERT INTO media_library (filename, filepath, media_type, used)
+        VALUES ('used.jpg', '/legacy/used.jpg', 'image', 1);
+        INSERT INTO media_library (
+            filename, filepath, media_type, used, file_deleted
+        ) VALUES ('deleted.jpg', '/legacy/deleted.jpg', 'image', 1, 1);
+    """)
+    conn.close()
+
+    original_reconcile = Database._reconcile_media_schema
+    interrupted = []
+
+    def interrupt_after_schema_commit(self, migration_pending):
+        interrupted.append(migration_pending)
+        raise RuntimeError("injected migration interruption")
+
+    monkeypatch.setattr(
+        Database, "_reconcile_media_schema", interrupt_after_schema_commit,
+    )
+    with pytest.raises(RuntimeError, match="injected migration interruption"):
+        Database(str(path))
+    monkeypatch.setattr(Database, "_reconcile_media_schema", original_reconcile)
+
+    recovered = Database(str(path))
+
+    assert interrupted == [True]
+    with recovered._conn() as check:
+        states = check.execute(
+            "SELECT lifecycle_state FROM media_library ORDER BY id"
+        ).fetchall()
+        marker = check.execute(
+            "SELECT value FROM bot_state "
+            "WHERE key = 'migration:media_lifecycle_state'"
+        ).fetchone()
+    assert [row["lifecycle_state"] for row in states] == ["used", "deleted"]
+    assert marker["value"] == "complete"
+
+
+def test_noop_schema_init_does_not_resolve_historical_media_roots(tmp_path):
+    root = tmp_path / "historical-root"
+    root.mkdir(mode=0o700)
+    path = str(tmp_path / "db.sqlite")
+    db = Database(path)
+    staged = root / ".upload-staged.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    record = MediaProcessor(db).process_new_file(
+        str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )
+    Path(record["filepath"]).unlink()
+    root.rmdir()
+
+    reopened = Database(path)
+
+    assert reopened.get_media_by_id(record["id"])["id"] == record["id"]
+
+
+def test_mutation_snapshot_churn_is_bounded_and_fails_closed(
+    tmp_path, monkeypatch,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    staged = tmp_path / ".upload-staged.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    record = MediaProcessor(db).process_new_file(
+        str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )
+    callback_called = threading.Event()
+    attempts = []
+
+    @contextmanager
+    def change_status_before_lock(directory):
+        attempts.append(Path(directory).resolve())
+        if len(attempts) <= 16:
+            with db._conn() as conn:
+                row = conn.execute(
+                    "SELECT lifecycle_state FROM media_library WHERE id = ?",
+                    (record["id"],),
+                ).fetchone()
+                next_state = (
+                    "used"
+                    if row["lifecycle_state"] == "available"
+                    else "available"
+                )
+                conn.execute(
+                    "UPDATE media_library SET lifecycle_state = ? WHERE id = ?",
+                    (next_state, record["id"]),
+                )
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module, "media_store_lock", change_status_before_lock,
+    )
+
+    with pytest.raises(RuntimeError, match="media_store_snapshot_unstable"):
+        db.mark_media_file_deleted(
+            record["id"], delete_file=callback_called.set,
+        )
+
+    assert len(attempts) == 5
+    assert callback_called.is_set() is False
+    assert db.get_media_by_id(record["id"])["file_deleted"] == 0
+
+
 def test_lifecycle_mutation_waits_for_media_store_lock(tmp_path):
     from modules import media_processor as media_module
 
@@ -939,6 +1478,50 @@ with media_store_lock(Path(sys.argv[1])):
     stdout, stderr = child.communicate(timeout=2)
     assert child.returncode == 0, stderr
     assert stdout.strip() == "acquired"
+
+
+def test_lifecycle_mutation_waits_for_root_lock_in_separate_process(tmp_path):
+    from modules.media_processor import media_store_lock
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    staged = tmp_path / ".upload-staged.jpg"
+    staged.write_bytes(JPEG_BYTES)
+    record = MediaProcessor(db).process_new_file(
+        str(staged), "gym.jpg", "image/jpeg", len(JPEG_BYTES), "context",
+    )
+    script = """
+import sys
+from modules.database import Database
+
+database = Database(sys.argv[1])
+print('ready', flush=True)
+sys.stdin.readline()
+print('archiving', flush=True)
+archived = database.archive_media(int(sys.argv[2]))
+print(f'archived={archived}', flush=True)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script, db.db_path, str(record["id"])],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdin is not None
+    assert child.stdout is not None
+    assert child.stdout.readline().strip() == "ready"
+    with media_store_lock(tmp_path):
+        child.stdin.write("archive\n")
+        child.stdin.flush()
+        assert child.stdout.readline().strip() == "archiving"
+        readable, _writable, _errors = select.select([child.stdout], [], [], 0.05)
+        assert readable == []
+
+    stdout, stderr = child.communicate(timeout=2)
+    assert child.returncode == 0, stderr
+    assert stdout.strip() == "archived=True"
+    assert db.get_media_by_id(record["id"])["lifecycle_state"] == "archived"
 
 
 def test_missing_nofollow_support_rejects_before_opening_staged_target(
