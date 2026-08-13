@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import threading
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Optional, Sequence
 from urllib.parse import quote
@@ -19,8 +20,18 @@ from config import (
 REQUEST_TIMEOUT = 10
 TELEGRAM_POLL_TIMEOUT = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "25"))
 _DOWNLOAD_CHUNK_SIZE = 64 * 1024
-_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
-_VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v"})
+_MAX_CONTENT_LENGTH_DIGITS = 19
+_MAX_CONTENT_LENGTH_VALUE = (1 << 63) - 1
+_MIME_BY_SUFFIX = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".m4v": "video/x-m4v",
+}
+_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 _ALLOWED_OPERATIONS = frozenset({
     "api",
     "cycle",
@@ -51,6 +62,7 @@ _ALLOWED_CODES = frozenset({
     "file_too_large",
     "invalid_content_length",
     "invalid_error_code",
+    "invalid_media_metadata",
     "invalid_object",
     "invalid_result",
     "invalid_status",
@@ -209,21 +221,72 @@ class _ConnectionPoolLogFilter(logging.Filter):
     _telegram_connectionpool_filter = True
 
     def filter(self, record: logging.LogRecord) -> bool:
+        with _CONNECTIONPOOL_LOG_LOCK:
+            secrets = tuple(_TELEGRAM_LOG_SECRETS)
+            targets = tuple(_TELEGRAM_LOG_TARGETS)
+        fragments = [
+            record.msg,
+            record.args,
+            record.exc_text,
+            record.stack_info,
+        ]
+        if record.exc_info is not None:
+            fragments.append(record.exc_info[1])
+            try:
+                fragments.append(
+                    logging.Formatter().formatException(record.exc_info)
+                )
+            except Exception:
+                pass
+        try:
+            rendered = record.getMessage()
+        except Exception:
+            rendered = ""
+        fragments.append(rendered)
+        serialized = []
+        for fragment in fragments:
+            try:
+                serialized.append(str(fragment))
+            except Exception:
+                serialized.append("")
+        combined = "\n".join(serialized)
+        is_telegram_record = (
+            "api.telegram.org/bot" in combined
+            or "api.telegram.org/file/bot" in combined
+            or any(secret and secret in combined for secret in secrets)
+            or any(target and target in combined for target in targets)
+        )
+        if not is_telegram_record:
+            return True
         record.msg = "urllib3 connectionpool event"
         record.args = ()
         record.exc_info = None
         record.exc_text = None
         record.stack_info = None
+        record.pathname = "<redacted>"
+        record.filename = "<redacted>"
+        record.module = "<redacted>"
+        record.funcName = "<redacted>"
+        record.__dict__.pop("message", None)
         return True
 
 
-def _install_connectionpool_log_filter() -> None:
+_CONNECTIONPOOL_LOG_LOCK = threading.RLock()
+_TELEGRAM_LOG_SECRETS = set()
+_TELEGRAM_LOG_TARGETS = set()
+
+
+def _register_connectionpool_secrets(token: str, *targets: str) -> None:
     logger = logging.getLogger("urllib3.connectionpool")
-    if not any(
-        getattr(item, "_telegram_connectionpool_filter", False)
-        for item in logger.filters
-    ):
-        logger.addFilter(_ConnectionPoolLogFilter())
+    with _CONNECTIONPOOL_LOG_LOCK:
+        if token:
+            _TELEGRAM_LOG_SECRETS.add(token)
+        _TELEGRAM_LOG_TARGETS.update(target for target in targets if target)
+        if not any(
+            getattr(item, "_telegram_connectionpool_filter", False)
+            for item in logger.filters
+        ):
+            logger.addFilter(_ConnectionPoolLogFilter())
 
 
 class TelegramApi:
@@ -235,12 +298,16 @@ class TelegramApi:
         media_library_dir: os.PathLike | str = MEDIA_LIBRARY_DIR,
         requests_client=requests,
     ):
-        _install_connectionpool_log_filter()
         self.bot_token = str(bot_token)
         self.media_library_dir = Path(os.path.abspath(os.fspath(media_library_dir)))
         self.requests = requests_client
         self._api_base = f"https://api.telegram.org/bot{self.bot_token}"
         self._file_base = f"https://api.telegram.org/file/bot{self.bot_token}"
+        _register_connectionpool_secrets(
+            self.bot_token,
+            self._api_base,
+            self._file_base,
+        )
 
     def _safe_transport_error(self, method: str, exc: Exception) -> TelegramApiError:
         return TelegramApiError(
@@ -487,13 +554,53 @@ class TelegramApi:
         return normalized, parent_fd, relative.parts[-1], file_fd
 
     @staticmethod
-    def _download_byte_limit(destination: Path) -> int:
-        suffix = destination.suffix.lower()
-        if suffix in _IMAGE_SUFFIXES:
-            return TELEGRAM_MAX_IMAGE_BYTES
-        if suffix in _VIDEO_SUFFIXES:
-            return TELEGRAM_MAX_VIDEO_BYTES
-        return max(TELEGRAM_MAX_IMAGE_BYTES, TELEGRAM_MAX_VIDEO_BYTES)
+    def _download_byte_limit(
+        destination: Path,
+        message_filename: str,
+        mime_type: str,
+        expected_size: int,
+    ) -> int:
+        if (
+            not isinstance(message_filename, str)
+            or not message_filename
+            or "\x00" in message_filename
+            or "/" in message_filename
+            or "\\" in message_filename
+        ):
+            message_suffix = ""
+        else:
+            message_suffix = Path(message_filename).suffix.lower()
+        destination_suffix = destination.suffix.lower()
+        expected_mime = _MIME_BY_SUFFIX.get(message_suffix)
+        normalized_mime = (
+            mime_type.split(";", 1)[0].strip().lower()
+            if isinstance(mime_type, str)
+            else ""
+        )
+        if (
+            expected_mime is None
+            or destination_suffix != message_suffix
+            or normalized_mime != expected_mime
+            or type(expected_size) is not int
+            or expected_size <= 0
+        ):
+            raise TelegramApiError(
+                operation="download",
+                method="downloadFile",
+                code="invalid_media_metadata",
+            )
+        limit = (
+            TELEGRAM_MAX_IMAGE_BYTES
+            if normalized_mime in _IMAGE_MIME_TYPES
+            else TELEGRAM_MAX_VIDEO_BYTES
+        )
+        if expected_size > limit:
+            raise TelegramApiError(
+                operation="download",
+                method="downloadFile",
+                code="file_too_large",
+            )
+        return limit
 
     @staticmethod
     def _content_length(response) -> Optional[int]:
@@ -510,15 +617,27 @@ class TelegramApi:
             return None
         if type(raw_length) is int:
             length = raw_length
-        elif isinstance(raw_length, str) and raw_length.isascii() and raw_length.isdigit():
-            length = int(raw_length)
+        elif (
+            isinstance(raw_length, str)
+            and 1 <= len(raw_length) <= _MAX_CONTENT_LENGTH_DIGITS
+            and raw_length.isascii()
+            and raw_length.isdigit()
+        ):
+            try:
+                length = int(raw_length)
+            except (ValueError, OverflowError):
+                raise TelegramApiError(
+                    operation="download",
+                    method="downloadFile",
+                    code="invalid_content_length",
+                ) from None
         else:
             raise TelegramApiError(
                 operation="download",
                 method="downloadFile",
                 code="invalid_content_length",
             )
-        if length < 0:
+        if length < 0 or length > _MAX_CONTENT_LENGTH_VALUE:
             raise TelegramApiError(
                 operation="download",
                 method="downloadFile",
@@ -530,8 +649,25 @@ class TelegramApi:
         self,
         file_path: str,
         destination: os.PathLike | str,
+        *,
+        message_filename: str,
+        mime_type: str,
+        expected_size: int,
     ) -> Path:
+        """Download media using MIME and size metadata from the Telegram message.
+
+        ``getFile`` supplies only the remote path. The caller (Task 9) must
+        preserve and pass the original message filename/MIME/size. The
+        destination may sanitize the basename but must preserve its extension.
+        """
         safe_remote_path = self._validate_remote_file_path(file_path)
+        requested_destination = Path(destination)
+        byte_limit = self._download_byte_limit(
+            requested_destination,
+            message_filename,
+            mime_type,
+            expected_size,
+        )
         destination_path, parent_fd, leaf_name, file_fd = self._reserve_destination(
             destination
         )
@@ -562,7 +698,6 @@ class TelegramApi:
                     method="downloadFile",
                     status=status,
                 )
-            byte_limit = self._download_byte_limit(destination_path)
             declared_length = self._content_length(response)
             if declared_length is not None and declared_length > byte_limit:
                 raise TelegramApiError(

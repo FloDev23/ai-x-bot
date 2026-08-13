@@ -715,11 +715,16 @@ class FakeRequests:
 
 class ConnectionPoolLoggingRequests(FakeRequests):
     def post(self, url, **kwargs):
-        logging.getLogger("urllib3.connectionpool").debug(
-            "Starting new HTTPS connection for %s headers=%s",
-            url,
-            {"Authorization": f"Basic {url}"},
-        )
+        try:
+            raise RuntimeError(f"response body includes {url}")
+        except RuntimeError:
+            logging.getLogger("urllib3.connectionpool").debug(
+                "Starting new HTTPS connection for %s headers=%s",
+                url,
+                {"Authorization": f"Basic {url}"},
+                exc_info=True,
+                stack_info=True,
+            )
         return super().post(url, **kwargs)
 
 
@@ -751,7 +756,120 @@ def test_connectionpool_debug_record_never_formats_bot_token(tmp_path, caplog):
         if record.name == "urllib3.connectionpool"
     ]
     assert connection_records == ["urllib3 connectionpool event"]
-    assert secret not in " ".join(record.getMessage() for record in caplog.records)
+    for record in caplog.records:
+        serialized = " ".join((
+            str(record.msg),
+            repr(record.args),
+            record.getMessage(),
+            str(record.exc_info),
+            str(record.exc_text),
+            str(record.stack_info),
+        ))
+        assert secret not in serialized
+
+
+def test_connectionpool_filter_preserves_non_telegram_record(tmp_path, caplog):
+    TelegramApi("123456:secret", tmp_path, requests_client=FakeRequests())
+    caplog.set_level(logging.DEBUG)
+    logger = logging.getLogger("urllib3.connectionpool")
+    message = "Starting new HTTPS connection for %s headers=%s"
+    args = (
+        "https://newsapi.org/v2/everything",
+        {"Authorization": "Bearer news-api-private"},
+    )
+    logger.debug(message, *args)
+    record = caplog.records[-1]
+    assert record.msg == message
+    assert record.args == args
+    assert record.getMessage() == (
+        "Starting new HTTPS connection for https://newsapi.org/v2/everything "
+        "headers={'Authorization': 'Bearer news-api-private'}"
+    )
+
+
+def test_connectionpool_filter_is_safe_under_concurrent_api_initialization(
+    tmp_path,
+    caplog,
+):
+    caplog.set_level(logging.DEBUG)
+
+    def initialize_and_send(index):
+        secret = f"123456789:telegram_Bot-Secret-{index}"
+        api = TelegramApi(
+            secret,
+            tmp_path,
+            requests_client=ConnectionPoolLoggingRequests(post_outcomes=[
+                FakeResponse({"ok": True, "result": {"message_id": index}})
+            ]),
+        )
+        return secret, api.send_message("42", "hello")
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        results = list(executor.map(initialize_and_send, range(200)))
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "urllib3.connectionpool"
+    ]
+    assert len(records) == 200
+    assert [result[1]["message_id"] for result in results] == list(range(200))
+    serialized = " ".join(
+        " ".join((
+            str(record.msg),
+            repr(record.args),
+            record.getMessage(),
+            str(record.exc_info),
+            str(record.exc_text),
+            str(record.stack_info),
+        ))
+        for record in records
+    )
+    assert all(secret not in serialized for secret, _result in results)
+
+
+def test_connectionpool_filter_redacts_token_only_in_traceback_or_stack(
+    tmp_path,
+    caplog,
+):
+    secret = "123456789:telegram_Bot-Secret-trace"
+    TelegramApi(secret, tmp_path, requests_client=FakeRequests())
+    caplog.set_level(logging.DEBUG)
+    logger = logging.getLogger("urllib3.connectionpool")
+
+    try:
+        exec(compile("raise RuntimeError('generic')", secret, "exec"), {})
+    except RuntimeError:
+        logger.debug("generic traceback", exc_info=True)
+    exec(
+        compile(
+            "logger.debug('generic stack', stack_info=True)",
+            secret,
+            "exec",
+        ),
+        {"logger": logger},
+    )
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "urllib3.connectionpool"
+    ][-2:]
+    assert [record.getMessage() for record in records] == [
+        "urllib3 connectionpool event",
+        "urllib3 connectionpool event",
+    ]
+    serialized = caplog.text + " ".join(
+        " ".join((
+            str(record.msg),
+            repr(record.args),
+            str(record.exc_info),
+            str(record.exc_text),
+            str(record.stack_info),
+        ))
+        for record in records
+    )
+    assert secret not in serialized
 
 
 def test_get_updates_uses_exact_poll_timeout_and_allowed_updates(tmp_path):
@@ -934,6 +1052,202 @@ def test_sanitize_error_uses_closed_metadata_allowlists():
     assert "OpaquePrivateValue" not in safe
 
 
+def test_download_requires_explicit_message_media_metadata(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    requests_client = FakeRequests(get_outcomes=[FakeResponse(chunks=[b"x"])])
+    api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
+    with pytest.raises(TypeError):
+        api.download_file("photos/a.jpg", media_root / "photo.jpg")
+    assert requests_client.gets == []
+
+
+def test_download_trusts_message_filename_not_destination_suffix(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    requests_client = FakeRequests(get_outcomes=[FakeResponse(chunks=[b"x"])])
+    api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
+    with pytest.raises(TelegramApiError) as raised:
+        api.download_file(
+            "documents/file",
+            media_root / "looks-safe.jpg",
+            message_filename="payload.bin",
+            mime_type="image/jpeg",
+            expected_size=1,
+        )
+    assert str(raised.value) == (
+        "operation=download method=downloadFile code=invalid_media_metadata"
+    )
+    assert requests_client.gets == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime_type"),
+    [
+        ("photo.jpg", "image/jpeg"),
+        ("photo.jpeg", "image/jpeg"),
+        ("photo.png", "image/png"),
+        ("photo.webp", "image/webp"),
+        ("clip.mp4", "video/mp4"),
+        ("clip.mov", "video/quicktime"),
+        ("clip.m4v", "video/x-m4v"),
+    ],
+)
+def test_download_accepts_message_mime_matching_filename(
+    tmp_path,
+    filename,
+    mime_type,
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    response = FakeResponse(chunks=[b"x"], headers={"Content-Length": "1"})
+    api = TelegramApi(
+        "123456:secret",
+        media_root,
+        requests_client=FakeRequests(get_outcomes=[response]),
+    )
+    destination = media_root / filename
+    assert api.download_file(
+        "documents/file",
+        destination,
+        message_filename=filename,
+        mime_type=mime_type,
+        expected_size=1,
+    ) == destination
+    assert destination.read_bytes() == b"x"
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "limit"),
+    [
+        ("photo.jpg", "image/jpeg", telegram_api_module.TELEGRAM_MAX_IMAGE_BYTES),
+        ("photo.png", "image/png", telegram_api_module.TELEGRAM_MAX_IMAGE_BYTES),
+        ("photo.webp", "image/webp", telegram_api_module.TELEGRAM_MAX_IMAGE_BYTES),
+        ("clip.mp4", "video/mp4", telegram_api_module.TELEGRAM_MAX_VIDEO_BYTES),
+        ("clip.mov", "video/quicktime", telegram_api_module.TELEGRAM_MAX_VIDEO_BYTES),
+        ("clip.m4v", "video/x-m4v", telegram_api_module.TELEGRAM_MAX_VIDEO_BYTES),
+    ],
+)
+def test_download_uses_exact_configured_cap_for_each_media_type(
+    tmp_path,
+    filename,
+    mime_type,
+    limit,
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    accepted_response = FakeResponse(chunks=[b"x"])
+    api = TelegramApi(
+        "123456:secret",
+        media_root,
+        requests_client=FakeRequests(get_outcomes=[accepted_response]),
+    )
+    accepted = media_root / f"accepted-{filename}"
+    assert api.download_file(
+        "documents/file",
+        accepted,
+        message_filename=filename,
+        mime_type=mime_type,
+        expected_size=limit,
+    ) == accepted
+
+    rejected = media_root / f"rejected-{filename}"
+    with pytest.raises(TelegramApiError) as raised:
+        api.download_file(
+            "documents/file",
+            rejected,
+            message_filename=filename,
+            mime_type=mime_type,
+            expected_size=limit + 1,
+        )
+    assert str(raised.value) == (
+        "operation=download method=downloadFile code=file_too_large"
+    )
+    assert not rejected.exists()
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "expected_size", "expected_code"),
+    [
+        ("payload.bin", "application/octet-stream", 1, "invalid_media_metadata"),
+        ("photo.jpg", "image/png", 1, "invalid_media_metadata"),
+        ("photo.jpg", "", 1, "invalid_media_metadata"),
+        ("photo.jpg", "image/jpeg", True, "invalid_media_metadata"),
+        ("photo.jpg", "image/jpeg", 0, "invalid_media_metadata"),
+        (
+            "photo.jpg",
+            "image/jpeg",
+            telegram_api_module.TELEGRAM_MAX_IMAGE_BYTES + 1,
+            "file_too_large",
+        ),
+        (
+            "clip.mp4",
+            "video/mp4",
+            telegram_api_module.TELEGRAM_MAX_VIDEO_BYTES + 1,
+            "file_too_large",
+        ),
+    ],
+)
+def test_download_rejects_unknown_mismatched_or_unbounded_message_metadata(
+    tmp_path,
+    filename,
+    mime_type,
+    expected_size,
+    expected_code,
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    requests_client = FakeRequests(get_outcomes=[FakeResponse(chunks=[b"unused"])])
+    api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
+    with pytest.raises(TelegramApiError) as raised:
+        api.download_file(
+            "documents/file",
+            media_root / filename,
+            message_filename=filename,
+            mime_type=mime_type,
+            expected_size=expected_size,
+        )
+    assert str(raised.value) == (
+        f"operation=download method=downloadFile code={expected_code}"
+    )
+    assert requests_client.gets == []
+
+
+@pytest.mark.parametrize(
+    "content_length",
+    ["9" * 5000, "-1", "5, 5", True, 2**70],
+)
+def test_download_rejects_malformed_content_length_with_cleanup(
+    tmp_path,
+    content_length,
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    destination = media_root / "photo.jpg"
+    response = FakeResponse(
+        chunks=[pytest.fail],
+        headers={"Content-Length": content_length},
+    )
+    api = TelegramApi(
+        "123456:secret",
+        media_root,
+        requests_client=FakeRequests(get_outcomes=[response]),
+    )
+    with pytest.raises(TelegramApiError) as raised:
+        api.download_file(
+            "photos/a.jpg",
+            destination,
+            message_filename="photo.jpg",
+            mime_type="image/jpeg",
+            expected_size=1,
+        )
+    assert str(raised.value) == (
+        "operation=download method=downloadFile code=invalid_content_length"
+    )
+    assert response.close_calls == 1
+    assert not destination.exists()
+
+
 def test_download_requires_explicit_absolute_destination_inside_media_root(tmp_path):
     media_root = tmp_path / "media"
     media_root.mkdir()
@@ -942,9 +1256,21 @@ def test_download_requires_explicit_absolute_destination_inside_media_root(tmp_p
     ])
     api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
     with pytest.raises(ValueError):
-        api.download_file("photos/a.jpg", Path("relative.jpg"))
+        api.download_file(
+            "photos/a.jpg",
+            Path("relative.jpg"),
+            message_filename="relative.jpg",
+            mime_type="image/jpeg",
+            expected_size=1,
+        )
     with pytest.raises(ValueError):
-        api.download_file("photos/a.jpg", tmp_path / "outside.jpg")
+        api.download_file(
+            "photos/a.jpg",
+            tmp_path / "outside.jpg",
+            message_filename="outside.jpg",
+            mime_type="image/jpeg",
+            expected_size=1,
+        )
     assert requests_client.gets == []
 
 
@@ -962,9 +1288,21 @@ def test_download_rejects_symlink_parent_and_existing_destination(tmp_path):
         requests_client=FakeRequests(get_outcomes=[FakeResponse(chunks=[b"unused"])]),
     )
     with pytest.raises(ValueError):
-        api.download_file("photos/a.jpg", media_root / "jump" / "escaped.jpg")
+        api.download_file(
+            "photos/a.jpg",
+            media_root / "jump" / "escaped.jpg",
+            message_filename="escaped.jpg",
+            mime_type="image/jpeg",
+            expected_size=1,
+        )
     with pytest.raises(FileExistsError):
-        api.download_file("photos/a.jpg", existing)
+        api.download_file(
+            "photos/a.jpg",
+            existing,
+            message_filename="existing.jpg",
+            mime_type="image/jpeg",
+            expected_size=1,
+        )
     assert existing.read_bytes() == b"keep"
     assert not (outside / "escaped.jpg").exists()
 
@@ -978,7 +1316,13 @@ def test_download_rejects_parent_symlink_even_when_target_stays_inside_root(tmp_
     requests_client = FakeRequests(get_outcomes=[FakeResponse(chunks=[b"unsafe"])])
     api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
     with pytest.raises(ValueError, match="must not contain symlinks"):
-        api.download_file("photos/a.jpg", media_root / "alias" / "escaped.jpg")
+        api.download_file(
+            "photos/a.jpg",
+            media_root / "alias" / "escaped.jpg",
+            message_filename="escaped.jpg",
+            mime_type="image/jpeg",
+            expected_size=1,
+        )
     assert requests_client.gets == []
     assert not (real_parent / "escaped.jpg").exists()
 
@@ -990,7 +1334,13 @@ def test_download_rejects_dotdot_as_a_lexical_parent_component(tmp_path):
     api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
     destination = media_root / "parent" / ".." / "escaped.jpg"
     with pytest.raises(ValueError, match="Invalid download destination"):
-        api.download_file("photos/a.jpg", destination)
+        api.download_file(
+            "photos/a.jpg",
+            destination,
+            message_filename="escaped.jpg",
+            mime_type="image/jpeg",
+            expected_size=1,
+        )
     assert requests_client.gets == []
     assert not (media_root / "escaped.jpg").exists()
 
@@ -1002,7 +1352,13 @@ def test_download_fails_closed_without_nofollow_support(tmp_path, monkeypatch):
     api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
     monkeypatch.delattr("modules.telegram_api.os.O_NOFOLLOW")
     with pytest.raises(RuntimeError, match="secure_nofollow_unavailable"):
-        api.download_file("photos/a.jpg", media_root / "new.jpg")
+        api.download_file(
+            "photos/a.jpg",
+            media_root / "new.jpg",
+            message_filename="new.jpg",
+            mime_type="image/jpeg",
+            expected_size=1,
+        )
     assert requests_client.gets == []
     assert not (media_root / "new.jpg").exists()
 
@@ -1017,7 +1373,13 @@ def test_download_is_exclusive_and_cleans_partial_file_on_failure(tmp_path):
     ])
     api = TelegramApi(secret, media_root, requests_client=requests_client)
     with pytest.raises(TelegramApiError) as raised:
-        api.download_file("photos/a.jpg", destination)
+        api.download_file(
+            "photos/a.jpg",
+            destination,
+            message_filename="new.jpg",
+            mime_type="image/jpeg",
+            expected_size=7,
+        )
     assert secret not in str(raised.value)
     assert not destination.exists()
 
@@ -1047,7 +1409,13 @@ def test_download_close_failure_cleans_file_and_fds_repeatedly(tmp_path):
         destination = media_root / f"close-{index}.jpg"
         destinations.append(destination)
         with pytest.raises(TelegramApiError) as raised:
-            api.download_file("photos/a.jpg", destination)
+            api.download_file(
+                "photos/a.jpg",
+                destination,
+                message_filename=f"close-{index}.jpg",
+                mime_type="image/jpeg",
+                expected_size=8,
+            )
         errors.append(str(raised.value))
     assert len(os.listdir("/dev/fd")) == fd_count_before
     assert all(not destination.exists() for destination in destinations)
@@ -1077,7 +1445,13 @@ def test_download_enforces_content_length_and_counted_image_limit(
     )
     for name in ("declared.jpg", "streamed.jpg"):
         with pytest.raises(TelegramApiError) as raised:
-            api.download_file("photos/a.jpg", media_root / name)
+            api.download_file(
+                "photos/a.jpg",
+                media_root / name,
+                message_filename=name,
+                mime_type="image/jpeg",
+                expected_size=5,
+            )
         assert str(raised.value) == (
             "operation=download method=downloadFile code=file_too_large"
         )
@@ -1094,7 +1468,13 @@ def test_download_writes_only_to_reserved_destination(tmp_path):
         FakeResponse(chunks=[b"abc", b"", b"def"]),
     ])
     api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
-    assert api.download_file("photos/a.jpg", destination) == destination
+    assert api.download_file(
+        "photos/a.jpg",
+        destination,
+        message_filename="new.jpg",
+        mime_type="image/jpeg",
+        expected_size=6,
+    ) == destination
     assert destination.read_bytes() == b"abcdef"
     url, kwargs = requests_client.gets[0]
     assert url == "https://api.telegram.org/file/bot123456:secret/photos/a.jpg"
