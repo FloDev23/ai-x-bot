@@ -523,6 +523,53 @@ class DraftPipeline:
             return None
         return replacement
 
+    def edit_from_telegram_session(
+        self,
+        draft_id,
+        text,
+        *,
+        state_key: str,
+        expected_state_value: str,
+        session_token: str,
+    ):
+        """Run canonical edit gates, then atomically consume and replace."""
+        prior = self.db.get_post_draft(draft_id)
+        if not prior or prior.get("status") != "pending_approval":
+            return None, "rejected"
+        source_ids = prior.get("source_ids")
+        intended_slot = prior.get("intended_slot")
+        context = self._source_context(
+            category=prior.get("category"),
+            source_ids=source_ids,
+            intended_slot=intended_slot,
+        )
+        if context is None:
+            return None, "rejected"
+        slot_iso, safe_source_ids, sources = context
+        prepared = self._validate_copy(
+            text=text,
+            category=prior.get("category"),
+            safe_source_ids=safe_source_ids,
+            sources=sources,
+            slot_iso=slot_iso,
+            exclude_draft_id=draft_id,
+        )
+        if prepared is None:
+            return None, "rejected"
+        replacement, outcome = self.db.replace_post_draft_consuming_state_atomic(
+            state_key=state_key,
+            expected_state_value=expected_state_value,
+            prior_draft_id=draft_id,
+            expected_revision=prior.get("revision", 0),
+            expected_slot=intended_slot,
+            expected_category=prior.get("category"),
+            expected_source_ids=source_ids,
+            text=prepared.text,
+            score_data=prepared.score_data,
+            publication_key="telegram-edit:" + session_token,
+        )
+        return replacement, outcome
+
     def approve(self, draft_id, approved_by) -> bool:
         draft = self.db.get_post_draft(draft_id)
         if not draft or draft.get("status") != "pending_approval":
@@ -558,6 +605,33 @@ class DraftPipeline:
             draft.get("revision", 0),
             ["pending_approval", "approved", "expired"],
             slot_iso,
+        )
+
+    def postpone_from_telegram_session(
+        self,
+        draft_id,
+        new_slot,
+        *,
+        state_key: str,
+        expected_state_value: str,
+    ) -> str:
+        """Atomically consume a Telegram session with draft postponement."""
+        draft = self.db.get_post_draft(draft_id)
+        if not draft or draft.get("status") not in {
+            "pending_approval", "approved", "expired",
+        }:
+            return "draft_conflict"
+        slot = _aware_datetime(new_slot)
+        now = _aware_datetime(self.now_fn())
+        if slot is None or now is None or slot <= now:
+            return "draft_conflict"
+        return self.db.postpone_post_draft_consuming_state_atomic(
+            state_key=state_key,
+            expected_state_value=expected_state_value,
+            draft_id=draft_id,
+            expected_revision=draft.get("revision", 0),
+            expected_statuses=["pending_approval", "approved", "expired"],
+            new_slot=slot.isoformat(),
         )
 
     def discard(self, draft_id, reason) -> bool:

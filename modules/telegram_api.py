@@ -6,7 +6,7 @@ import os
 import re
 import threading
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, BinaryIO, Dict, Optional, Sequence
 from urllib.parse import quote
 
 import requests
@@ -621,7 +621,7 @@ class TelegramApi:
     def send_media(
         self,
         chat_id: str,
-        media_path: os.PathLike | str,
+        media: BinaryIO | os.PathLike | str,
         media_type: str,
         *,
         caption: Optional[str] = None,
@@ -644,13 +644,19 @@ class TelegramApi:
         _validate_reply_markup(reply_markup)
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        with Path(media_path).open("rb") as media_file:
+        def send(media_file: BinaryIO):
             return self._post(
                 method,
                 payload,
                 timeout=REQUEST_TIMEOUT,
                 files={field: media_file},
             )
+        if isinstance(media, (str, os.PathLike)):
+            with Path(media).open("rb") as media_file:
+                return send(media_file)
+        if not callable(getattr(media, "read", None)):
+            raise TypeError("media must be a path or binary stream")
+        return send(media)
 
     def get_file(self, file_id: str) -> Dict[str, Any]:
         result = self._post(

@@ -70,6 +70,29 @@ _PUBLICATION_MEDIA_IDENTITY_COLUMNS = (
     "file_size",
     "file_sha256",
 )
+_PREVIEW_DRAFT_SNAPSHOT_COLUMNS = (
+    "id",
+    "revision",
+    "status",
+    "media_id",
+    "published_tweet_id",
+)
+_PREVIEW_MEDIA_SNAPSHOT_COLUMNS = (
+    "id",
+    "filename",
+    "filepath",
+    "media_type",
+    "mime_type",
+    "file_device",
+    "file_inode",
+    "file_size",
+    "file_sha256",
+    "lifecycle_state",
+    "reserved_by_draft_id",
+    "file_deleted",
+    "used",
+    "used_in_tweet_id",
+)
 
 
 @dataclass(frozen=True)
@@ -677,6 +700,30 @@ class Database:
         verified_by: Optional[str] = None,
         verified_at: Optional[str] = None,
     ) -> int:
+        with self._conn() as conn:
+            return self._insert_content_source_in_conn(
+                conn,
+                source_type=source_type,
+                text=text,
+                url=url,
+                metadata=metadata,
+                trust_state=trust_state,
+                verified_by=verified_by,
+                verified_at=verified_at,
+            )
+
+    def _insert_content_source_in_conn(
+        self,
+        conn,
+        *,
+        source_type: str,
+        text: str,
+        url: Optional[str],
+        metadata: Optional[Dict],
+        trust_state: str,
+        verified_by: Optional[str],
+        verified_at: Optional[str],
+    ) -> int:
         now = self._now_iso()
         effective_trust = trust_state
         effective_verified_at = verified_at
@@ -688,28 +735,65 @@ class Database:
             elif effective_trust == "verified":
                 effective_verified_at = effective_verified_at or now
                 expires_at = (
-                    datetime.fromisoformat(effective_verified_at) + timedelta(days=90)
+                    datetime.fromisoformat(effective_verified_at)
+                    + timedelta(days=90)
                 ).isoformat()
+        cursor = conn.execute("""
+            INSERT INTO content_sources (
+                source_type, text, url, metadata_json, trust_state,
+                verified_by, verified_at, expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            source_type,
+            text,
+            url,
+            json.dumps(metadata or {}),
+            effective_trust,
+            verified_by,
+            effective_verified_at,
+            expires_at,
+            now,
+            now,
+        ))
+        return cursor.lastrowid
 
+    def add_content_source_consuming_state_atomic(
+        self,
+        *,
+        state_key: str,
+        expected_state_value: str,
+        source_type: str,
+        text: str,
+        url: Optional[str] = None,
+        metadata: Optional[Dict] = None,
+        trust_state: str = "verified",
+        verified_by: Optional[str] = None,
+        verified_at: Optional[str] = None,
+    ) -> Tuple[Optional[int], str]:
+        """Consume one exact Telegram session with its source insertion."""
         with self._conn() as conn:
-            cursor = conn.execute("""
-                INSERT INTO content_sources (
-                    source_type, text, url, metadata_json, trust_state,
-                    verified_by, verified_at, expires_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                source_type,
-                text,
-                url,
-                json.dumps(metadata or {}),
-                effective_trust,
-                verified_by,
-                effective_verified_at,
-                expires_at,
-                now,
-                now,
-            ))
-            return cursor.lastrowid
+            conn.execute("BEGIN IMMEDIATE")
+            consumed = conn.execute(
+                "DELETE FROM bot_state WHERE key = ? AND value = ?",
+                (state_key, expected_state_value),
+            )
+            if consumed.rowcount != 1:
+                return None, "session_conflict"
+            if url and conn.execute(
+                "SELECT 1 FROM content_sources WHERE url = ? LIMIT 1", (url,)
+            ).fetchone():
+                return None, "duplicate"
+            source_id = self._insert_content_source_in_conn(
+                conn,
+                source_type=source_type,
+                text=text,
+                url=url,
+                metadata=metadata,
+                trust_state=trust_state,
+                verified_by=verified_by,
+                verified_at=verified_at,
+            )
+            return source_id, "created"
 
     def get_content_source(self, source_id: int) -> Optional[Dict]:
         with self._conn() as conn:
@@ -874,7 +958,7 @@ class Database:
         score_data: Dict,
         intended_slot: str,
         publication_key: str,
-    ):
+    ) -> Tuple[Optional[Dict], str]:
         """Atomically claim a live slot, returning ``(draft, outcome)``."""
         intended_slot = self._normalize_datetime_iso(intended_slot)
         now = self._now_iso()
@@ -1175,6 +1259,69 @@ class Database:
         except sqlite3.IntegrityError:
             return False
 
+    def postpone_post_draft_consuming_state_atomic(
+        self,
+        *,
+        state_key: str,
+        expected_state_value: str,
+        draft_id: int,
+        expected_revision: int,
+        expected_statuses: List[str],
+        new_slot: str,
+    ) -> str:
+        """Consume one exact Telegram session with one draft postponement."""
+        if not expected_statuses:
+            return "draft_conflict"
+        new_slot = self._normalize_datetime_iso(new_slot)
+        placeholders = ", ".join("?" for _ in expected_statuses)
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            consumed = conn.execute(
+                "DELETE FROM bot_state WHERE key = ? AND value = ?",
+                (state_key, expected_state_value),
+            )
+            if consumed.rowcount != 1:
+                return "session_conflict"
+            current = conn.execute(
+                "SELECT status, revision FROM post_drafts WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            if (
+                current is None
+                or current["revision"] != expected_revision
+                or current["status"] not in expected_statuses
+            ):
+                conn.rollback()
+                return "draft_conflict"
+            occupied = conn.execute(
+                "SELECT id FROM post_drafts WHERE intended_slot = ? "
+                "AND id != ? AND status IN ("
+                + _LIVE_DRAFT_STATUS_SQL
+                + ") LIMIT 1",
+                (new_slot, draft_id),
+            ).fetchone()
+            if occupied:
+                conn.rollback()
+                return "slot_conflict"
+            cursor = conn.execute(
+                "UPDATE post_drafts SET status = 'pending_approval', "
+                "intended_slot = ?, approved_at = NULL, "
+                "approved_by = NULL, updated_at = ?, "
+                "revision = revision + 1 WHERE id = ? AND revision = ? "
+                "AND status IN (" + placeholders + ")",
+                [
+                    new_slot,
+                    self._now_iso(),
+                    draft_id,
+                    expected_revision,
+                    *expected_statuses,
+                ],
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return "draft_conflict"
+            return "postponed"
+
     def approve_post_draft_atomic(
         self,
         draft_id: int,
@@ -1254,7 +1401,7 @@ class Database:
         text: str,
         score_data: Dict,
         publication_key: str,
-    ):
+    ) -> Tuple[Optional[Dict], str]:
         """Supersede and replace one exact draft in a single transaction."""
         expected_slot = self._normalize_datetime_iso(expected_slot)
         now = self._now_iso()
@@ -1328,6 +1475,162 @@ class Database:
                 "SELECT * FROM post_drafts WHERE id = ?", (replacement_id,)
             ).fetchone()
             return self._decode_post_draft(row), "created"
+
+    def replace_post_draft_consuming_state_atomic(
+        self,
+        *,
+        state_key: str,
+        expected_state_value: str,
+        prior_draft_id: int,
+        expected_revision: int,
+        expected_slot: str,
+        expected_category: str,
+        expected_source_ids: List[int],
+        text: str,
+        score_data: Dict,
+        publication_key: str,
+    ):
+        """Consume one exact Telegram session with one draft replacement."""
+        expected_slot = self._normalize_datetime_iso(expected_slot)
+        now = self._now_iso()
+        with self._media_store_mutation_lock(
+            "draft_reservations", prior_draft_id,
+        ) as conn:
+            consumed = conn.execute(
+                "DELETE FROM bot_state WHERE key = ? AND value = ?",
+                (state_key, expected_state_value),
+            )
+            if consumed.rowcount != 1:
+                existing = conn.execute(
+                    "SELECT * FROM post_drafts WHERE publication_key = ?",
+                    (publication_key,),
+                ).fetchone()
+                if existing and self._telegram_edit_retry_matches_in_conn(
+                    conn,
+                    existing=existing,
+                    prior_draft_id=prior_draft_id,
+                    text=text,
+                    score_data=score_data,
+                    expected_slot=expected_slot,
+                    expected_category=expected_category,
+                    expected_source_ids=expected_source_ids,
+                ):
+                    return self._decode_post_draft(existing), "already_applied"
+                return None, "session_conflict"
+            prior = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (prior_draft_id,)
+            ).fetchone()
+            prior_source_ids = (
+                json.loads(prior["source_ids_json"]) if prior else None
+            )
+            if (
+                prior is None
+                or prior["revision"] != expected_revision
+                or prior["status"] != "pending_approval"
+                or prior["intended_slot"] != expected_slot
+                or prior["category"] != expected_category
+                or prior_source_ids != expected_source_ids
+            ):
+                conn.rollback()
+                return None, "conflict"
+            if not self._eligible_content_sources_in_conn(
+                conn, expected_source_ids
+            ):
+                conn.rollback()
+                return None, "no_eligible_source"
+            cursor = conn.execute(
+                "UPDATE post_drafts SET status = 'superseded', updated_at = ?, "
+                "revision = revision + 1 WHERE id = ? AND revision = ? "
+                "AND intended_slot = ? AND status = 'pending_approval'",
+                (now, prior_draft_id, expected_revision, expected_slot),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return None, "conflict"
+            replacement = conn.execute("""
+                INSERT INTO post_drafts (
+                    publication_key, text, category, source_ids_json,
+                    score_json, intended_slot, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                publication_key,
+                text,
+                expected_category,
+                json.dumps(expected_source_ids),
+                json.dumps(score_data),
+                expected_slot,
+                now,
+                now,
+            ))
+            replacement_id = replacement.lastrowid
+            self._insert_draft_evaluation_in_conn(
+                conn,
+                expected_slot,
+                expected_category,
+                "pending_approval",
+                {
+                    "draft_id": replacement_id,
+                    "source_ids": expected_source_ids,
+                    "scores": score_data,
+                    "supersedes_draft_id": prior_draft_id,
+                },
+                now,
+            )
+            conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                WHERE reserved_by_draft_id = ? AND lifecycle_state = 'reserved'
+            """, (prior_draft_id,))
+            row = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (replacement_id,)
+            ).fetchone()
+            return self._decode_post_draft(row), "created"
+
+    @staticmethod
+    def _telegram_edit_retry_matches_in_conn(
+        conn,
+        *,
+        existing,
+        prior_draft_id: int,
+        text: str,
+        score_data: Dict,
+        expected_slot: str,
+        expected_category: str,
+        expected_source_ids: List[int],
+    ) -> bool:
+        try:
+            sources_match = json.loads(existing["source_ids_json"]) == expected_source_ids
+            score_matches = json.loads(existing["score_json"]) == score_data
+        except (TypeError, ValueError):
+            return False
+        if not (
+            existing["text"] == text
+            and existing["category"] == expected_category
+            and existing["intended_slot"] == expected_slot
+            and sources_match
+            and score_matches
+        ):
+            return False
+        audits = conn.execute(
+            "SELECT details_json FROM draft_evaluations "
+            "WHERE intended_slot = ? AND category = ? "
+            "AND outcome = 'pending_approval' ORDER BY id DESC",
+            (expected_slot, expected_category),
+        ).fetchall()
+        for audit in audits:
+            try:
+                details = json.loads(audit["details_json"])
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(details, dict)
+                and details.get("draft_id") == existing["id"]
+                and details.get("supersedes_draft_id") == prior_draft_id
+                and details.get("source_ids") == expected_source_ids
+                and details.get("scores") == score_data
+            ):
+                return True
+        return False
 
     def claim_post_draft_for_publication(
         self,
@@ -1403,6 +1706,69 @@ class Database:
                 and self._publication_media_matches_in_conn(
                     conn, claim, expected_media,
                 )
+            )
+
+    def validate_post_draft_preview_media(
+        self,
+        expected_draft: Mapping,
+        expected_media: Mapping,
+    ) -> bool:
+        """Revalidate one preview binding under the caller's media lease."""
+        if not isinstance(expected_draft, Mapping) or not isinstance(
+            expected_media, Mapping,
+        ):
+            return False
+        draft_id = expected_draft.get("id")
+        media_id = expected_media.get("id")
+        if type(draft_id) is not int or type(media_id) is not int:
+            return False
+        try:
+            expected_draft_values = tuple(
+                expected_draft[column]
+                for column in _PREVIEW_DRAFT_SNAPSHOT_COLUMNS
+            )
+            expected_media_values = tuple(
+                expected_media[column]
+                for column in _PREVIEW_MEDIA_SNAPSHOT_COLUMNS
+            )
+        except (KeyError, TypeError):
+            return False
+        status = expected_draft.get("status")
+        if status == "published":
+            tweet_id = expected_draft.get("published_tweet_id")
+            binding_valid = (
+                isinstance(tweet_id, str)
+                and bool(tweet_id)
+                and expected_media.get("lifecycle_state") == "used"
+                and expected_media.get("used_in_tweet_id") == tweet_id
+            )
+        else:
+            binding_valid = (
+                status in {"pending_approval", "approved", "publishing"}
+                and expected_media.get("lifecycle_state") == "reserved"
+                and expected_media.get("reserved_by_draft_id") == draft_id
+            )
+        if not binding_valid or expected_draft.get("media_id") != media_id:
+            return False
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current_draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_id,),
+            ).fetchone()
+            current_media = conn.execute(
+                "SELECT * FROM media_library WHERE id = ?", (media_id,),
+            ).fetchone()
+            return (
+                current_draft is not None
+                and current_media is not None
+                and tuple(
+                    current_draft[column]
+                    for column in _PREVIEW_DRAFT_SNAPSHOT_COLUMNS
+                ) == expected_draft_values
+                and tuple(
+                    current_media[column]
+                    for column in _PREVIEW_MEDIA_SNAPSHOT_COLUMNS
+                ) == expected_media_values
             )
 
     def transition_post_draft(

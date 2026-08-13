@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from config import DRY_RUN, NEWS_TRUSTED_DOMAINS
+from modules.media_store import open_verified_media
 from modules.telegram_api import (
     TELEGRAM_CAPTION_MAX_CHARS,
     TELEGRAM_CALLBACK_DATA_MAX_BYTES,
@@ -47,6 +48,10 @@ _GROWTH_REASONS = {
 _SAFE_USERNAME = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 _SAFE_CALLBACK_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,4096}$")
+_PREVIEW_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+_PREVIEW_VIDEO_MIME_TYPES = frozenset({
+    "video/mp4", "video/quicktime", "video/x-m4v",
+})
 
 
 class TelegramController:
@@ -360,7 +365,69 @@ class TelegramController:
     def _send_draft_card(self, chat_id: str, draft: Dict[str, Any]):
         draft_id = draft.get("id")
         markup = self._draft_markup(draft_id) if type(draft_id) is int else None
+        self._send_draft_preview(chat_id, draft)
         self._send(chat_id, self._draft_card_text(draft), reply_markup=markup)
+
+    @staticmethod
+    def _draft_preview_type(media: Dict[str, Any]) -> Optional[str]:
+        media_type = media.get("media_type")
+        mime_type = media.get("mime_type")
+        filename = media.get("filename")
+        if not isinstance(filename, str):
+            return None
+        was_document = filename.startswith("telegram-document-")
+        if (
+            media_type in {"image", "photo"}
+            and mime_type in _PREVIEW_IMAGE_MIME_TYPES
+        ):
+            return "document" if was_document else "photo"
+        if media_type == "video" and mime_type in _PREVIEW_VIDEO_MIME_TYPES:
+            return "document" if was_document else "video"
+        if (
+            media_type == "document"
+            and was_document
+            and mime_type in _PREVIEW_IMAGE_MIME_TYPES | _PREVIEW_VIDEO_MIME_TYPES
+        ):
+            return "document"
+        return None
+
+    def _send_draft_preview(self, chat_id: str, draft: Dict[str, Any]) -> bool:
+        draft_id = draft.get("id")
+        media_id = draft.get("media_id")
+        if type(draft_id) is not int or type(media_id) is not int:
+            return False
+        media = self.db.get_media_by_id(media_id)
+        if not isinstance(media, dict) or media.get("id") != media_id:
+            return False
+        status = draft.get("status")
+        lifecycle = media.get("lifecycle_state")
+        if status == "published":
+            tweet_id = draft.get("published_tweet_id")
+            if (
+                lifecycle != "used"
+                or not isinstance(tweet_id, str)
+                or not tweet_id
+                or media.get("used_in_tweet_id") != tweet_id
+            ):
+                return False
+        elif lifecycle != "reserved" or media.get("reserved_by_draft_id") != draft_id:
+            return False
+        preview_type = self._draft_preview_type(media)
+        if preview_type is None:
+            return False
+        try:
+            with open_verified_media(media) as media_file:
+                if not self.db.validate_post_draft_preview_media(draft, media):
+                    return False
+                self.telegram_api.send_media(
+                    chat_id,
+                    media_file,
+                    preview_type,
+                    caption=f"Anteprima media bozza #{draft_id}",
+                )
+        except (OSError, RuntimeError, TelegramApiError, TypeError, ValueError):
+            return False
+        return True
 
     def _posts(self, chat_id: str):
         pending = self.db.list_post_drafts(["pending_approval"], limit=50)
@@ -725,39 +792,48 @@ class TelegramController:
                 if not source_name or len(clean) > 120:
                     self._send(chat_id, "Nome fonte non valido: massimo 120 caratteri.")
                     return "invalid_news_source"
-                if not self._consume_session(chat_id, raw):
-                    self._send(chat_id, "Operazione già gestita.")
-                    return "session_conflict"
-                if self.db.content_source_exists(payload["url"]):
-                    self._send(chat_id, "Questa fonte è già presente.")
-                    return "duplicate_source"
                 summary = payload["text"]
                 title = self._clean_text(summary.splitlines()[0], 200)
-                self.db.add_content_source(
-                    source_type="verified_news",
-                    text=summary,
-                    url=payload["url"],
-                    metadata={
-                        "title": title,
-                        "summary": summary,
-                        "published_at": payload["published_at"],
-                        "source_name": source_name,
-                    },
-                    trust_state="verified",
-                    verified_by="floriano",
+                _source_id, outcome = (
+                    self.db.add_content_source_consuming_state_atomic(
+                        state_key=self._session_key(chat_id),
+                        expected_state_value=raw,
+                        source_type="verified_news",
+                        text=summary,
+                        url=payload["url"],
+                        metadata={
+                            "title": title,
+                            "summary": summary,
+                            "published_at": payload["published_at"],
+                            "source_name": source_name,
+                        },
+                        trust_state="verified",
+                        verified_by="floriano",
+                    )
                 )
+                if outcome == "session_conflict":
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                if outcome == "duplicate":
+                    self._send(chat_id, "Questa fonte è già presente.")
+                    return "duplicate_source"
                 self._send(chat_id, "News verificata salvata.")
                 return "source_saved"
 
         if kind == "draft_edit" and step == "text":
             if self.draft_pipeline is None:
-                self._consume_session(chat_id, raw)
                 self._send(chat_id, "Pipeline bozze non disponibile.")
                 return "draft_unavailable"
-            if not self._consume_session(chat_id, raw):
+            replacement, outcome = self.draft_pipeline.edit_from_telegram_session(
+                payload["draft_id"],
+                clean,
+                state_key=self._session_key(chat_id),
+                expected_state_value=raw,
+                session_token=session["token"],
+            )
+            if outcome == "session_conflict":
                 self._send(chat_id, "Operazione già gestita.")
                 return "session_conflict"
-            replacement = self.draft_pipeline.edit(payload["draft_id"], clean)
             if not isinstance(replacement, dict):
                 self._send(chat_id, "Modifica respinta dai controlli editoriali.")
                 return "draft_edit_rejected"
@@ -774,14 +850,19 @@ class TelegramController:
                 self._send(chat_id, "Slot non valido: usa ISO 8601 con fuso e data futura.")
                 return "invalid_slot"
             if self.draft_pipeline is None:
-                self._consume_session(chat_id, raw)
                 self._send(chat_id, "Pipeline bozze non disponibile.")
                 return "draft_unavailable"
-            if not self._consume_session(chat_id, raw):
+            normalized = slot.isoformat()
+            outcome = self.draft_pipeline.postpone_from_telegram_session(
+                payload["draft_id"],
+                normalized,
+                state_key=self._session_key(chat_id),
+                expected_state_value=raw,
+            )
+            if outcome == "session_conflict":
                 self._send(chat_id, "Operazione già gestita.")
                 return "session_conflict"
-            normalized = slot.isoformat()
-            if not self.draft_pipeline.postpone(payload["draft_id"], normalized):
+            if outcome != "postponed":
                 self._send(chat_id, "Riprogrammazione non riuscita.")
                 return "draft_postpone_rejected"
             self._send(chat_id, "Bozza riprogrammata; serve una nuova approvazione.")
@@ -937,15 +1018,17 @@ class TelegramController:
                 return "session_conflict"
             self._send(chat_id, "Inserisci l'URL HTTPS allowlisted dell'articolo.")
             return "news_url"
-        if not self._consume_session(chat_id, raw):
-            self._send(chat_id, "Operazione già gestita.")
-            return "session_conflict"
-        self.db.add_content_source(
+        _source_id, outcome = self.db.add_content_source_consuming_state_atomic(
+            state_key=self._session_key(chat_id),
+            expected_state_value=raw,
             source_type=source_type,
             text=text,
             trust_state="verified",
             verified_by="floriano",
         )
+        if outcome == "session_conflict":
+            self._send(chat_id, "Operazione già gestita.")
+            return "session_conflict"
         self._send(chat_id, f"{_SOURCE_TYPES[source_type]} salvata.")
         return "source_saved"
 

@@ -1,5 +1,6 @@
 import logging
 import os
+import io
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -959,6 +960,20 @@ def test_send_media_uses_bounded_multipart_request(tmp_path):
     assert kwargs["data"] == {"chat_id": "42", "caption": "real studio"}
     assert set(kwargs["files"]) == {"photo"}
     assert kwargs["timeout"] == REQUEST_TIMEOUT
+
+
+def test_send_media_accepts_caller_owned_verified_stream_without_closing(tmp_path):
+    media_stream = io.BytesIO(b"verified-jpeg")
+    requests_client = FakeRequests(post_outcomes=[
+        FakeResponse({"ok": True, "result": {"message_id": 3}})
+    ])
+    api = TelegramApi("123456:secret", tmp_path, requests_client=requests_client)
+
+    assert api.send_media("42", media_stream, "document")["message_id"] == 3
+
+    _url, kwargs = requests_client.posts[0]
+    assert kwargs["files"]["document"] is media_stream
+    assert not media_stream.closed
 
 
 @pytest.mark.parametrize(

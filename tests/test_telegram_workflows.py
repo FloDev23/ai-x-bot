@@ -1,13 +1,18 @@
 import json
 import inspect
+import sqlite3
+import subprocess
+import sys
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from modules.database import Database
 from modules.draft_pipeline import DraftPipeline
 from modules.fact_guard import FactCheckResult
-from modules.telegram_api import TelegramApi
+from modules.media_processor import MediaProcessor
+from modules.telegram_api import TelegramApi, telegram_media_metadata
 from modules.telegram_controller import TelegramController
 
 
@@ -53,14 +58,26 @@ class WorkflowTelegramApi:
     def __init__(self, media_library_dir):
         self.media_library_dir = Path(media_library_dir)
         self.messages = []
+        self.media_messages = []
         self.callback_answers = []
+        self.events = []
 
     def send_message(self, chat_id, text, **kwargs):
         self.messages.append((str(chat_id), text, kwargs))
+        self.events.append(("message", str(chat_id), text, kwargs))
         return {"message_id": len(self.messages)}
+
+    def send_media(self, chat_id, media, media_type, **kwargs):
+        if isinstance(media, (str, Path)):
+            raise AssertionError("draft previews must use a verified open stream")
+        content = media.read()
+        self.media_messages.append((str(chat_id), content, media_type, kwargs))
+        self.events.append(("media", str(chat_id), content, media_type, kwargs))
+        return {"message_id": len(self.events)}
 
     def answer_callback(self, callback_id, **kwargs):
         self.callback_answers.append((callback_id, kwargs))
+        self.events.append(("callback", callback_id, kwargs))
         return True
 
 
@@ -91,9 +108,25 @@ class StubPipeline:
         self.calls.append(("edit", draft_id, text))
         return self.db.get_post_draft(draft_id)
 
+    def edit_from_telegram_session(
+        self, draft_id, text, *, state_key, expected_state_value, session_token,
+    ):
+        del session_token
+        if not self.db.compare_and_clear_state(state_key, expected_state_value):
+            return None, "session_conflict"
+        return self.edit(draft_id, text), "created"
+
     def postpone(self, draft_id, slot):
         self.calls.append(("postpone", draft_id, slot))
         return True
+
+    def postpone_from_telegram_session(
+        self, draft_id, slot, *, state_key, expected_state_value,
+    ):
+        if not self.db.compare_and_clear_state(state_key, expected_state_value):
+            return "session_conflict"
+        self.postpone(draft_id, slot)
+        return "postponed"
 
     def discard(self, draft_id, reason):
         self.calls.append(("discard", draft_id, reason))
@@ -184,6 +217,45 @@ def add_pending_draft(db, *, slot=FUTURE_SLOT, text="Old pending copy"):
     return source_id, draft_id
 
 
+_PREVIEW_JPEG = b"\xff\xd8\xff\xe0" + b"telegram-preview"
+_PREVIEW_MP4 = (
+    b"\x00\x00\x00\x14ftypisom\x00\x00\x00\x00mp42" + b"telegram-preview"
+)
+_PREVIEW_DOCUMENT_FILENAME = telegram_media_metadata({
+    "document": {
+        "file_id": "document-file-id",
+        "file_unique_id": "document-unique-id",
+        "file_name": "preview.jpg",
+        "mime_type": "image/jpeg",
+        "file_size": len(_PREVIEW_JPEG),
+    },
+})["message_filename"]
+
+
+def attach_verified_preview(
+    db,
+    tmp_path,
+    draft_id,
+    *,
+    content=_PREVIEW_JPEG,
+    filename="photo-preview.jpg",
+    mime_type="image/jpeg",
+):
+    media_root = tmp_path / f"media-{draft_id}"
+    media_root.mkdir(mode=0o700)
+    staged = media_root / ("staged" + Path(filename).suffix)
+    staged.write_bytes(content)
+    record = MediaProcessor(db).process_new_file(
+        str(staged),
+        filename,
+        mime_type,
+        len(content),
+        "Real studio",
+    )
+    assert db.attach_media_to_draft(record["id"], draft_id)
+    return record
+
+
 def test_session_compare_clear_survives_restart_and_has_one_thread_winner(tmp_path):
     path = str(tmp_path / "sessions.db")
     first = Database(path)
@@ -214,6 +286,483 @@ def test_session_compare_clear_survives_restart_and_has_one_thread_winner(tmp_pa
 
     assert sorted(outcomes) == [False, True]
     assert Database(path).get_state(key) is None
+
+
+def _session_json(kind, step, payload):
+    return json.dumps({
+        "version": 1,
+        "token": "atomic-session-token",
+        "kind": kind,
+        "step": step,
+        "payload": payload,
+        "expires_at": "2030-08-15T12:30:00+00:00",
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def test_terminal_source_failure_rolls_back_exact_session_and_insert(tmp_path):
+    db = Database(str(tmp_path / "source-atomic.db"))
+    key = "telegram_session:42"
+    raw = _session_json(
+        "source_intake",
+        "news_source",
+        {
+            "text": "Grounded report",
+            "url": "https://news.example/report",
+            "published_at": "2029-08-14",
+        },
+    )
+    db.set_state(key, raw)
+    with db._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_terminal_source
+            BEFORE INSERT ON content_sources
+            BEGIN SELECT RAISE(ABORT, 'injected source failure'); END
+        """)
+
+    try:
+        db.add_content_source_consuming_state_atomic(
+            state_key=key,
+            expected_state_value=raw,
+            source_type="verified_news",
+            text="Grounded report",
+            url="https://news.example/report",
+            metadata={
+                "title": "Grounded report",
+                "summary": "Grounded report",
+                "published_at": "2029-08-14",
+                "source_name": "News Example",
+            },
+            trust_state="verified",
+            verified_by="floriano",
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("injected SQLite failure did not propagate")
+
+    assert Database(db.db_path).get_state(key) == raw
+    assert Database(db.db_path).get_eligible_sources("verified_news") == []
+
+
+def test_non_news_terminal_failure_rolls_back_exact_session_and_insert(tmp_path):
+    db = Database(str(tmp_path / "non-news-atomic.db"))
+    key = "telegram_session:42"
+    raw = _session_json(
+        "source_intake", "classification", {"text": "Founder fact"},
+    )
+    db.set_state(key, raw)
+    with db._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_terminal_non_news
+            BEFORE INSERT ON content_sources
+            BEGIN SELECT RAISE(ABORT, 'injected non-news failure'); END
+        """)
+
+    try:
+        db.add_content_source_consuming_state_atomic(
+            state_key=key,
+            expected_state_value=raw,
+            source_type="founder_note",
+            text="Founder fact",
+            trust_state="verified",
+            verified_by="floriano",
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("injected SQLite failure did not propagate")
+
+    assert Database(db.db_path).get_state(key) == raw
+    assert Database(db.db_path).get_eligible_sources("founder_note") == []
+
+
+def test_postpone_terminal_failure_rolls_back_session_slot_and_revision(tmp_path):
+    db = Database(str(tmp_path / "postpone-atomic.db"))
+    _source_id, draft_id = add_pending_draft(db)
+    prior = db.get_post_draft(draft_id)
+    key = "telegram_session:42"
+    raw = _session_json("draft_postpone", "slot", {"draft_id": draft_id})
+    db.set_state(key, raw)
+    with db._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_terminal_postpone
+            BEFORE UPDATE OF intended_slot ON post_drafts
+            BEGIN SELECT RAISE(ABORT, 'injected postpone failure'); END
+        """)
+
+    try:
+        db.postpone_post_draft_consuming_state_atomic(
+            state_key=key,
+            expected_state_value=raw,
+            draft_id=draft_id,
+            expected_revision=prior["revision"],
+            expected_statuses=["pending_approval"],
+            new_slot="2030-08-17T12:00:00+00:00",
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("injected SQLite failure did not propagate")
+
+    recovered = Database(db.db_path)
+    assert recovered.get_state(key) == raw
+    current = recovered.get_post_draft(draft_id)
+    assert current["intended_slot"] == prior["intended_slot"]
+    assert current["revision"] == prior["revision"]
+
+
+def test_edit_terminal_failure_rolls_back_session_and_replacement(tmp_path):
+    db = Database(str(tmp_path / "edit-atomic.db"))
+    source_id, draft_id = add_pending_draft(db)
+    prior = db.get_post_draft(draft_id)
+    key = "telegram_session:42"
+    raw = _session_json("draft_edit", "text", {"draft_id": draft_id})
+    db.set_state(key, raw)
+    with db._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_terminal_edit
+            BEFORE INSERT ON post_drafts
+            WHEN NEW.publication_key = 'telegram-edit:atomic-session-token'
+            BEGIN SELECT RAISE(ABORT, 'injected edit failure'); END
+        """)
+
+    try:
+        db.replace_post_draft_consuming_state_atomic(
+            state_key=key,
+            expected_state_value=raw,
+            prior_draft_id=draft_id,
+            expected_revision=prior["revision"],
+            expected_slot=prior["intended_slot"],
+            expected_category=prior["category"],
+            expected_source_ids=[source_id],
+            text="Edited copy",
+            score_data={"total": 90},
+            publication_key="telegram-edit:atomic-session-token",
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("injected SQLite failure did not propagate")
+
+    recovered = Database(db.db_path)
+    assert recovered.get_state(key) == raw
+    assert recovered.get_post_draft(draft_id)["status"] == "pending_approval"
+    assert len(recovered.list_post_drafts()) == 1
+
+
+def test_concurrent_terminal_source_session_has_one_business_winner(tmp_path):
+    path = str(tmp_path / "atomic-winner.db")
+    key = "telegram_session:42"
+    raw = _session_json(
+        "source_intake", "classification", {"text": "One winner"},
+    )
+    Database(path).set_state(key, raw)
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def save_source():
+        local = Database(path)
+        barrier.wait()
+        outcomes.append(local.add_content_source_consuming_state_atomic(
+            state_key=key,
+            expected_state_value=raw,
+            source_type="founder_note",
+            text="One winner",
+            trust_state="verified",
+            verified_by="floriano",
+        )[1])
+
+    threads = [threading.Thread(target=save_source) for _index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["created", "session_conflict"]
+    assert len(Database(path).get_eligible_sources("founder_note")) == 1
+    assert Database(path).get_state(key) is None
+
+
+def test_terminal_source_hard_crash_rolls_back_then_replays_once(tmp_path):
+    path = str(tmp_path / "source-hard-crash.db")
+    key = "telegram_session:42"
+    raw = _session_json(
+        "source_intake", "classification", {"text": "Crash safe insight"},
+    )
+    Database(path).set_state(key, raw)
+    script = """
+import os
+import sys
+from modules.database import Database
+
+db = Database(sys.argv[1])
+original = db._insert_content_source_in_conn
+def insert_then_crash(conn, **values):
+    original(conn, **values)
+    os._exit(91)
+db._insert_content_source_in_conn = insert_then_crash
+db.add_content_source_consuming_state_atomic(
+    state_key=sys.argv[2],
+    expected_state_value=sys.argv[3],
+    source_type='founder_note',
+    text='Crash safe insight',
+    trust_state='verified',
+    verified_by='floriano',
+)
+"""
+
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, path, key, raw],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        check=False,
+    )
+
+    assert crashed.returncode == 91
+    recovered = Database(path)
+    assert recovered.get_state(key) == raw
+    assert recovered.get_eligible_sources("founder_note") == []
+    source_id, outcome = recovered.add_content_source_consuming_state_atomic(
+        state_key=key,
+        expected_state_value=raw,
+        source_type="founder_note",
+        text="Crash safe insight",
+        trust_state="verified",
+        verified_by="floriano",
+    )
+    assert type(source_id) is int
+    assert outcome == "created"
+    assert recovered.get_state(key) is None
+    assert len(recovered.get_eligible_sources("founder_note")) == 1
+
+
+def test_applied_commit_ambiguity_keeps_one_effect_and_consumed_session(tmp_path):
+    class CommitAmbiguityDatabase(Database):
+        _raise_after_commit = False
+
+        @contextmanager
+        def _conn(self):
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+                conn.commit()
+                if self._raise_after_commit:
+                    self._raise_after_commit = False
+                    raise sqlite3.OperationalError("injected commit ambiguity")
+            finally:
+                conn.close()
+
+        def _insert_content_source_in_conn(self, conn, **values):
+            source_id = super()._insert_content_source_in_conn(conn, **values)
+            self._raise_after_commit = True
+            return source_id
+
+    path = str(tmp_path / "source-ambiguous-commit.db")
+    db = CommitAmbiguityDatabase(path)
+    key = "telegram_session:42"
+    raw = _session_json(
+        "source_intake", "classification", {"text": "One committed insight"},
+    )
+    db.set_state(key, raw)
+    telegram = WorkflowTelegramApi(tmp_path)
+    update = callback_update(109, "input:source:founder_note")
+
+    assert workflow_controller(db, telegram).process_update(update) == "failed"
+
+    recovered = Database(path)
+    assert recovered.get_state(key) is None
+    assert len(recovered.get_eligible_sources("founder_note")) == 1
+    assert workflow_controller(recovered, telegram).process_update(update) == "duplicate"
+    assert workflow_controller(recovered, telegram).process_update(
+        callback_update(1090, "input:source:founder_note")
+    ) == "processed"
+    assert len(Database(path).get_eligible_sources("founder_note")) == 1
+
+
+def test_edit_atomic_retry_returns_same_replacement_without_second_effect(tmp_path):
+    db = Database(str(tmp_path / "edit-atomic-retry.db"))
+    source_id, draft_id = add_pending_draft(db)
+    prior = db.get_post_draft(draft_id)
+    key = "telegram_session:42"
+    raw = _session_json("draft_edit", "text", {"draft_id": draft_id})
+    db.set_state(key, raw)
+    values = {
+        "state_key": key,
+        "expected_state_value": raw,
+        "prior_draft_id": draft_id,
+        "expected_revision": prior["revision"],
+        "expected_slot": prior["intended_slot"],
+        "expected_category": prior["category"],
+        "expected_source_ids": [source_id],
+        "text": "Idempotent edited copy",
+        "score_data": {"total": 90},
+        "publication_key": "telegram-edit:atomic-session-token",
+    }
+
+    created, first_outcome = db.replace_post_draft_consuming_state_atomic(**values)
+    replayed, replay_outcome = db.replace_post_draft_consuming_state_atomic(**values)
+
+    assert first_outcome == "created"
+    assert replay_outcome == "already_applied"
+    assert replayed["id"] == created["id"]
+    assert len(db.list_post_drafts()) == 2
+    assert db.get_post_draft(draft_id)["status"] == "superseded"
+
+
+def test_edit_atomic_retry_with_different_copy_is_session_conflict(tmp_path):
+    db = Database(str(tmp_path / "edit-atomic-different-retry.db"))
+    source_id, draft_id = add_pending_draft(db)
+    prior = db.get_post_draft(draft_id)
+    key = "telegram_session:42"
+    raw = _session_json("draft_edit", "text", {"draft_id": draft_id})
+    db.set_state(key, raw)
+    values = {
+        "state_key": key,
+        "expected_state_value": raw,
+        "prior_draft_id": draft_id,
+        "expected_revision": prior["revision"],
+        "expected_slot": prior["intended_slot"],
+        "expected_category": prior["category"],
+        "expected_source_ids": [source_id],
+        "text": "Winning edited copy",
+        "score_data": {"clarity": 18, "total": 90},
+        "publication_key": "telegram-edit:atomic-session-token",
+    }
+    created, first_outcome = db.replace_post_draft_consuming_state_atomic(**values)
+
+    replayed, replay_outcome = db.replace_post_draft_consuming_state_atomic(
+        **{
+            **values,
+            "text": "Different losing copy",
+            "score_data": {"clarity": 19, "total": 91},
+        }
+    )
+
+    assert first_outcome == "created"
+    assert type(created["id"]) is int
+    assert replayed is None
+    assert replay_outcome == "session_conflict"
+    assert len(db.list_post_drafts()) == 2
+
+
+def test_news_operational_error_keeps_input_for_restart_after_same_update_duplicate(
+    tmp_path,
+):
+    class OperationalSourceDatabase(Database):
+        def _insert_content_source_in_conn(self, conn, **values):
+            del values
+            conn.execute("SELECT * FROM injected_missing_table")
+
+    path = str(tmp_path / "news-restart.db")
+    failing = OperationalSourceDatabase(path)
+    key = "telegram_session:42"
+    raw = _session_json(
+        "source_intake",
+        "news_source",
+        {
+            "text": "Restart-safe report",
+            "url": "https://news.example/restart-report",
+            "published_at": "2029-08-14",
+        },
+    )
+    failing.set_state(key, raw)
+    telegram = WorkflowTelegramApi(tmp_path)
+    update = message_update(110, "News Example")
+
+    assert workflow_controller(failing, telegram).process_update(update) == "failed"
+    assert Database(path).get_state(key) == raw
+    assert workflow_controller(Database(path), telegram).process_update(update) == (
+        "duplicate"
+    )
+    assert Database(path).get_state(key) == raw
+
+    restarted = workflow_controller(Database(path), telegram)
+    assert restarted.process_update(message_update(111, "News Example")) == "processed"
+    assert Database(path).get_state(key) is None
+    sources = Database(path).get_eligible_sources("verified_news")
+    assert len(sources) == 1
+    assert sources[0]["url"] == "https://news.example/restart-report"
+
+
+def test_non_news_callback_failure_keeps_exact_session_and_no_source(tmp_path):
+    db = Database(str(tmp_path / "non-news-controller.db"))
+    key = "telegram_session:42"
+    raw = _session_json(
+        "source_intake", "classification", {"text": "Founder insight"},
+    )
+    db.set_state(key, raw)
+    with db._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_controller_source
+            BEFORE INSERT ON content_sources
+            BEGIN SELECT RAISE(ABORT, 'injected source failure'); END
+        """)
+    telegram = WorkflowTelegramApi(tmp_path)
+
+    assert workflow_controller(db, telegram).process_update(
+        callback_update(112, "input:source:founder_note")
+    ) == "failed"
+
+    assert Database(db.db_path).get_state(key) == raw
+    assert Database(db.db_path).get_eligible_sources("founder_note") == []
+
+
+def test_postpone_failure_keeps_exact_session_and_draft_snapshot(tmp_path):
+    db = Database(str(tmp_path / "postpone-controller.db"))
+    _source_id, draft_id = add_pending_draft(db)
+    prior = db.get_post_draft(draft_id)
+    key = "telegram_session:42"
+    raw = _session_json("draft_postpone", "slot", {"draft_id": draft_id})
+    db.set_state(key, raw)
+    with db._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_controller_postpone
+            BEFORE UPDATE OF intended_slot ON post_drafts
+            BEGIN SELECT RAISE(ABORT, 'injected postpone failure'); END
+        """)
+    pipeline = DraftPipeline(
+        db, NeverPlanner(), CopyGenerator(), Guard(), Scorer(),
+        now_fn=lambda: datetime(2029, 8, 15, tzinfo=timezone.utc),
+    )
+    telegram = WorkflowTelegramApi(tmp_path)
+
+    assert workflow_controller(db, telegram, pipeline=pipeline).process_update(
+        message_update(113, "2030-08-17T12:00:00+00:00")
+    ) == "failed"
+
+    recovered = Database(db.db_path)
+    assert recovered.get_state(key) == raw
+    current = recovered.get_post_draft(draft_id)
+    assert current["intended_slot"] == prior["intended_slot"]
+    assert current["revision"] == prior["revision"]
+
+
+def test_edit_failure_keeps_exact_session_and_draft_snapshot(tmp_path):
+    db = Database(str(tmp_path / "edit-controller.db"))
+    _source_id, draft_id = add_pending_draft(db)
+    key = "telegram_session:42"
+    raw = _session_json("draft_edit", "text", {"draft_id": draft_id})
+    db.set_state(key, raw)
+    with db._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_controller_edit
+            BEFORE INSERT ON post_drafts
+            BEGIN SELECT RAISE(ABORT, 'injected edit failure'); END
+        """)
+    pipeline = DraftPipeline(
+        db, NeverPlanner(), CopyGenerator(), Guard(), Scorer(),
+        now_fn=lambda: datetime(2029, 8, 15, tzinfo=timezone.utc),
+    )
+    telegram = WorkflowTelegramApi(tmp_path)
+
+    assert workflow_controller(db, telegram, pipeline=pipeline).process_update(
+        message_update(114, "A grounded edited insight")
+    ) == "failed"
+
+    recovered = Database(db.db_path)
+    assert recovered.get_state(key) == raw
+    assert recovered.get_post_draft(draft_id)["status"] == "pending_approval"
+    assert len(recovered.list_post_drafts()) == 1
 
 
 def test_edit_rewrites_then_runs_fact_score_and_novelty_gates(tmp_path):
@@ -451,6 +1000,244 @@ def test_posts_renders_complete_safe_draft_card_and_latest_published(tmp_path):
         f"draft:postpone:{draft_id}",
         f"draft:discard:{draft_id}",
     }
+
+
+def test_posts_sends_verified_media_stream_before_separate_full_draft_card(tmp_path):
+    db = Database(str(tmp_path / "posts-preview.db"))
+    _source_id, draft_id = add_pending_draft(
+        db,
+        text="Complete preview draft <literal> & safe",
+    )
+    attach_verified_preview(db, tmp_path, draft_id)
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    assert controller.process_update(message_update(301, "/posts")) == "processed"
+
+    assert telegram.media_messages == [(
+        "42",
+        _PREVIEW_JPEG,
+        "photo",
+        {"caption": f"Anteprima media bozza #{draft_id}"},
+    )]
+    media_event_index = next(
+        index for index, event in enumerate(telegram.events)
+        if event[0] == "media"
+    )
+    card_event_index = next(
+        index for index, event in enumerate(telegram.events)
+        if event[0] == "message" and "Complete preview draft" in event[2]
+    )
+    assert media_event_index < card_event_index
+    card = telegram.events[card_event_index]
+    assert "Complete preview draft <literal> & safe" in card[2]
+    assert card[3]["reply_markup"]["inline_keyboard"]
+
+
+def test_posts_dispatches_verified_video_and_document_previews(tmp_path):
+    for update_id, filename, mime_type, content, telegram_type in (
+        (305, "video-preview.mp4", "video/mp4", _PREVIEW_MP4, "video"),
+        (
+            306,
+            _PREVIEW_DOCUMENT_FILENAME,
+            "image/jpeg",
+            _PREVIEW_JPEG,
+            "document",
+        ),
+    ):
+        case_root = tmp_path / telegram_type
+        case_root.mkdir()
+        db = Database(str(case_root / "posts-preview.db"))
+        _source_id, draft_id = add_pending_draft(
+            db,
+            text=f"Complete {telegram_type} preview post",
+        )
+        attach_verified_preview(
+            db,
+            case_root,
+            draft_id,
+            content=content,
+            filename=filename,
+            mime_type=mime_type,
+        )
+        telegram = WorkflowTelegramApi(case_root)
+        controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+        assert controller.process_update(
+            message_update(update_id, "/posts")
+        ) == "processed"
+
+        assert len(telegram.media_messages) == 1
+        assert telegram.media_messages[0][1:3] == (content, telegram_type)
+
+
+def test_posts_media_type_mime_mismatch_fails_closed(tmp_path):
+    db = Database(str(tmp_path / "posts-mismatch-preview.db"))
+    _source_id, draft_id = add_pending_draft(
+        db,
+        text="Complete post despite mismatched preview metadata",
+    )
+    record = attach_verified_preview(db, tmp_path, draft_id)
+    with db._conn() as conn:
+        conn.execute(
+            "UPDATE media_library SET media_type = 'video' WHERE id = ?",
+            (record["id"],),
+        )
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    assert controller.process_update(message_update(308, "/posts")) == "processed"
+
+    assert telegram.media_messages == []
+    assert any(
+        "Complete post despite mismatched preview metadata" in message[1]
+        for message in telegram.messages
+    )
+
+
+def test_published_preview_requires_exact_tweet_media_binding(tmp_path):
+    db = Database(str(tmp_path / "posts-published-binding.db"))
+    _source_id, draft_id = add_pending_draft(
+        db,
+        text="Published post with mismatched used media",
+    )
+    record = attach_verified_preview(db, tmp_path, draft_id)
+    with db._conn() as conn:
+        conn.execute(
+            "UPDATE post_drafts SET status = 'published', "
+            "published_tweet_id = 'tweet-a' WHERE id = ?",
+            (draft_id,),
+        )
+        conn.execute(
+            "UPDATE media_library SET lifecycle_state = 'used', used = 1, "
+            "reserved_by_draft_id = NULL, used_in_tweet_id = 'tweet-other' "
+            "WHERE id = ?",
+            (record["id"],),
+        )
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    assert controller.process_update(message_update(309, "/posts")) == "processed"
+
+    assert telegram.media_messages == []
+    assert any(
+        "Published post with mismatched used media" in message[1]
+        for message in telegram.messages
+    )
+
+
+def test_preview_revalidates_draft_media_binding_under_open_media_lease(tmp_path):
+    class DetachAfterMediaReadDatabase(Database):
+        detach_draft_id = None
+
+        def get_media_by_id(self, media_id):
+            record = super().get_media_by_id(media_id)
+            if self.detach_draft_id is not None:
+                draft_id = self.detach_draft_id
+                self.detach_draft_id = None
+                assert self.detach_media_from_draft(draft_id)
+            return record
+
+    path = str(tmp_path / "preview-binding-race.db")
+    db = DetachAfterMediaReadDatabase(path)
+    _source_id, draft_id = add_pending_draft(
+        db,
+        text="Post whose preview binding changed",
+    )
+    attach_verified_preview(db, tmp_path, draft_id)
+    db.detach_draft_id = draft_id
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    assert controller.process_update(message_update(310, "/posts")) == "processed"
+
+    assert telegram.media_messages == []
+    assert Database(path).get_post_draft(draft_id)["media_id"] is None
+    assert any(
+        "Post whose preview binding changed" in message[1]
+        for message in telegram.messages
+    )
+
+
+def test_draft_callback_sends_preview_then_card_then_answers_once(tmp_path):
+    db = Database(str(tmp_path / "callback-preview.db"))
+    _source_id, draft_id = add_pending_draft(
+        db,
+        text="Complete callback preview post",
+    )
+    attach_verified_preview(db, tmp_path, draft_id)
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    assert controller.process_update(
+        callback_update(307, f"draft:regen:{draft_id}")
+    ) == "processed"
+
+    preview_index = next(
+        index for index, event in enumerate(telegram.events)
+        if event[0] == "media"
+    )
+    card_index = next(
+        index for index, event in enumerate(telegram.events)
+        if event[0] == "message" and "Complete callback preview post" in event[2]
+    )
+    callback_indexes = [
+        index for index, event in enumerate(telegram.events)
+        if event[0] == "callback"
+    ]
+    assert preview_index < card_index < callback_indexes[0]
+    assert callback_indexes == [len(telegram.events) - 1]
+
+
+def test_posts_tampered_media_fails_closed_and_keeps_safe_full_card(tmp_path):
+    db = Database(str(tmp_path / "posts-tampered-preview.db"))
+    _source_id, draft_id = add_pending_draft(
+        db,
+        text="Keep this complete post after preview failure",
+    )
+    record = attach_verified_preview(db, tmp_path, draft_id)
+    tampered = b"\xff\xd8\xff\xe0" + b"x" * (len(_PREVIEW_JPEG) - 4)
+    assert len(tampered) == len(_PREVIEW_JPEG)
+    Path(record["filepath"]).write_bytes(tampered)
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    assert controller.process_update(message_update(302, "/posts")) == "processed"
+
+    assert telegram.media_messages == []
+    rendered = "\n".join(message[1] for message in telegram.messages)
+    assert "Keep this complete post after preview failure" in rendered
+    assert record["filepath"] not in rendered
+
+
+def test_posts_missing_or_stale_media_fails_closed_without_raw_path(tmp_path):
+    for update_id, failure in ((303, "missing"), (304, "stale")):
+        case_root = tmp_path / failure
+        case_root.mkdir()
+        db = Database(str(case_root / "posts-preview.db"))
+        _source_id, draft_id = add_pending_draft(
+            db,
+            text=f"Complete {failure} preview post",
+        )
+        record = attach_verified_preview(db, case_root, draft_id)
+        media_path = Path(record["filepath"])
+        if failure == "missing":
+            media_path.unlink()
+        else:
+            original = media_path.read_bytes()
+            media_path.rename(media_path.with_suffix(".old"))
+            media_path.write_bytes(original)
+        telegram = WorkflowTelegramApi(case_root)
+        controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+        assert controller.process_update(
+            message_update(update_id, "/posts")
+        ) == "processed"
+
+        assert telegram.media_messages == []
+        rendered = "\n".join(message[1] for message in telegram.messages)
+        assert f"Complete {failure} preview post" in rendered
+        assert record["filepath"] not in rendered
 
 
 def test_draft_card_preserves_complete_text_when_metadata_exceeds_message_limit(
