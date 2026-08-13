@@ -1,4 +1,5 @@
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import pytest
 
 from modules.database import Database
 from modules.notifier import TelegramNotifier
+import modules.telegram_api as telegram_api_module
 from modules.telegram_api import (
     REQUEST_TIMEOUT,
     TELEGRAM_POLL_TIMEOUT,
@@ -120,6 +122,106 @@ def test_callback_without_chat_context_is_unauthorized(controller, fake_telegram
     assert fake_telegram.answered_callbacks == []
 
 
+def test_update_with_message_and_callback_is_claimed_as_malformed(
+    controller,
+    fake_telegram,
+    fake_db,
+):
+    update = {
+        "update_id": 142,
+        "message": {"chat": {"id": 42}, "text": "/status"},
+        "callback_query": {
+            "id": "callback-poison",
+            "message": {"chat": {"id": 999}},
+            "data": "draft:approve:7",
+        },
+    }
+    assert controller.process_update(update) == "malformed"
+    assert fake_db.telegram_updates[142] == {
+        "chat_id": "None",
+        "state": "malformed",
+        "result": {},
+    }
+    assert fake_db.operational_mutations == []
+    assert fake_telegram.messages == []
+    assert fake_telegram.answered_callbacks == []
+
+
+def test_update_without_supported_subtype_is_claimed_as_malformed(
+    controller,
+    fake_telegram,
+    fake_db,
+):
+    assert controller.process_update({"update_id": 143, "inline_query": {}}) == (
+        "malformed"
+    )
+    assert fake_db.telegram_updates[143]["state"] == "malformed"
+    assert fake_db.operational_mutations == []
+    assert fake_telegram.messages == []
+
+
+@pytest.mark.parametrize("callback_id", [None, ""])
+def test_callback_without_usable_id_is_malformed_before_dispatch(
+    fake_db,
+    fake_telegram,
+    callback_id,
+):
+    dispatched = []
+    local_controller = TelegramController(
+        telegram_api=fake_telegram,
+        db=fake_db,
+        notifier=FakeNotifier(),
+        authorized_chat_id="42",
+        dispatcher=lambda update: dispatched.append(update),
+    )
+    update = {
+        "update_id": 144,
+        "callback_query": {
+            "id": callback_id,
+            "message": {"chat": {"id": 42}},
+            "data": "draft:approve:7",
+        },
+    }
+    assert local_controller.process_update(update) == "malformed"
+    assert fake_db.telegram_updates[144]["state"] == "malformed"
+    assert dispatched == []
+    assert fake_telegram.answered_callbacks == []
+
+
+@pytest.mark.parametrize("bad_update_id", [True, 1.0, "1", -1, 2**63])
+def test_non_exact_or_out_of_range_update_id_fails_before_claim(
+    controller,
+    fake_db,
+    bad_update_id,
+):
+    update = {
+        "update_id": bad_update_id,
+        "message": {"chat": {"id": 42}, "text": "/status"},
+    }
+    assert controller.process_update(update) == "malformed"
+    assert fake_db.telegram_updates == {}
+    assert fake_db.operational_mutations == []
+
+
+def test_oversized_update_id_does_not_reach_sqlite(tmp_path, fake_telegram):
+    db = Database(str(tmp_path / "strict-update-id.db"))
+    controller = TelegramController(
+        telegram_api=fake_telegram,
+        db=db,
+        notifier=FakeNotifier(),
+        authorized_chat_id="42",
+        dispatcher=lambda _update: pytest.fail("must not dispatch"),
+    )
+    update = {
+        "update_id": 2**63,
+        "message": {"chat": {"id": 42}, "text": "/status"},
+    }
+    assert controller.process_update(update) == "malformed"
+    with db._conn() as conn:
+        count = conn.execute("SELECT COUNT(*) AS count FROM telegram_updates").fetchone()
+    assert count["count"] == 0
+
+
 def test_failed_callback_is_answered_once_with_failure_feedback(fake_db, fake_telegram):
     notifier = FakeNotifier()
 
@@ -226,6 +328,143 @@ def test_dispatch_failure_survives_failed_state_persistence(fake_telegram):
     assert local_controller.process_update(update) == "failed"
     assert db.complete_calls == 1
     assert len(notifier.errors) == 1
+
+
+def test_dispatch_failure_persists_only_allowlisted_exception_class(
+    fake_db,
+    fake_telegram,
+):
+    private_exception = type("Basic_private_token", (RuntimeError,), {})
+
+    def fail_dispatch(_update):
+        raise private_exception("headers=private")
+
+    local_controller = TelegramController(
+        telegram_api=fake_telegram,
+        db=fake_db,
+        notifier=FakeNotifier(),
+        authorized_chat_id="42",
+        dispatcher=fail_dispatch,
+    )
+    update = {"update_id": 167, "message": {"chat": {"id": 42}}}
+    assert local_controller.process_update(update) == "failed"
+    assert fake_db.telegram_updates[167]["result"] == {
+        "error": "exception=RuntimeError"
+    }
+
+
+def test_unauthorized_completion_failure_is_local_only(fake_telegram):
+    db = CompletionFailingDatabase()
+    notifier = FakeNotifier()
+    local_controller = TelegramController(
+        telegram_api=fake_telegram,
+        db=db,
+        notifier=notifier,
+        authorized_chat_id="42",
+        dispatcher=lambda _update: pytest.fail("must not dispatch"),
+    )
+    update = {"update_id": 163, "message": {"chat": {"id": 999}}}
+    assert local_controller.process_update(update) == "failed"
+    assert db.complete_calls == 1
+    assert notifier.errors == []
+    assert fake_telegram.messages == []
+
+
+class ClaimFailingDatabase:
+    def __init__(self, failed_update_id=None):
+        self.failed_update_id = failed_update_id
+        self.claim_calls = []
+        self.telegram_updates = {}
+
+    def claim_telegram_update(self, update_id, chat_id):
+        self.claim_calls.append(update_id)
+        if self.failed_update_id is None or update_id == self.failed_update_id:
+            raise RuntimeError("headers={'Authorization': 'private'}")
+        if update_id in self.telegram_updates:
+            return False
+        self.telegram_updates[update_id] = {
+            "chat_id": str(chat_id),
+            "state": "processing",
+            "result": {},
+        }
+        return True
+
+    def complete_telegram_update(self, update_id, state, result):
+        self.telegram_updates[update_id].update(state=state, result=dict(result))
+
+
+def test_claim_exception_fails_closed_without_dispatch_or_notifier(fake_telegram):
+    db = ClaimFailingDatabase()
+    notifier = FakeNotifier()
+    dispatched = []
+    local_controller = TelegramController(
+        telegram_api=fake_telegram,
+        db=db,
+        notifier=notifier,
+        authorized_chat_id="42",
+        dispatcher=lambda update: dispatched.append(update),
+    )
+    update = {"update_id": 164, "message": {"chat": {"id": 42}}}
+    assert local_controller.process_update(update) == "failed"
+    assert db.claim_calls == [164]
+    assert dispatched == []
+    assert notifier.errors == []
+
+
+@pytest.mark.parametrize("claim_result", [1, "claimed", object()])
+def test_non_boolean_claim_result_fails_closed(fake_telegram, claim_result):
+    class AmbiguousClaimDatabase:
+        def claim_telegram_update(self, _update_id, _chat_id):
+            return claim_result
+
+    dispatched = []
+    local_controller = TelegramController(
+        telegram_api=fake_telegram,
+        db=AmbiguousClaimDatabase(),
+        notifier=FakeNotifier(),
+        authorized_chat_id="42",
+        dispatcher=lambda update: dispatched.append(update),
+    )
+    update = {"update_id": 168, "message": {"chat": {"id": 42}}}
+    assert local_controller.process_update(update) == "failed"
+    assert dispatched == []
+
+
+def test_stop_before_claim_has_no_side_effect(fake_db, fake_telegram):
+    stop_event = RecordingStopEvent()
+    stop_event.set_flag = True
+    local_controller = TelegramController(
+        telegram_api=fake_telegram,
+        db=fake_db,
+        notifier=FakeNotifier(),
+        authorized_chat_id="42",
+        dispatcher=lambda _update: pytest.fail("must not dispatch"),
+    )
+    update = {"update_id": 165, "message": {"chat": {"id": 42}}}
+    assert local_controller.process_update(update, stop_event=stop_event) == "stopped"
+    assert fake_db.telegram_updates == {}
+
+
+def test_stop_after_claim_prevents_dispatch(fake_db, fake_telegram):
+    stop_event = RecordingStopEvent()
+    original_claim = fake_db.claim_telegram_update
+
+    def claim_and_stop(update_id, chat_id):
+        claimed = original_claim(update_id, chat_id)
+        stop_event.set_flag = True
+        return claimed
+
+    fake_db.claim_telegram_update = claim_and_stop
+    local_controller = TelegramController(
+        telegram_api=fake_telegram,
+        db=fake_db,
+        notifier=FakeNotifier(),
+        authorized_chat_id="42",
+        dispatcher=lambda _update: pytest.fail("must not dispatch"),
+    )
+    update = {"update_id": 166, "message": {"chat": {"id": 42}}}
+    assert local_controller.process_update(update, stop_event=stop_event) == "stopped"
+    assert fake_db.telegram_updates[166]["state"] == "stopped"
 
 
 def test_concurrent_replay_dispatches_once(tmp_path, fake_telegram):
@@ -341,18 +580,88 @@ def test_empty_poll_waits_interruptibly_instead_of_busy_loop(fake_db):
 
 
 def test_malformed_batch_waits_interruptibly_instead_of_busy_loop(fake_db):
-    stop_event = RecordingStopEvent(stop_after_waits=1)
-    api = ScriptedPollingApi([[{"message": {"chat": {"id": 42}}}]])
+    stop_event = RecordingStopEvent(stop_after_waits=6)
+    api = ScriptedPollingApi([
+        [{"message": {"chat": {"id": 42}}}] for _ in range(6)
+    ])
     _polling_controller(api, fake_db).run_forever(stop_event)
-    assert stop_event.waits == [0.1]
+    assert stop_event.waits == [1, 2, 4, 8, 30, 30]
+    assert api.calls == [(None, 25)] * 6
+
+
+def test_non_list_poll_response_uses_malformed_batch_backoff(fake_db):
+    stop_event = RecordingStopEvent(stop_after_waits=6)
+    api = ScriptedPollingApi([None, {}, False, "", (), 0])
+    _polling_controller(api, fake_db).run_forever(stop_event)
+    assert stop_event.waits == [1, 2, 4, 8, 30, 30]
+    assert api.calls == [(None, 25)] * 6
+
+
+def test_run_forever_isolates_claim_failure_and_processes_next_update(fake_telegram):
+    stop_event = RecordingStopEvent()
+    db = ClaimFailingDatabase(failed_update_id=70)
+    api = ScriptedPollingApi([
+        [
+            {"update_id": 70, "message": {"chat": {"id": 42}}},
+            {"update_id": 71, "message": {"chat": {"id": 42}}},
+        ],
+        [],
+    ], stop_event=stop_event)
+    local_controller = TelegramController(
+        telegram_api=api,
+        db=db,
+        notifier=FakeNotifier(),
+        authorized_chat_id="42",
+        dispatcher=lambda _update: "ok",
+    )
+    local_controller.run_forever(stop_event)
+    assert db.claim_calls == [70, 71]
+    assert db.telegram_updates[71]["state"] == "processed"
+    assert api.calls == [(None, 25), (72, 25)]
+
+
+def test_run_forever_rechecks_stop_before_each_batch_entry(fake_db):
+    stop_event = RecordingStopEvent()
+    dispatched = []
+
+    def dispatch(update):
+        dispatched.append(update["update_id"])
+        stop_event.set_flag = True
+        return "ok"
+
+    api = ScriptedPollingApi([[
+        {"update_id": 72, "message": {"chat": {"id": 42}}},
+        {"update_id": 73, "message": {"chat": {"id": 42}}},
+    ]])
+    local_controller = TelegramController(
+        telegram_api=api,
+        db=fake_db,
+        notifier=FakeNotifier(),
+        authorized_chat_id="42",
+        dispatcher=dispatch,
+    )
+    local_controller.run_forever(stop_event)
+    assert dispatched == [72]
+    assert 73 not in fake_db.telegram_updates
 
 
 class FakeResponse:
-    def __init__(self, payload=None, status_code=200, chunks=(), json_error=None):
+    def __init__(
+        self,
+        payload=None,
+        status_code=200,
+        chunks=(),
+        json_error=None,
+        headers=None,
+        close_error=None,
+    ):
         self.payload = payload if payload is not None else {"ok": True, "result": {}}
         self.status_code = status_code
         self.chunks = list(chunks)
         self.json_error = json_error
+        self.headers = dict(headers or {})
+        self.close_error = close_error
+        self.close_calls = 0
         self.text = "response body must not be exposed"
 
     def json(self):
@@ -366,6 +675,19 @@ class FakeResponse:
             if isinstance(chunk, Exception):
                 raise chunk
             yield chunk
+
+    def close(self):
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class ExplodingStatusResponse:
+    @property
+    def status_code(self):
+        raise RuntimeError(
+            "json={'data':'private'} headers=Basic private response=Bearer private"
+        )
 
 
 class FakeRequests:
@@ -391,6 +713,16 @@ class FakeRequests:
         return self._resolve(self.get_outcomes)
 
 
+class ConnectionPoolLoggingRequests(FakeRequests):
+    def post(self, url, **kwargs):
+        logging.getLogger("urllib3.connectionpool").debug(
+            "Starting new HTTPS connection for %s headers=%s",
+            url,
+            {"Authorization": f"Basic {url}"},
+        )
+        return super().post(url, **kwargs)
+
+
 def test_messaging_transport_does_not_require_media_directory_at_startup(tmp_path):
     missing_media_root = tmp_path / "created_later"
     requests_client = FakeRequests(post_outcomes=[
@@ -403,6 +735,23 @@ def test_messaging_transport_does_not_require_media_directory_at_startup(tmp_pat
     )
     assert api.send_message("42", "hello") == {"message_id": 1}
     assert not missing_media_root.exists()
+
+
+def test_connectionpool_debug_record_never_formats_bot_token(tmp_path, caplog):
+    secret = "123456789:telegram_Bot-Secret"
+    requests_client = ConnectionPoolLoggingRequests(post_outcomes=[
+        FakeResponse({"ok": True, "result": {"message_id": 1}})
+    ])
+    caplog.set_level(logging.DEBUG)
+    api = TelegramApi(secret, tmp_path, requests_client=requests_client)
+    assert api.send_message("42", "hello") == {"message_id": 1}
+    connection_records = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "urllib3.connectionpool"
+    ]
+    assert connection_records == ["urllib3 connectionpool event"]
+    assert secret not in " ".join(record.getMessage() for record in caplog.records)
 
 
 def test_get_updates_uses_exact_poll_timeout_and_allowed_updates(tmp_path):
@@ -473,6 +822,40 @@ def test_http_and_json_failures_raise_sanitized_api_errors(tmp_path, response):
     assert "response body must not be exposed" not in str(raised.value)
 
 
+def test_post_status_property_failure_is_sanitized(tmp_path):
+    api = TelegramApi(
+        "123456:secret",
+        tmp_path,
+        requests_client=FakeRequests(post_outcomes=[ExplodingStatusResponse()]),
+    )
+    with pytest.raises(TelegramApiError) as raised:
+        api.send_message("42", "hello")
+    assert str(raised.value) == (
+        "operation=transport method=sendMessage exception=RuntimeError"
+    )
+
+
+def test_remote_api_error_code_cannot_copy_response_payload(tmp_path):
+    private_code = "private-secret-value"
+    api = TelegramApi(
+        "123456:secret",
+        tmp_path,
+        requests_client=FakeRequests(post_outcomes=[
+            FakeResponse({
+                "ok": False,
+                "error_code": private_code,
+                "description": "Bearer private body",
+            })
+        ]),
+    )
+    with pytest.raises(TelegramApiError) as raised:
+        api.send_message("42", "hello")
+    assert str(raised.value) == (
+        "operation=api method=sendMessage code=invalid_error_code"
+    )
+    assert private_code not in str(raised.value)
+
+
 def test_request_exception_redacts_token_header_and_query(tmp_path):
     secret = "123456789:telegram_Bot-Secret"
     error = RuntimeError(
@@ -487,38 +870,68 @@ def test_request_exception_redacts_token_header_and_query(tmp_path):
     with pytest.raises(TelegramApiError) as raised:
         api.send_message("42", "hello")
     safe = str(raised.value)
+    assert safe == "operation=transport method=sendMessage exception=RuntimeError"
     assert secret not in safe
-    assert "Bearer [redacted]" in safe
-    assert "https://example.test/path?[redacted]" in safe
 
 
-def test_sanitize_error_rejects_raw_updates_and_configured_secrets():
+def test_sanitize_error_is_allowlist_only_for_untrusted_exception_context():
     secret = "not-token-shaped-secret"
+    raw = (
+        f"json={{'data': 'private'}} headers=Basic-private response=secret "
+        f"body=Bearer-private query=?token={secret} update_id=9 raw-update"
+    )
     assert sanitize_error(
-        f"failed token={secret} https://example.test/a?secret={secret}",
+        RuntimeError(raw),
         secrets=[secret],
-    ) == "failed token=[redacted] https://example.test/a?[redacted]"
-    assert sanitize_error(
-        "dispatch failed for {'update_id': 1, 'message': {'text': 'private'}}"
-    ) == "[redacted raw Telegram payload]"
+        operation="telegram_update",
+        method="getUpdates",
+        status=502,
+        code=400,
+    ) == (
+        "operation=telegram_update method=getUpdates status=502 "
+        "exception=RuntimeError code=400"
+    )
 
 
 def test_sanitize_error_redacts_environment_api_keys_and_request_bodies(monkeypatch):
     api_secret = "configured-private-api-key"
     monkeypatch.setenv("GROQ_API_KEY", api_secret)
-    safe_token = sanitize_error(f"provider failed key={api_secret}")
-    safe_body = sanitize_error("request failed body={'text': 'private prompt'}")
+    safe_token = sanitize_error(RuntimeError(f"provider failed key={api_secret}"))
+    safe_body = sanitize_error(
+        ValueError("request failed body={'text': 'private prompt'}")
+    )
     assert api_secret not in safe_token
-    assert safe_body == "request failed body=[redacted]"
+    assert safe_token == "exception=RuntimeError"
+    assert safe_body == "exception=ValueError"
 
 
 def test_sanitize_error_redacts_basic_authorization_and_assignment_updates():
-    safe_header = sanitize_error("request Authorization: Basic basic-private-value")
-    assert "basic-private-value" not in safe_header
-    assert "Authorization: Basic [redacted]" in safe_header
-    assert sanitize_error("raw update_id=9 text=private") == (
-        "[redacted raw Telegram payload]"
+    safe_header = sanitize_error(
+        RuntimeError("request Authorization: Basic basic-private-value")
     )
+    assert safe_header == "exception=RuntimeError"
+    assert "basic-private-value" not in safe_header
+    assert sanitize_error("raw update_id=9 text=private") == "exception=Exception"
+
+
+def test_sanitize_error_rejects_credentials_hidden_in_exception_class_name():
+    private_exception = type("Bearer_private_token", (RuntimeError,), {})
+    safe = sanitize_error(private_exception("body=private"))
+    assert safe == "exception=RuntimeError"
+    assert "Bearer" not in safe
+    assert "token" not in safe
+
+
+def test_sanitize_error_uses_closed_metadata_allowlists():
+    private_exception = type("OpaquePrivateValue", (BaseException,), {})
+    safe = sanitize_error(
+        private_exception(),
+        operation="OpaquePrivateValue",
+        method="OpaquePrivateValue",
+        code="OpaquePrivateValue",
+    )
+    assert safe == "exception=BaseException"
+    assert "OpaquePrivateValue" not in safe
 
 
 def test_download_requires_explicit_absolute_destination_inside_media_root(tmp_path):
@@ -556,6 +969,32 @@ def test_download_rejects_symlink_parent_and_existing_destination(tmp_path):
     assert not (outside / "escaped.jpg").exists()
 
 
+def test_download_rejects_parent_symlink_even_when_target_stays_inside_root(tmp_path):
+    media_root = tmp_path / "media"
+    real_parent = media_root / "real"
+    media_root.mkdir()
+    real_parent.mkdir()
+    (media_root / "alias").symlink_to(real_parent, target_is_directory=True)
+    requests_client = FakeRequests(get_outcomes=[FakeResponse(chunks=[b"unsafe"])])
+    api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
+    with pytest.raises(ValueError, match="must not contain symlinks"):
+        api.download_file("photos/a.jpg", media_root / "alias" / "escaped.jpg")
+    assert requests_client.gets == []
+    assert not (real_parent / "escaped.jpg").exists()
+
+
+def test_download_rejects_dotdot_as_a_lexical_parent_component(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    requests_client = FakeRequests(get_outcomes=[FakeResponse(chunks=[b"unsafe"])])
+    api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
+    destination = media_root / "parent" / ".." / "escaped.jpg"
+    with pytest.raises(ValueError, match="Invalid download destination"):
+        api.download_file("photos/a.jpg", destination)
+    assert requests_client.gets == []
+    assert not (media_root / "escaped.jpg").exists()
+
+
 def test_download_fails_closed_without_nofollow_support(tmp_path, monkeypatch):
     media_root = tmp_path / "media"
     media_root.mkdir()
@@ -581,6 +1020,70 @@ def test_download_is_exclusive_and_cleans_partial_file_on_failure(tmp_path):
         api.download_file("photos/a.jpg", destination)
     assert secret not in str(raised.value)
     assert not destination.exists()
+
+
+def test_download_close_failure_cleans_file_and_fds_repeatedly(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    secret = "123456789:telegram_Bot-Secret"
+    responses = [
+        FakeResponse(
+            chunks=[b"complete"],
+            close_error=RuntimeError(
+                f"response body=query headers=Bearer {secret} raw update_id=8"
+            ),
+        )
+        for _ in range(20)
+    ]
+    api = TelegramApi(
+        secret,
+        media_root,
+        requests_client=FakeRequests(get_outcomes=responses),
+    )
+    fd_count_before = len(os.listdir("/dev/fd"))
+    destinations = []
+    errors = []
+    for index in range(20):
+        destination = media_root / f"close-{index}.jpg"
+        destinations.append(destination)
+        with pytest.raises(TelegramApiError) as raised:
+            api.download_file("photos/a.jpg", destination)
+        errors.append(str(raised.value))
+    assert len(os.listdir("/dev/fd")) == fd_count_before
+    assert all(not destination.exists() for destination in destinations)
+    assert all(
+        error == "operation=transport method=downloadFile exception=RuntimeError"
+        for error in errors
+    )
+    assert all(response.close_calls == 1 for response in responses)
+
+
+def test_download_enforces_content_length_and_counted_image_limit(
+    tmp_path,
+    monkeypatch,
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    monkeypatch.setattr(telegram_api_module, "TELEGRAM_MAX_IMAGE_BYTES", 5)
+    declared = FakeResponse(
+        chunks=[pytest.fail],
+        headers={"Content-Length": "6"},
+    )
+    streamed = FakeResponse(chunks=[b"123", b"456"])
+    api = TelegramApi(
+        "123456:secret",
+        media_root,
+        requests_client=FakeRequests(get_outcomes=[declared, streamed]),
+    )
+    for name in ("declared.jpg", "streamed.jpg"):
+        with pytest.raises(TelegramApiError) as raised:
+            api.download_file("photos/a.jpg", media_root / name)
+        assert str(raised.value) == (
+            "operation=download method=downloadFile code=file_too_large"
+        )
+        assert not (media_root / name).exists()
+    assert declared.close_calls == 1
+    assert streamed.close_calls == 1
 
 
 def test_download_writes_only_to_reserved_destination(tmp_path):
@@ -619,8 +1122,14 @@ def test_notifier_uses_api_and_persists_one_sanitized_error(fake_db, fake_telegr
     sent = fake_telegram.messages[0][1]
     assert secret not in persisted
     assert secret not in sent
-    assert "Bearer [redacted]" in persisted
-    assert "https://example.test/path?[redacted]" in sent
+    assert fake_db.logged_errors[0] == (
+        "operation=telegram_update",
+        "RuntimeError",
+        "operation=telegram_update exception=RuntimeError",
+    )
+    for forbidden in ("Authorization", "Bearer", "https://", "?token", "path"):
+        assert forbidden not in persisted
+        assert forbidden not in sent
 
 
 def test_notifier_rejects_raw_update_from_persistence_and_message(fake_db, fake_telegram):
@@ -634,9 +1143,34 @@ def test_notifier_rejects_raw_update_from_persistence_and_message(fake_db, fake_
         "telegram_update",
         RuntimeError("failed for {'update_id': 8, 'message': {'text': 'private'}}"),
     )
-    assert fake_db.logged_errors[0][2] == "[redacted raw Telegram payload]"
+    assert fake_db.logged_errors[0][2] == (
+        "operation=telegram_update exception=RuntimeError"
+    )
     assert "update_id" not in fake_telegram.messages[0][1]
     assert "private" not in fake_telegram.messages[0][1]
+
+
+def test_notifier_allowlists_exception_class_before_db_and_telegram(
+    fake_db,
+    fake_telegram,
+):
+    private_exception = type("Bearer_private_token", (RuntimeError,), {})
+    notifier = TelegramNotifier(
+        "123456:secret",
+        "42",
+        database=fake_db,
+        telegram_api=fake_telegram,
+    )
+    notifier.notify_error("telegram_update", private_exception("body=private"))
+    assert fake_db.logged_errors[0] == (
+        "operation=telegram_update",
+        "RuntimeError",
+        "operation=telegram_update exception=RuntimeError",
+    )
+    persisted_and_sent = " ".join(fake_db.logged_errors[0]) + fake_telegram.messages[0][1]
+    assert "Bearer" not in persisted_and_sent
+    assert "token" not in persisted_and_sent
+    assert "private" not in persisted_and_sent
 
 
 def test_notifier_has_no_automated_engagement_summaries(fake_db, fake_telegram):

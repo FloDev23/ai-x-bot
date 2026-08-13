@@ -2,7 +2,7 @@
 
 import logging
 
-from modules.telegram_api import TelegramApi, sanitize_error
+from modules.telegram_api import TelegramApi, safe_exception_class, sanitize_error
 
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ class TelegramNotifier:
         except Exception as exc:
             logger.warning(
                 "Telegram notification delivery failed: %s",
-                sanitize_error(exc, secrets=[self.bot_token]),
+                sanitize_error(exc, operation="notification_delivery"),
             )
             return None
 
@@ -84,16 +84,18 @@ class TelegramNotifier:
 
     def notify_error(self, context: str, error: Exception):
         """Persist one sanitized event, then attempt one sanitized notification."""
-        safe_context = sanitize_error(context, secrets=[self.bot_token])
-        safe_message = sanitize_error(error, secrets=[self.bot_token])
-        error_type = sanitize_error(type(error).__name__, secrets=[self.bot_token])
+        safe_context = sanitize_error(None, operation=context)
+        operation = context if safe_context else "telegram_error"
+        safe_context = sanitize_error(None, operation=operation)
+        safe_message = sanitize_error(error, operation=operation)
+        error_type = safe_exception_class(error)
         if self.database is not None:
             try:
                 self.database.log_error(safe_context, error_type, safe_message)
             except Exception as exc:
                 logger.warning(
                     "Telegram error persistence failed: %s",
-                    sanitize_error(exc, secrets=[self.bot_token]),
+                    sanitize_error(exc, operation="error_persistence"),
                 )
 
         text = (
