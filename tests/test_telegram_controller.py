@@ -161,7 +161,7 @@ def test_update_without_supported_subtype_is_claimed_as_malformed(
     assert fake_telegram.messages == []
 
 
-@pytest.mark.parametrize("callback_id", [None, ""])
+@pytest.mark.parametrize("callback_id", [None, "", "bad\ncallback", "x" * 4097])
 def test_callback_without_usable_id_is_malformed_before_dispatch(
     fake_db,
     fake_telegram,
@@ -1503,20 +1503,18 @@ def test_download_uses_exact_configured_cap_for_each_media_type(
 ):
     media_root = tmp_path / "media"
     media_root.mkdir()
-    accepted_response = FakeResponse(chunks=[b"x"])
     api = TelegramApi(
         "123456:secret",
         media_root,
-        requests_client=FakeRequests(get_outcomes=[accepted_response]),
+        requests_client=FakeRequests(),
     )
     accepted = media_root / f"accepted-{filename}"
-    assert api.download_file(
-        "documents/file",
+    assert api._download_byte_limit(
         accepted,
-        message_filename=filename,
-        mime_type=mime_type,
-        expected_size=limit,
-    ) == accepted
+        filename,
+        mime_type,
+        limit,
+    ) == limit
 
     rejected = media_root / f"rejected-{filename}"
     with pytest.raises(TelegramApiError) as raised:
@@ -1846,6 +1844,37 @@ def test_download_writes_only_to_reserved_destination(tmp_path):
     url, kwargs = requests_client.gets[0]
     assert url == "https://api.telegram.org/file/bot123456:secret/photos/a.jpg"
     assert kwargs == {"stream": True, "timeout": REQUEST_TIMEOUT}
+
+
+@pytest.mark.parametrize("content_length", ["5", None])
+def test_download_rejects_bytes_shorter_than_canonical_expected_size(
+    tmp_path,
+    content_length,
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    destination = media_root / "short.jpg"
+    headers = {} if content_length is None else {"Content-Length": content_length}
+    response = FakeResponse(chunks=[b"12345"], headers=headers)
+    api = TelegramApi(
+        "123456:secret",
+        media_root,
+        requests_client=FakeRequests(get_outcomes=[response]),
+    )
+
+    with pytest.raises(TelegramApiError) as raised:
+        api.download_file(
+            "photos/a.jpg",
+            destination,
+            message_filename="short.jpg",
+            mime_type="image/jpeg",
+            expected_size=6,
+        )
+
+    assert str(raised.value) == (
+        "operation=download method=downloadFile code=invalid_media_metadata"
+    )
+    assert not destination.exists()
 
 
 def test_notifier_uses_api_and_persists_one_sanitized_error(fake_db, fake_telegram):

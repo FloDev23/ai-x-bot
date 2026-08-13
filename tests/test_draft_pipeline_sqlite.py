@@ -278,7 +278,7 @@ def test_approve_loses_revision_cas_to_concurrent_postpone(tmp_path):
         datetime.fromisoformat(SLOT) + timedelta(microseconds=1),
     ],
 )
-def test_atomic_approval_rejects_at_or_after_slot(tmp_path, approval_time):
+def test_atomic_approval_expires_at_or_after_slot(tmp_path, approval_time):
     db = Database(str(tmp_path / "bot.db"))
     source_id = _source(db)
     draft_id = db.create_post_draft(
@@ -294,7 +294,7 @@ def test_atomic_approval_rejects_at_or_after_slot(tmp_path, approval_time):
         lambda: approval_time,
     ) is False
 
-    assert db.get_post_draft(draft_id)["status"] == "pending_approval"
+    assert db.get_post_draft(draft_id)["status"] == "expired"
 
 
 def test_concurrent_postpone_uses_revision_cas_without_last_writer_wins(tmp_path):

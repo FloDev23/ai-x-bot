@@ -1093,15 +1093,34 @@ class Database:
                 count += 1
         return count
 
-    def get_recent_content_texts(self, days: int = 30) -> List[str]:
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    def get_recent_content_texts(
+        self,
+        days: int = 30,
+        exclude_draft_id: Optional[int] = None,
+        now: Optional[datetime] = None,
+    ) -> List[str]:
+        current = self._as_utc(now or datetime.now(timezone.utc))
+        since = (current - timedelta(days=days)).isoformat()
+        until = current.isoformat()
         with self._conn() as conn:
-            rows = conn.execute("""
-                SELECT text, created_at FROM post_drafts WHERE created_at >= ?
-                UNION ALL
-                SELECT text, created_at FROM posted_tweets WHERE created_at >= ?
-                ORDER BY created_at DESC
-            """, (since, since)).fetchall()
+            if exclude_draft_id is None:
+                rows = conn.execute("""
+                    SELECT text, created_at FROM post_drafts
+                    WHERE created_at >= ? AND created_at <= ?
+                    UNION ALL
+                    SELECT text, created_at FROM posted_tweets
+                    WHERE created_at >= ? AND created_at <= ?
+                    ORDER BY created_at DESC
+                """, (since, until, since, until)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT text, created_at FROM post_drafts
+                    WHERE created_at >= ? AND created_at <= ? AND id != ?
+                    UNION ALL
+                    SELECT text, created_at FROM posted_tweets
+                    WHERE created_at >= ? AND created_at <= ?
+                    ORDER BY created_at DESC
+                """, (since, until, exclude_draft_id, since, until)).fetchall()
         return [row["text"] for row in rows]
 
     def postpone_post_draft_atomic(
@@ -1190,8 +1209,23 @@ class Database:
                 or current["status"] != "pending_approval"
                 or current["revision"] != expected_revision
                 or current["intended_slot"] != expected_slot
-                or current_time >= self._parse_datetime(current["intended_slot"])
             ):
+                return False
+            if current_time >= self._parse_datetime(current["intended_slot"]):
+                expired = conn.execute("""
+                    UPDATE post_drafts
+                    SET status = 'expired', updated_at = ?,
+                        revision = revision + 1
+                    WHERE id = ? AND status = 'pending_approval'
+                      AND revision = ? AND intended_slot = ?
+                """, (
+                    self._now_iso(),
+                    draft_id,
+                    expected_revision,
+                    expected_slot,
+                ))
+                if expired.rowcount != 1:
+                    return False
                 return False
             cursor = conn.execute("""
                 UPDATE post_drafts
@@ -2206,6 +2240,74 @@ class Database:
             )
             return True
 
+    def detach_media_from_draft(self, draft_id: int) -> bool:
+        """Atomically return a pending draft to text-only and release its media."""
+        with self._media_store_mutation_lock(
+            "draft_reservations", draft_id,
+        ) as conn:
+            draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+            if not draft or draft["status"] != "pending_approval":
+                return False
+            media_id = draft["media_id"]
+            if media_id is None:
+                return True
+            media = conn.execute(
+                "SELECT * FROM media_library WHERE id = ?", (media_id,)
+            ).fetchone()
+            if (
+                not media
+                or media["lifecycle_state"] != "reserved"
+                or media["reserved_by_draft_id"] != draft_id
+            ):
+                return False
+            media_source_ids = set()
+            for source in conn.execute("""
+                SELECT id, metadata_json FROM content_sources
+                WHERE source_type = 'media_context'
+            """).fetchall():
+                try:
+                    metadata = json.loads(source["metadata_json"])
+                except (TypeError, ValueError):
+                    continue
+                if metadata.get("media_id") == media_id:
+                    media_source_ids.add(source["id"])
+            source_ids = [
+                source_id
+                for source_id in json.loads(draft["source_ids_json"])
+                if source_id not in media_source_ids
+            ]
+            released = conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                WHERE id = ? AND lifecycle_state = 'reserved'
+                  AND reserved_by_draft_id = ?
+            """, (media_id, draft_id))
+            if released.rowcount != 1:
+                return False
+            now = self._now_iso()
+            updated = conn.execute("""
+                UPDATE post_drafts
+                SET media_id = NULL, source_ids_json = ?, updated_at = ?,
+                    revision = revision + 1
+                WHERE id = ? AND status = 'pending_approval'
+                  AND revision = ? AND media_id = ?
+            """, (
+                json.dumps(source_ids), now, draft_id, draft["revision"], media_id,
+            ))
+            if updated.rowcount != 1:
+                raise sqlite3.IntegrityError("draft changed during media detach")
+            self._insert_draft_evaluation_in_conn(
+                conn,
+                draft["intended_slot"],
+                draft["category"],
+                "media_released",
+                {"draft_id": draft_id, "media_id": media_id},
+                now,
+            )
+            return True
+
     def release_media_for_draft(self, draft_id: int) -> None:
         with self._media_store_mutation_lock(
             "draft_reservations", draft_id,
@@ -2586,6 +2688,30 @@ class Database:
                 "SELECT value FROM bot_state WHERE key = ?", (key,)
             ).fetchone()
         return row["value"] if row else default
+
+    def compare_and_set_state(
+        self,
+        key: str,
+        expected_value: str,
+        new_value: str,
+    ) -> bool:
+        """Replace one exact state value so concurrent workflows have one winner."""
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                UPDATE bot_state
+                SET value = ?, updated_at = ?
+                WHERE key = ? AND value = ?
+            """, (new_value, self._now_iso(), key, expected_value))
+            return cursor.rowcount == 1
+
+    def compare_and_clear_state(self, key: str, expected_value: str) -> bool:
+        """Consume one exact state value at most once across processes."""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM bot_state WHERE key = ? AND value = ?",
+                (key, expected_value),
+            )
+            return cursor.rowcount == 1
 
     def log_error(self, context: str, error_type: str, safe_message: str) -> int:
         context = self._sanitize_persisted_text(context)

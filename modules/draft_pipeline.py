@@ -145,14 +145,13 @@ class DraftPipeline:
             details or {},
         )
 
-    def _prepare(
+    def _source_context(
         self,
         *,
         category: str,
         source_ids,
         intended_slot,
-        include_link: bool,
-    ) -> Optional[_PreparedDraft]:
+    ):
         slot_iso = _slot_iso(intended_slot)
         if slot_iso is None:
             return None
@@ -174,36 +173,21 @@ class DraftPipeline:
                 {"source_ids": safe_source_ids},
             )
             return None
+        return slot_iso, safe_source_ids, sources
 
-        try:
-            candidate = self.generator.generate_grounded_tweet(
-                category,
-                sources,
-                include_link,
-            )
-        except Exception:
-            self._record(
-                slot_iso,
-                category,
-                "generation_failed",
-                {
-                    "reason_codes": ["generation_unavailable"],
-                    "source_ids": safe_source_ids,
-                },
-            )
-            return None
-        if not isinstance(candidate, dict) or not isinstance(
-            candidate.get("text"), str
-        ):
-            self._record(
-                slot_iso,
-                category,
-                "generation_failed",
-                {"source_ids": safe_source_ids},
-            )
-            return None
-
-        text = candidate["text"].strip()
+    def _validate_copy(
+        self,
+        *,
+        text,
+        category: str,
+        safe_source_ids,
+        sources,
+        slot_iso: str,
+        exclude_draft_id: Optional[int] = None,
+    ) -> Optional[_PreparedDraft]:
+        if not isinstance(text, str):
+            text = ""
+        text = text.strip()
         if not text:
             self._record(
                 slot_iso,
@@ -293,7 +277,18 @@ class DraftPipeline:
             )
             return None
 
-        for previous in self.db.get_recent_content_texts(days=30):
+        if exclude_draft_id is None:
+            recent_texts = self.db.get_recent_content_texts(
+                days=30,
+                now=self.now_fn(),
+            )
+        else:
+            recent_texts = self.db.get_recent_content_texts(
+                days=30,
+                exclude_draft_id=exclude_draft_id,
+                now=self.now_fn(),
+            )
+        for previous in recent_texts:
             if not isinstance(previous, str):
                 continue
             if semantic_similarity(text, previous) >= self.duplicate_threshold:
@@ -311,6 +306,58 @@ class DraftPipeline:
             source_ids=safe_source_ids,
             score_data=safe_score,
             intended_slot=slot_iso,
+        )
+
+    def _prepare(
+        self,
+        *,
+        category: str,
+        source_ids,
+        intended_slot,
+        include_link: bool,
+    ) -> Optional[_PreparedDraft]:
+        context = self._source_context(
+            category=category,
+            source_ids=source_ids,
+            intended_slot=intended_slot,
+        )
+        if context is None:
+            return None
+        slot_iso, safe_source_ids, sources = context
+
+        try:
+            candidate = self.generator.generate_grounded_tweet(
+                category,
+                sources,
+                include_link,
+            )
+        except Exception:
+            self._record(
+                slot_iso,
+                category,
+                "generation_failed",
+                {
+                    "reason_codes": ["generation_unavailable"],
+                    "source_ids": safe_source_ids,
+                },
+            )
+            return None
+        if not isinstance(candidate, dict) or not isinstance(
+            candidate.get("text"), str
+        ):
+            self._record(
+                slot_iso,
+                category,
+                "generation_failed",
+                {"source_ids": safe_source_ids},
+            )
+            return None
+        return self._validate_copy(
+            text=candidate["text"],
+            category=category,
+            safe_source_ids=safe_source_ids,
+            sources=sources,
+            slot_iso=slot_iso,
         )
 
     def _persist(self, prepared: _PreparedDraft) -> Optional[Dict]:
@@ -407,6 +454,71 @@ class DraftPipeline:
                 {
                     "supersedes_draft_id": draft_id,
                 },
+            )
+            return None
+        return replacement
+
+    def edit(self, draft_id, text) -> Optional[Dict]:
+        """Validate user copy through the canonical gates, then supersede it."""
+        prior = self.db.get_post_draft(draft_id)
+        if not prior or prior.get("status") != "pending_approval":
+            return None
+        source_ids = prior.get("source_ids")
+        intended_slot = prior.get("intended_slot")
+        context = self._source_context(
+            category=prior.get("category"),
+            source_ids=source_ids,
+            intended_slot=intended_slot,
+        )
+        if context is None:
+            return None
+        slot_iso, safe_source_ids, sources = context
+        prepared = self._validate_copy(
+            text=text,
+            category=prior.get("category"),
+            safe_source_ids=safe_source_ids,
+            sources=sources,
+            slot_iso=slot_iso,
+            exclude_draft_id=draft_id,
+        )
+        if prepared is None:
+            return None
+        try:
+            replacement, outcome = self.db.replace_post_draft_atomic(
+                prior_draft_id=draft_id,
+                expected_revision=prior.get("revision", 0),
+                expected_slot=intended_slot,
+                expected_category=prior.get("category"),
+                expected_source_ids=source_ids,
+                text=prepared.text,
+                score_data=prepared.score_data,
+                publication_key="draft:" + uuid4().hex,
+            )
+        except Exception:
+            self._record(
+                intended_slot,
+                prior.get("category"),
+                "generation_failed",
+                {
+                    "reason_codes": ["draft_persistence_unavailable"],
+                    "source_ids": source_ids,
+                },
+            )
+            return None
+        if outcome == "no_eligible_source":
+            self._record(
+                intended_slot,
+                prior.get("category"),
+                "no_eligible_source",
+                {"source_ids": source_ids},
+            )
+            return None
+        if outcome != "created":
+            self._record(
+                prepared.intended_slot,
+                prepared.category,
+                "regeneration_conflict",
+                {"supersedes_draft_id": draft_id},
             )
             return None
         return replacement

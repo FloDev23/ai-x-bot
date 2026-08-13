@@ -62,8 +62,9 @@ class FakeDraftDatabase:
             return []
         return sources
 
-    def get_recent_content_texts(self, days=30):
+    def get_recent_content_texts(self, days=30, exclude_draft_id=None, now=None):
         assert days == 30
+        del exclude_draft_id, now
         return list(self.recent_texts)
 
     def create_post_draft(self, **values):
@@ -157,8 +158,11 @@ class FakeDraftDatabase:
             or draft["status"] != "pending_approval"
             or draft["revision"] != expected_revision
             or draft["intended_slot"] != expected_slot
-            or now >= slot
         ):
+            return False
+        if now >= slot:
+            draft["status"] = "expired"
+            draft["revision"] += 1
             return False
         draft.update(
             status="approved",
@@ -536,7 +540,7 @@ def test_approve_is_single_use_and_requires_time_before_slot(pipeline_parts):
 
 
 @pytest.mark.parametrize("slot", [NOW, NOW - timedelta(seconds=1)])
-def test_approve_refuses_at_or_after_slot(pipeline_parts, slot):
+def test_approve_expires_at_or_after_slot(pipeline_parts, slot):
     pipeline, database, _, _, _, _ = pipeline_parts
     draft_id = database.create_post_draft(
         text="Ready.",
@@ -548,7 +552,7 @@ def test_approve_refuses_at_or_after_slot(pipeline_parts, slot):
     )
 
     assert pipeline.approve(draft_id, "floriano") is False
-    assert database.get_post_draft(draft_id)["status"] == "pending_approval"
+    assert database.get_post_draft(draft_id)["status"] == "expired"
 
 
 @pytest.mark.parametrize("initial_status", ["pending_approval", "approved", "expired"])

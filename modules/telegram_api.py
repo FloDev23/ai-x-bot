@@ -20,6 +20,10 @@ from config import (
 
 REQUEST_TIMEOUT = 10
 TELEGRAM_POLL_TIMEOUT = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "25"))
+TELEGRAM_MESSAGE_MAX_CHARS = 4096
+TELEGRAM_CAPTION_MAX_CHARS = 1024
+TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
+TELEGRAM_CALLBACK_ANSWER_MAX_CHARS = 200
 _DOWNLOAD_CHUNK_SIZE = 64 * 1024
 _MAX_CONTENT_LENGTH_DIGITS = 19
 _MAX_CONTENT_LENGTH_VALUE = (1 << 63) - 1
@@ -371,6 +375,33 @@ def telegram_media_metadata(message: Any) -> Dict[str, Any]:
     return _named_media_metadata(subtype, message[subtype])
 
 
+def _validate_reply_markup(reply_markup: Optional[Dict[str, Any]]) -> None:
+    if reply_markup is None:
+        return
+    if not isinstance(reply_markup, dict):
+        raise ValueError("Invalid Telegram reply markup")
+    keyboard = reply_markup.get("inline_keyboard")
+    if not isinstance(keyboard, list):
+        raise ValueError("Invalid Telegram reply markup")
+    for row in keyboard:
+        if not isinstance(row, list) or not row:
+            raise ValueError("Invalid Telegram reply markup")
+        for button in row:
+            if not isinstance(button, dict) or not isinstance(button.get("text"), str):
+                raise ValueError("Invalid Telegram inline button")
+            callback_data = button.get("callback_data")
+            if callback_data is None:
+                continue
+            if not isinstance(callback_data, str):
+                raise ValueError("Invalid Telegram callback data")
+            try:
+                size = len(callback_data.encode("utf-8"))
+            except UnicodeError:
+                raise ValueError("Invalid Telegram callback data") from None
+            if not 1 <= size <= TELEGRAM_CALLBACK_DATA_MAX_BYTES:
+                raise ValueError("Invalid Telegram callback data")
+
+
 class _ConnectionPoolLogFilter(logging.Filter):
     _telegram_connectionpool_filter = True
 
@@ -572,9 +603,13 @@ class TelegramApi:
         disable_web_page_preview: bool = False,
         reply_markup: Optional[Dict[str, Any]] = None,
     ):
+        rendered_text = str(text)
+        if not 1 <= len(rendered_text) <= TELEGRAM_MESSAGE_MAX_CHARS:
+            raise ValueError("Telegram message exceeds the supported limit")
+        _validate_reply_markup(reply_markup)
         payload: Dict[str, Any] = {
             "chat_id": str(chat_id),
-            "text": str(text),
+            "text": rendered_text,
             "disable_web_page_preview": bool(disable_web_page_preview),
         }
         if parse_mode:
@@ -602,7 +637,11 @@ class TelegramApi:
         method, field = method_and_field[media_type]
         payload: Dict[str, Any] = {"chat_id": str(chat_id)}
         if caption is not None:
-            payload["caption"] = str(caption)
+            rendered_caption = str(caption)
+            if len(rendered_caption) > TELEGRAM_CAPTION_MAX_CHARS:
+                raise ValueError("Telegram caption exceeds the supported limit")
+            payload["caption"] = rendered_caption
+        _validate_reply_markup(reply_markup)
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
         with Path(media_path).open("rb") as media_file:
@@ -636,7 +675,10 @@ class TelegramApi:
     ):
         payload: Dict[str, Any] = {"callback_query_id": str(callback_id)}
         if text is not None:
-            payload["text"] = str(text)
+            rendered_text = str(text)
+            if len(rendered_text) > TELEGRAM_CALLBACK_ANSWER_MAX_CHARS:
+                raise ValueError("Telegram callback answer exceeds the supported limit")
+            payload["text"] = rendered_text
         if show_alert:
             payload["show_alert"] = True
         return self._post(
@@ -865,6 +907,12 @@ class TelegramApi:
                     method="downloadFile",
                     code="file_too_large",
                 )
+            if declared_length is not None and declared_length != expected_size:
+                raise TelegramApiError(
+                    operation="download",
+                    method="downloadFile",
+                    code="invalid_media_metadata",
+                )
             try:
                 with os.fdopen(file_fd, "wb") as destination_file:
                     file_fd = -1
@@ -881,7 +929,19 @@ class TelegramApi:
                                 method="downloadFile",
                                 code="file_too_large",
                             )
+                        if bytes_written > expected_size:
+                            raise TelegramApiError(
+                                operation="download",
+                                method="downloadFile",
+                                code="invalid_media_metadata",
+                            )
                         destination_file.write(chunk)
+                    if bytes_written != expected_size:
+                        raise TelegramApiError(
+                            operation="download",
+                            method="downloadFile",
+                            code="invalid_media_metadata",
+                        )
             except TelegramApiError:
                 raise
             except Exception as exc:

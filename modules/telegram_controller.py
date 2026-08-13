@@ -1,14 +1,52 @@
-"""Authorized, idempotent dispatch boundary for Telegram updates."""
+"""Authorized, idempotent Telegram control and workflow boundary."""
 
+import hashlib
+import json
+import os
+import re
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlparse
+from uuid import uuid4
 
-from modules.telegram_api import TELEGRAM_POLL_TIMEOUT, TelegramApiError, sanitize_error
+from config import DRY_RUN, NEWS_TRUSTED_DOMAINS
+from modules.telegram_api import (
+    TELEGRAM_CAPTION_MAX_CHARS,
+    TELEGRAM_CALLBACK_DATA_MAX_BYTES,
+    TELEGRAM_MESSAGE_MAX_CHARS,
+    TELEGRAM_POLL_TIMEOUT,
+    TelegramApiError,
+    sanitize_error,
+    telegram_media_metadata,
+)
 
 
 _TRANSPORT_BACKOFF_SECONDS = (1, 2, 4, 8, 30)
 _EMPTY_POLL_DELAY_SECONDS = 0.1
 _SQLITE_INTEGER_MAX = (1 << 63) - 1
 _SUPPORTED_SUBTYPES = ("message", "callback_query")
+_SESSION_VERSION = 1
+_SESSION_TTL = timedelta(minutes=30)
+_SESSION_KINDS = {
+    "source_intake": {"text", "classification", "news_url", "news_date", "news_source"},
+    "draft_edit": {"text"},
+    "draft_postpone": {"slot"},
+}
+_SOURCE_TYPES = {
+    "founder_note": "Founder note",
+    "product_fact": "Product fact",
+    "evergreen_idea": "Evergreen idea",
+    "verified_news": "Verified news",
+}
+_GROWTH_REASONS = {
+    "not_relevant": "Non pertinente",
+    "low_quality": "Qualità bassa",
+    "already_known": "Già noto",
+}
+_SAFE_USERNAME = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+_SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+_SAFE_CALLBACK_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,4096}$")
 
 
 class TelegramController:
@@ -22,6 +60,15 @@ class TelegramController:
         authorized_chat_id: str,
         dispatcher: Optional[Callable[[Dict[str, Any]], Any]] = None,
         poll_timeout: int = TELEGRAM_POLL_TIMEOUT,
+        *,
+        draft_pipeline=None,
+        media_processor=None,
+        media_matcher=None,
+        analytics=None,
+        scheduler_status=None,
+        dry_run: Optional[bool] = None,
+        now_fn=None,
+        news_trusted_domains=None,
     ):
         self.telegram_api = telegram_api
         self.db = db
@@ -29,6 +76,30 @@ class TelegramController:
         self.authorized_chat_id = str(authorized_chat_id)
         self.dispatcher = dispatcher
         self.poll_timeout = int(poll_timeout)
+        self.draft_pipeline = draft_pipeline
+        self.media_processor = media_processor
+        self.media_matcher = media_matcher
+        self.analytics = analytics
+        self.scheduler_status = scheduler_status
+        self.dry_run = DRY_RUN if dry_run is None else bool(dry_run)
+        self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        domains = NEWS_TRUSTED_DOMAINS if news_trusted_domains is None else news_trusted_domains
+        self.news_trusted_domains = {
+            domain.strip().lower().rstrip(".")
+            for domain in domains
+            if isinstance(domain, str) and domain.strip()
+        }
+        self.command_handlers = {
+            "/status": self._status,
+            "/posts": self._posts,
+            "/growth": self._growth,
+            "/stats": self._stats,
+            "/ideas": self._ideas,
+            "/pause": self._pause,
+            "/resume": self._resume,
+            "/errors": self._errors,
+            "/help": self._help,
+        }
 
     @staticmethod
     def _supported_subtype(update: Dict[str, Any]):
@@ -64,9 +135,978 @@ class TelegramController:
         return stop_event is not None and stop_event.is_set()
 
     def _dispatch(self, update: Dict[str, Any]):
-        if self.dispatcher is None:
-            return "ignored"
-        return self.dispatcher(update)
+        if self.dispatcher is not None:
+            return self.dispatcher(update)
+        return self._dispatch_workflow(update)
+
+    @staticmethod
+    def _clean_text(value: Any, limit: int) -> str:
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.split())[:limit]
+
+    @staticmethod
+    def _positive_id(value: Any) -> Optional[int]:
+        if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+            return None
+        try:
+            parsed = int(value)
+        except (ValueError, OverflowError):
+            return None
+        if not 0 < parsed <= _SQLITE_INTEGER_MAX:
+            return None
+        return parsed
+
+    def _now(self) -> datetime:
+        value = self.now_fn()
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if not isinstance(value, datetime):
+            raise ValueError("invalid controller clock")
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def _send(self, chat_id: str, text: Any, *, reply_markup=None):
+        """Send plain text so user data cannot become HTML/Markdown markup."""
+        rendered = str(text).strip() or "Nessun dato disponibile."
+        if len(rendered) > TELEGRAM_MESSAGE_MAX_CHARS:
+            rendered = rendered[: TELEGRAM_MESSAGE_MAX_CHARS - 1] + "…"
+        return self.telegram_api.send_message(
+            str(chat_id),
+            rendered,
+            parse_mode=None,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+
+    @staticmethod
+    def _callback_markup(rows):
+        return {"inline_keyboard": rows}
+
+    @staticmethod
+    def _fit_labeled_lines(fields, budget: int) -> str:
+        """Fit metadata into ``budget`` while retaining every field label."""
+        values = [str(value) for _label, value in fields]
+
+        def render():
+            return "\n".join(
+                label + value for (label, _original), value in zip(fields, values)
+            )
+
+        rendered = render()
+        while len(rendered) > budget:
+            candidates = [
+                index for index, value in enumerate(values) if len(value) > 1
+            ]
+            if not candidates:
+                return rendered[:max(0, budget)]
+            index = max(candidates, key=lambda candidate: len(values[candidate]))
+            excess = len(rendered) - budget
+            target = max(1, len(values[index]) - excess)
+            values[index] = (
+                "…"
+                if target == 1
+                else values[index][:target - 1] + "…"
+            )
+            rendered = render()
+        return rendered
+
+    @staticmethod
+    def _callback_button(text: str, data: str) -> Dict[str, str]:
+        try:
+            size = len(data.encode("utf-8"))
+        except UnicodeError:
+            raise ValueError("invalid callback data") from None
+        if not 1 <= size <= TELEGRAM_CALLBACK_DATA_MAX_BYTES:
+            raise ValueError("invalid callback data")
+        return {"text": text, "callback_data": data}
+
+    def _dispatch_workflow(self, update: Dict[str, Any]):
+        if "message" in update:
+            message = update["message"]
+            chat_id = str(message["chat"]["id"])
+            if any(name in message for name in ("photo", "video", "document")):
+                return self._ingest_media(chat_id, message)
+            text = message.get("text")
+            if not isinstance(text, str) or not text.strip():
+                self._send(chat_id, "Messaggio non supportato.")
+                return "unsupported_message"
+            if len(text) > TELEGRAM_MESSAGE_MAX_CHARS:
+                self._send(chat_id, "Messaggio troppo lungo.")
+                return "invalid_message"
+            stripped = text.strip()
+            if stripped.startswith("/"):
+                command = stripped.split(None, 1)[0].split("@", 1)[0].lower()
+                handler = self.command_handlers.get(command)
+                if handler is None:
+                    self._send(chat_id, "Comando non riconosciuto. Usa /help.")
+                    return "unknown_command"
+                return handler(chat_id)
+            return self._handle_text_input(chat_id, text)
+
+        callback = update["callback_query"]
+        chat_id = str(callback["message"]["chat"]["id"])
+        data = callback.get("data")
+        if not isinstance(data, str):
+            self._send(chat_id, "Azione non valida.")
+            return "invalid_callback"
+        try:
+            size = len(data.encode("utf-8"))
+        except UnicodeError:
+            size = 0
+        if not 1 <= size <= TELEGRAM_CALLBACK_DATA_MAX_BYTES:
+            self._send(chat_id, "Azione non valida.")
+            return "invalid_callback"
+        return self._handle_callback(chat_id, data)
+
+    def _status(self, chat_id: str):
+        paused = self.db.get_state("paused", "false") == "true"
+        lines = [
+            "Stato",
+            f"dry-run: {'attivo' if self.dry_run else 'disattivo'}",
+            f"pausa: {'attiva' if paused else 'disattiva'}",
+        ]
+        jobs = []
+        if callable(self.scheduler_status):
+            try:
+                reported = self.scheduler_status()
+                if isinstance(reported, (list, tuple)):
+                    jobs = list(reported)[:10]
+            except Exception:
+                jobs = []
+        if jobs:
+            lines.append("prossimi job:")
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+                name = self._clean_text(job.get("name"), 80) or "job"
+                when = self._clean_text(job.get("next_run"), 80) or "non disponibile"
+                lines.append(f"- {name}: {when}")
+        else:
+            lines.append("prossimi job: non disponibili")
+        self._send(chat_id, "\n".join(lines))
+        return "status"
+
+    def _draft_markup(self, draft_id: int):
+        prefix = str(draft_id)
+        return self._callback_markup([
+            [
+                self._callback_button("Approva", f"draft:approve:{prefix}"),
+                self._callback_button("Rigenera", f"draft:regen:{prefix}"),
+            ],
+            [
+                self._callback_button("Modifica", f"draft:edit:{prefix}"),
+                self._callback_button("Scegli media", f"draft:media:{prefix}"),
+            ],
+            [
+                self._callback_button("Solo testo", f"draft:textonly:{prefix}"),
+                self._callback_button("Posticipa", f"draft:postpone:{prefix}"),
+            ],
+            [self._callback_button("Scarta", f"draft:discard:{prefix}")],
+        ])
+
+    def _draft_card_text(self, draft: Dict[str, Any]) -> str:
+        source_labels = []
+        for source_id in draft.get("source_ids") or []:
+            if type(source_id) is not int:
+                continue
+            source = self.db.get_content_source(source_id)
+            if not source:
+                continue
+            label = self._clean_text(source.get("source_type"), 60) or "source"
+            metadata = source.get("metadata") or {}
+            if isinstance(metadata, dict):
+                detail = self._clean_text(
+                    metadata.get("source_name") or metadata.get("title"), 100,
+                )
+                if detail:
+                    label += f" ({detail})"
+            source_labels.append(label)
+        score = draft.get("score_data") or {}
+        score_parts = []
+        if isinstance(score, dict):
+            for key in sorted(score):
+                value = score[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                score_parts.append(f"{self._clean_text(str(key), 40)}: {value}")
+        media_label = "nessuno"
+        media_id = draft.get("media_id")
+        if type(media_id) is int:
+            media = self.db.get_media_by_id(media_id)
+            if media:
+                media_label = self._clean_text(media.get("filename"), 160) or str(media_id)
+                description = self._clean_text(media.get("ai_description"), 240)
+                if description:
+                    media_label += f" — {description}"
+        text = draft.get("text") if isinstance(draft.get("text"), str) else ""
+        fields = [
+            ("Bozza #", draft.get("id")),
+            ("stato: ", self._clean_text(draft.get("status"), 40) or "sconosciuto"),
+            ("categoria: ", self._clean_text(draft.get("category"), 100) or "n/d"),
+            ("slot: ", self._clean_text(draft.get("intended_slot"), 100) or "n/d"),
+            ("fonti: ", ", ".join(source_labels) if source_labels else "nessuna"),
+            ("score: ", ", ".join(score_parts) if score_parts else "n/d"),
+            ("media: ", media_label),
+        ]
+        post_section = "\n\n" + text
+        metadata = self._fit_labeled_lines(
+            fields,
+            TELEGRAM_MESSAGE_MAX_CHARS - len(post_section),
+        )
+        return metadata + post_section
+
+    def _send_draft_card(self, chat_id: str, draft: Dict[str, Any]):
+        draft_id = draft.get("id")
+        markup = self._draft_markup(draft_id) if type(draft_id) is int else None
+        self._send(chat_id, self._draft_card_text(draft), reply_markup=markup)
+
+    def _posts(self, chat_id: str):
+        pending = self.db.list_post_drafts(["pending_approval"], limit=50)
+        approved = self.db.list_post_drafts(["approved"], limit=50)
+        scheduled = self.db.list_post_drafts(["publishing"], limit=50)
+        published = self.db.list_post_drafts(["published"], limit=5)
+        self._send(
+            chat_id,
+            "Post\n"
+            f"in attesa: {len(pending)}\n"
+            f"approvati: {len(approved)}\n"
+            f"programmati: {len(scheduled)}\n"
+            f"pubblicati recenti: {len(published)}",
+        )
+        for draft in pending + approved + scheduled + published:
+            self._send_draft_card(chat_id, draft)
+        return "posts"
+
+    @staticmethod
+    def _candidate_url(candidate: Dict[str, Any]) -> Optional[str]:
+        profile = candidate.get("profile") or {}
+        username = candidate.get("username") or (
+            profile.get("username") if isinstance(profile, dict) else None
+        )
+        if not isinstance(username, str) or _SAFE_USERNAME.fullmatch(username) is None:
+            return None
+        latest = candidate.get("latest_post") or {}
+        tweet_id = None
+        if isinstance(latest, dict):
+            tweet_id = latest.get("id") or latest.get("tweet_id")
+        if isinstance(tweet_id, str) and tweet_id.isascii() and tweet_id.isdigit():
+            return f"https://x.com/{username}/status/{tweet_id}"
+        return f"https://x.com/{username}"
+
+    def _growth_card(self, candidate: Dict[str, Any]):
+        profile = candidate.get("profile") or {}
+        latest = candidate.get("latest_post") or {}
+        username = self._clean_text(candidate.get("username"), 40) or "sconosciuto"
+        bio = self._clean_text(
+            profile.get("description") if isinstance(profile, dict) else None, 400,
+        )
+        followers = profile.get("followers_count") if isinstance(profile, dict) else None
+        latest_text = self._clean_text(
+            latest.get("text") if isinstance(latest, dict) else None, 500,
+        )
+        lines = [
+            f"Candidato #{candidate.get('id')} — @{username}",
+            f"score: {candidate.get('score')}",
+            f"fonte: {self._clean_text(candidate.get('discovery_source'), 80) or 'n/d'}",
+            f"follower: {followers if type(followers) is int else 'n/d'}",
+        ]
+        if bio:
+            lines.append(f"bio: {bio}")
+        if latest_text:
+            lines.append(f"segnale: {latest_text}")
+        candidate_id = candidate.get("id")
+        rows = []
+        direct_url = self._candidate_url(candidate)
+        if direct_url:
+            rows.append([{"text": "Open on X", "url": direct_url}])
+        if type(candidate_id) is int:
+            rows.extend([
+                [
+                    self._callback_button("Salva", f"growth:save:{candidate_id}"),
+                    self._callback_button(
+                        "Seguito su X", f"growth:followed:{candidate_id}",
+                    ),
+                ],
+                [self._callback_button("Scarta", f"growth:discard:{candidate_id}")],
+            ])
+        return "\n".join(lines), self._callback_markup(rows) if rows else None
+
+    def _growth(self, chat_id: str):
+        candidates = self.db.get_digest_candidates(limit=5)
+        if not candidates:
+            self._send(chat_id, "Nessun candidato growth disponibile.")
+            return "growth_empty"
+        self._send(chat_id, f"Growth: {len(candidates)} candidati. Azioni solo manuali.")
+        for candidate in candidates:
+            text, markup = self._growth_card(candidate)
+            self._send(chat_id, text, reply_markup=markup)
+        return "growth"
+
+    def _stats(self, chat_id: str):
+        report = None
+        if self.analytics is not None:
+            for method_name in ("weekly_report", "get_weekly_report"):
+                method = getattr(self.analytics, method_name, None)
+                if callable(method):
+                    report = method()
+                    break
+            if report is None:
+                ranking = getattr(self.analytics, "get_ranking", None)
+                if callable(ranking):
+                    report = {"ranking": ranking(days=7)}
+        if not isinstance(report, dict) or not report:
+            self._send(chat_id, "Statistiche non ancora disponibili.")
+            return "stats_empty"
+        lines = ["Statistiche"]
+        for key in sorted(report):
+            value = report[key]
+            if isinstance(value, (dict, list, tuple)):
+                rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            else:
+                rendered = str(value)
+            lines.append(f"{self._clean_text(str(key), 80)}: {self._clean_text(rendered, 800)}")
+        self._send(chat_id, "\n".join(lines))
+        return "stats"
+
+    def _source_type_markup(self):
+        return self._callback_markup([
+            [self._callback_button(label, f"input:source:{source_type}")]
+            for source_type, label in _SOURCE_TYPES.items()
+        ])
+
+    def _ideas(self, chat_id: str):
+        counts = {source_type: 0 for source_type in _SOURCE_TYPES}
+        for source in self.db.get_eligible_sources():
+            source_type = source.get("source_type")
+            if source_type in counts:
+                counts[source_type] += 1
+        self._set_session(chat_id, "source_intake", "text", {})
+        lines = ["Fonti attive"]
+        for source_type, label in _SOURCE_TYPES.items():
+            lines.append(f"{label}: {counts[source_type]}")
+        lines.append("Invia ora il testo da classificare.")
+        self._send(chat_id, "\n".join(lines))
+        return "ideas"
+
+    def _pause(self, chat_id: str):
+        self.db.set_state("paused", "true")
+        self._send(chat_id, "Pubblicazioni in pausa.")
+        return "paused"
+
+    def _resume(self, chat_id: str):
+        self.db.set_state("paused", "false")
+        self._send(chat_id, "Pubblicazioni riattivate.")
+        return "resumed"
+
+    def _errors(self, chat_id: str):
+        errors = self.db.get_recent_errors(limit=10, unresolved_only=False)
+        if not errors:
+            self._send(chat_id, "Nessun errore recente.")
+            return "errors_empty"
+        lines = ["Errori recenti"]
+        for event in errors:
+            context = self._clean_text(event.get("context"), 100)
+            kind = self._clean_text(event.get("error_type"), 100)
+            message = self._clean_text(event.get("safe_message"), 500)
+            created = self._clean_text(event.get("created_at"), 80)
+            lines.append(f"- {created} | {context} | {kind} | {message}")
+        self._send(chat_id, "\n".join(lines))
+        return "errors"
+
+    def _help(self, chat_id: str):
+        self._send(chat_id, "\n".join([
+            "Comandi",
+            "/status — stato e prossimi job",
+            "/posts — bozze e pubblicati",
+            "/growth — candidati manuali",
+            "/stats — riepilogo performance",
+            "/ideas — aggiungi una fonte",
+            "/pause — ferma le pubblicazioni",
+            "/resume — riattiva le pubblicazioni",
+            "/errors — ultimi errori sicuri",
+            "/help — questo elenco",
+        ]))
+        return "help"
+
+    @staticmethod
+    def _session_key(chat_id: str) -> str:
+        return f"telegram_session:{chat_id}"
+
+    def _session_value(self, kind: str, step: str, payload: Dict[str, Any]) -> str:
+        session = {
+            "version": _SESSION_VERSION,
+            "token": uuid4().hex,
+            "kind": kind,
+            "step": step,
+            "payload": payload,
+            "expires_at": (self._now() + _SESSION_TTL).isoformat(),
+        }
+        return json.dumps(session, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _set_session(self, chat_id: str, kind: str, step: str, payload: Dict[str, Any]):
+        value = self._session_value(kind, step, payload)
+        self.db.set_state(self._session_key(chat_id), value)
+        return value
+
+    def _valid_session_payload(self, kind: str, step: str, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if kind == "source_intake":
+            if step == "text":
+                return payload == {}
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip() or len(text) > 2000:
+                return False
+            if step == "classification":
+                return set(payload) == {"text"}
+            url = payload.get("url")
+            if step == "news_url":
+                return set(payload) == {"text"}
+            if not isinstance(url, str) or not self._trusted_news_url(url):
+                return False
+            if step == "news_date":
+                return set(payload) == {"text", "url"}
+            published_at = payload.get("published_at")
+            try:
+                published = date.fromisoformat(published_at)
+            except (TypeError, ValueError):
+                return False
+            return (
+                step == "news_source"
+                and set(payload) == {"text", "url", "published_at"}
+                and published_at == published.isoformat()
+                and published <= self._now().date()
+            )
+        if kind in {"draft_edit", "draft_postpone"}:
+            return (
+                set(payload) == {"draft_id"}
+                and type(payload.get("draft_id")) is int
+                and 0 < payload["draft_id"] <= _SQLITE_INTEGER_MAX
+            )
+        return False
+
+    def _decode_session(self, raw: Any):
+        if not isinstance(raw, str) or len(raw) > 8192:
+            return None
+        try:
+            session = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(session, dict) or set(session) != {
+            "version", "token", "kind", "step", "payload", "expires_at",
+        }:
+            return None
+        kind = session.get("kind")
+        step = session.get("step")
+        token = session.get("token")
+        if (
+            session.get("version") != _SESSION_VERSION
+            or kind not in _SESSION_KINDS
+            or step not in _SESSION_KINDS[kind]
+            or not isinstance(token, str)
+            or _SAFE_TOKEN.fullmatch(token) is None
+            or not self._valid_session_payload(kind, step, session.get("payload"))
+        ):
+            return None
+        try:
+            expires_at = datetime.fromisoformat(
+                session["expires_at"].replace("Z", "+00:00")
+            )
+            if expires_at.tzinfo is None or expires_at.astimezone(timezone.utc) <= self._now():
+                return None
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return session
+
+    def _load_session(self, chat_id: str):
+        key = self._session_key(chat_id)
+        raw = self.db.get_state(key)
+        if raw is None:
+            return None, None, False
+        session = self._decode_session(raw)
+        if session is None:
+            self.db.compare_and_clear_state(key, raw)
+            return raw, None, True
+        return raw, session, False
+
+    def _replace_session(
+        self,
+        chat_id: str,
+        expected_raw: str,
+        kind: str,
+        step: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        new_value = self._session_value(kind, step, payload)
+        return self.db.compare_and_set_state(
+            self._session_key(chat_id), expected_raw, new_value,
+        )
+
+    def _consume_session(self, chat_id: str, expected_raw: str) -> bool:
+        return self.db.compare_and_clear_state(
+            self._session_key(chat_id), expected_raw,
+        )
+
+    def _handle_text_input(self, chat_id: str, text: str):
+        raw, session, invalid = self._load_session(chat_id)
+        if invalid:
+            self._send(chat_id, "Sessione non valida o scaduta. Riprova.")
+            return "invalid_session"
+        if session is None:
+            self._send(chat_id, "Usa /ideas o un pulsante per iniziare.")
+            return "no_session"
+
+        clean = text.strip()
+        kind = session["kind"]
+        step = session["step"]
+        payload = session["payload"]
+        if kind == "source_intake":
+            if step == "text":
+                if not clean or len(clean) > 2000:
+                    self._send(chat_id, "Testo non valido: massimo 2000 caratteri.")
+                    return "invalid_source_text"
+                if not self._replace_session(
+                    chat_id, raw, kind, "classification", {"text": clean},
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                self._send(
+                    chat_id,
+                    "Scegli il tipo di fonte.",
+                    reply_markup=self._source_type_markup(),
+                )
+                return "source_classification"
+            if step == "news_url":
+                if not self._trusted_news_url(clean):
+                    self._send(chat_id, "URL non valido: usa una pagina HTTPS allowlisted.")
+                    return "invalid_news_url"
+                if not self._replace_session(
+                    chat_id,
+                    raw,
+                    kind,
+                    "news_date",
+                    {"text": payload["text"], "url": clean},
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                self._send(chat_id, "Inserisci la data di pubblicazione: YYYY-MM-DD.")
+                return "news_date"
+            if step == "news_date":
+                try:
+                    published = date.fromisoformat(clean)
+                except (TypeError, ValueError):
+                    published = None
+                if (
+                    published is None
+                    or clean != published.isoformat()
+                    or published > self._now().date()
+                ):
+                    self._send(chat_id, "Data non valida: usa YYYY-MM-DD, non futura.")
+                    return "invalid_news_date"
+                if not self._replace_session(
+                    chat_id,
+                    raw,
+                    kind,
+                    "news_source",
+                    {
+                        "text": payload["text"],
+                        "url": payload["url"],
+                        "published_at": clean,
+                    },
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                self._send(chat_id, "Inserisci il nome della fonte.")
+                return "news_source"
+            if step == "news_source":
+                source_name = self._clean_text(clean, 120)
+                if not source_name or len(clean) > 120:
+                    self._send(chat_id, "Nome fonte non valido: massimo 120 caratteri.")
+                    return "invalid_news_source"
+                if not self._consume_session(chat_id, raw):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                if self.db.content_source_exists(payload["url"]):
+                    self._send(chat_id, "Questa fonte è già presente.")
+                    return "duplicate_source"
+                summary = payload["text"]
+                title = self._clean_text(summary.splitlines()[0], 200)
+                self.db.add_content_source(
+                    source_type="verified_news",
+                    text=summary,
+                    url=payload["url"],
+                    metadata={
+                        "title": title,
+                        "summary": summary,
+                        "published_at": payload["published_at"],
+                        "source_name": source_name,
+                    },
+                    trust_state="verified",
+                    verified_by="floriano",
+                )
+                self._send(chat_id, "News verificata salvata.")
+                return "source_saved"
+
+        if kind == "draft_edit" and step == "text":
+            if self.draft_pipeline is None:
+                self._consume_session(chat_id, raw)
+                self._send(chat_id, "Pipeline bozze non disponibile.")
+                return "draft_unavailable"
+            if not self._consume_session(chat_id, raw):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            replacement = self.draft_pipeline.edit(payload["draft_id"], clean)
+            if not isinstance(replacement, dict):
+                self._send(chat_id, "Modifica respinta dai controlli editoriali.")
+                return "draft_edit_rejected"
+            self._send(chat_id, "Modifica validata; nuova bozza in approvazione.")
+            self._send_draft_card(chat_id, replacement)
+            return "draft_edited"
+
+        if kind == "draft_postpone" and step == "slot":
+            try:
+                slot = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                slot = None
+            if slot is None or slot.tzinfo is None or slot.astimezone(timezone.utc) <= self._now():
+                self._send(chat_id, "Slot non valido: usa ISO 8601 con fuso e data futura.")
+                return "invalid_slot"
+            if self.draft_pipeline is None:
+                self._consume_session(chat_id, raw)
+                self._send(chat_id, "Pipeline bozze non disponibile.")
+                return "draft_unavailable"
+            if not self._consume_session(chat_id, raw):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            normalized = slot.isoformat()
+            if not self.draft_pipeline.postpone(payload["draft_id"], normalized):
+                self._send(chat_id, "Riprogrammazione non riuscita.")
+                return "draft_postpone_rejected"
+            self._send(chat_id, "Bozza riprogrammata; serve una nuova approvazione.")
+            return "draft_postponed"
+
+        self.db.compare_and_clear_state(self._session_key(chat_id), raw)
+        self._send(chat_id, "Sessione non valida o scaduta. Riprova.")
+        return "invalid_session"
+
+    def _trusted_news_url(self, value: str) -> bool:
+        if not self.news_trusted_domains or not isinstance(value, str) or len(value) > 2048:
+            return False
+        try:
+            parsed = urlparse(value)
+            port = parsed.port
+        except (TypeError, ValueError):
+            return False
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme.lower() != "https"
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in (None, 443)
+            or not parsed.path
+            or parsed.path == "/"
+        ):
+            return False
+        return any(
+            host == domain or host.endswith("." + domain)
+            for domain in self.news_trusted_domains
+        )
+
+    def _handle_callback(self, chat_id: str, data: str):
+        parts = data.split(":")
+        if parts[0] == "draft" and len(parts) == 3:
+            draft_id = self._positive_id(parts[2])
+            if draft_id is not None:
+                return self._draft_callback(chat_id, parts[1], draft_id)
+        if parts[0] == "growth":
+            return self._growth_callback(chat_id, parts)
+        if parts[0] == "input":
+            return self._input_callback(chat_id, parts)
+        self._send(chat_id, "Azione non valida.")
+        return "invalid_callback"
+
+    def _draft_callback(self, chat_id: str, action: str, draft_id: int):
+        if action in {"approve", "regen", "edit", "postpone", "discard"} and (
+            self.draft_pipeline is None
+        ):
+            self._send(chat_id, "Pipeline bozze non disponibile.")
+            return "draft_unavailable"
+        if action == "approve":
+            approved = self.draft_pipeline.approve(draft_id, "floriano")
+            draft = self.db.get_post_draft(draft_id)
+            if approved:
+                self._send(chat_id, "Bozza approvata per lo slot previsto.")
+                return "draft_approved"
+            if draft and draft.get("status") == "expired":
+                self._send(
+                    chat_id,
+                    "Slot scaduto: la bozza non sarà pubblicata. Riprogrammala.",
+                    reply_markup=self._callback_markup([[
+                        self._callback_button(
+                            "Riprogramma", f"draft:postpone:{draft_id}",
+                        )
+                    ]]),
+                )
+                return "draft_expired"
+            self._send(chat_id, "Approvazione non disponibile.")
+            return "draft_approve_rejected"
+        if action == "regen":
+            replacement = self.draft_pipeline.regenerate(draft_id)
+            if not isinstance(replacement, dict):
+                self._send(chat_id, "Rigenerazione non riuscita.")
+                return "draft_regen_rejected"
+            self._send(chat_id, "Nuova bozza generata.")
+            self._send_draft_card(chat_id, replacement)
+            return "draft_regenerated"
+        if action == "edit":
+            draft = self.db.get_post_draft(draft_id)
+            if not draft or draft.get("status") != "pending_approval":
+                self._send(chat_id, "Bozza non modificabile.")
+                return "draft_edit_rejected"
+            self._set_session(chat_id, "draft_edit", "text", {"draft_id": draft_id})
+            self._send(chat_id, "Invia il nuovo testo completo.")
+            return "draft_edit_input"
+        if action == "media":
+            if self.media_matcher is None:
+                self._send(chat_id, "Matcher media non disponibile.")
+                return "media_unavailable"
+            media = self.media_matcher.attach_best(draft_id)
+            if not isinstance(media, dict):
+                self._send(chat_id, "Nessun media sufficientemente pertinente.")
+                return "media_not_matched"
+            self._send(chat_id, f"Media #{media.get('id')} associato alla bozza.")
+            draft = self.db.get_post_draft(draft_id)
+            if draft:
+                self._send_draft_card(chat_id, draft)
+            return "media_matched"
+        if action == "textonly":
+            detach = getattr(self.db, "detach_media_from_draft", None)
+            if not callable(detach) or not detach(draft_id):
+                self._send(chat_id, "Impossibile impostare la bozza solo testo.")
+                return "textonly_rejected"
+            self._send(chat_id, "Bozza impostata solo testo.")
+            return "textonly"
+        if action == "postpone":
+            draft = self.db.get_post_draft(draft_id)
+            if not draft or draft.get("status") not in {
+                "pending_approval", "approved", "expired",
+            }:
+                self._send(chat_id, "Bozza non riprogrammabile.")
+                return "draft_postpone_rejected"
+            self._set_session(
+                chat_id, "draft_postpone", "slot", {"draft_id": draft_id},
+            )
+            self._send(chat_id, "Invia il nuovo slot ISO 8601 con fuso orario.")
+            return "draft_postpone_input"
+        if action == "discard":
+            if not self.draft_pipeline.discard(draft_id, "user_discarded"):
+                self._send(chat_id, "Bozza non scartabile.")
+                return "draft_discard_rejected"
+            self._send(chat_id, "Bozza scartata.")
+            return "draft_discarded"
+        self._send(chat_id, "Azione bozza non valida.")
+        return "invalid_callback"
+
+    def _input_callback(self, chat_id: str, parts):
+        if parts == ["input", "cancel"]:
+            raw = self.db.get_state(self._session_key(chat_id))
+            if raw is not None:
+                self.db.compare_and_clear_state(self._session_key(chat_id), raw)
+            self._send(chat_id, "Operazione annullata.")
+            return "input_cancelled"
+        if len(parts) != 3 or parts[1] != "source" or parts[2] not in _SOURCE_TYPES:
+            self._send(chat_id, "Classificazione non valida.")
+            return "invalid_callback"
+        raw, session, invalid = self._load_session(chat_id)
+        if invalid or session is None:
+            self._send(chat_id, "Sessione non valida o scaduta. Riprova.")
+            return "invalid_session"
+        if session["kind"] != "source_intake" or session["step"] != "classification":
+            self._send(chat_id, "Questa sessione non attende una classificazione.")
+            return "invalid_session"
+        source_type = parts[2]
+        text = session["payload"]["text"]
+        if source_type == "verified_news":
+            if not self._replace_session(
+                chat_id, raw, "source_intake", "news_url", {"text": text},
+            ):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            self._send(chat_id, "Inserisci l'URL HTTPS allowlisted dell'articolo.")
+            return "news_url"
+        if not self._consume_session(chat_id, raw):
+            self._send(chat_id, "Operazione già gestita.")
+            return "session_conflict"
+        self.db.add_content_source(
+            source_type=source_type,
+            text=text,
+            trust_state="verified",
+            verified_by="floriano",
+        )
+        self._send(chat_id, f"{_SOURCE_TYPES[source_type]} salvata.")
+        return "source_saved"
+
+    def _growth_callback(self, chat_id: str, parts):
+        if len(parts) == 3 and parts[1] in {"save", "followed", "discard"}:
+            candidate_id = self._positive_id(parts[2])
+            if candidate_id is None:
+                self._send(chat_id, "Candidato non valido.")
+                return "invalid_callback"
+            if parts[1] == "discard":
+                rows = [[
+                    self._callback_button(
+                        label, f"growth:reason:{candidate_id}:{reason}",
+                    )
+                ] for reason, label in _GROWTH_REASONS.items()]
+                self._send(
+                    chat_id,
+                    "Perché vuoi scartarlo?",
+                    reply_markup=self._callback_markup(rows),
+                )
+                return "growth_discard_reason"
+            decision = "saved" if parts[1] == "save" else "followed_manually"
+            if not self.db.mark_candidate_decision(candidate_id, decision):
+                self._send(chat_id, "Decisione già registrata o non valida.")
+                return "growth_decision_rejected"
+            message = "Candidato salvato." if decision == "saved" else (
+                "Azione manuale registrata; nessuna azione è stata inviata a X."
+            )
+            self._send(chat_id, message)
+            return decision
+        if len(parts) == 4 and parts[1] == "reason":
+            candidate_id = self._positive_id(parts[2])
+            reason = parts[3]
+            if candidate_id is None or reason not in _GROWTH_REASONS:
+                self._send(chat_id, "Motivo non valido.")
+                return "invalid_callback"
+            if not self.db.mark_candidate_decision(candidate_id, "discarded", reason):
+                self._send(chat_id, "Decisione già registrata o non valida.")
+                return "growth_decision_rejected"
+            self._send(chat_id, "Candidato scartato per 30 giorni.")
+            return "growth_discarded"
+        self._send(chat_id, "Azione growth non valida.")
+        return "invalid_callback"
+
+    def _ingest_media(self, chat_id: str, message: Dict[str, Any]):
+        if self.media_processor is None:
+            self._send(chat_id, "Upload media non disponibile.")
+            return "media_unavailable"
+        caption = message.get("caption", "")
+        if (
+            not isinstance(caption, str)
+            or len(caption) > TELEGRAM_CAPTION_MAX_CHARS
+        ):
+            self._send(chat_id, "Upload non valido.")
+            return "invalid_media"
+        try:
+            metadata = telegram_media_metadata(message)
+        except TelegramApiError:
+            self._send(chat_id, "Upload non valido o non supportato.")
+            return "invalid_media"
+
+        downloaded = None
+        try:
+            remote = self.telegram_api.get_file(metadata["file_id"])
+            if not self._get_file_matches(remote, metadata):
+                self._send(chat_id, "File Telegram non valido.")
+                return "invalid_media"
+            root = getattr(self.telegram_api, "media_library_dir", None)
+            if root is None:
+                self._send(chat_id, "Archivio media non disponibile.")
+                return "media_unavailable"
+            root = Path(os.path.abspath(os.fspath(root)))
+            if not root.is_absolute() or not root.is_dir():
+                self._send(chat_id, "Archivio media non disponibile.")
+                return "media_unavailable"
+            suffix = Path(metadata["message_filename"]).suffix.lower()
+            destination = root / f".telegram-download-{uuid4().hex}{suffix}"
+            downloaded = destination
+            returned_path = self.telegram_api.download_file(
+                remote["file_path"],
+                destination,
+                message_filename=metadata["message_filename"],
+                mime_type=metadata["mime_type"],
+                expected_size=metadata["expected_size"],
+            )
+            if Path(returned_path) != destination:
+                raise ValueError("unexpected_download_destination")
+            record = self.media_processor.process_new_file(
+                str(downloaded),
+                metadata["message_filename"],
+                metadata["mime_type"],
+                metadata["expected_size"],
+                caption.strip(),
+            )
+        except Exception:
+            self._cleanup_download(downloaded)
+            self._send(chat_id, "Upload non riuscito. Riprova.")
+            return "media_failed"
+        finally:
+            self._cleanup_download(downloaded)
+
+        if not isinstance(record, dict) or type(record.get("id")) is not int:
+            self._send(chat_id, "Upload non riuscito. Riprova.")
+            return "media_failed"
+        state = self._clean_text(
+            record.get("lifecycle_state") or record.get("state"), 80,
+        ) or "available"
+        description = self._clean_text(record.get("ai_description"), 500) or "n/d"
+        tags = self._clean_text(record.get("ai_tags"), 500) or "n/d"
+        context = self._clean_text(record.get("user_context"), 500) or "n/d"
+        self._send(chat_id, "\n".join([
+            f"Libreria #{record['id']}",
+            f"stato: {state}",
+            f"descrizione: {description}",
+            f"tag: {tags}",
+            f"contesto: {context}",
+        ]))
+        return "media_saved"
+
+    @staticmethod
+    def _get_file_matches(remote: Any, metadata: Dict[str, Any]) -> bool:
+        if not isinstance(remote, dict) or not isinstance(remote.get("file_path"), str):
+            return False
+        file_path = remote["file_path"]
+        if not file_path or len(file_path) > 4096:
+            return False
+        file_id = remote.get("file_id")
+        if file_id is not None and file_id != metadata["file_id"]:
+            return False
+        file_size = remote.get("file_size")
+        if file_size is not None and file_size != metadata["expected_size"]:
+            return False
+        unique_id = remote.get("file_unique_id")
+        if unique_id is not None:
+            if (
+                not isinstance(unique_id, str)
+                or not unique_id
+                or len(unique_id) > 4096
+                or any(ord(character) < 32 for character in unique_id)
+            ):
+                return False
+            try:
+                digest = hashlib.sha256(unique_id.encode("utf-8")).hexdigest()
+            except UnicodeError:
+                return False
+            if not Path(metadata["message_filename"]).stem.endswith("-" + digest):
+                return False
+        return True
+
+    @staticmethod
+    def _cleanup_download(path: Any) -> None:
+        if path is None:
+            return
+        try:
+            candidate = Path(path)
+            if candidate.is_symlink():
+                candidate.unlink()
+            elif candidate.exists() and candidate.is_file():
+                candidate.unlink()
+        except (OSError, TypeError, ValueError):
+            pass
 
     def _notify_failure(self, context: str, error: Exception) -> None:
         try:
@@ -121,7 +1161,8 @@ class TelegramController:
         if str(chat_id) != self.authorized_chat_id:
             return self._complete_local_state(update_id, "unauthorized")
         if subtype == "callback_query" and (
-            not isinstance(payload.get("id"), str) or not payload["id"]
+            not isinstance(payload.get("id"), str)
+            or _SAFE_CALLBACK_ID.fullmatch(payload["id"]) is None
         ):
             return self._complete_local_state(update_id, "malformed")
         if self._stopped(stop_event):
