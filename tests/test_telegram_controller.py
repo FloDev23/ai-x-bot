@@ -14,6 +14,7 @@ from modules.telegram_api import (
     TelegramApi,
     TelegramApiError,
     sanitize_error,
+    telegram_media_metadata,
 )
 from modules.telegram_controller import TelegramController
 
@@ -872,6 +873,44 @@ def test_connectionpool_filter_redacts_token_only_in_traceback_or_stack(
     assert secret not in serialized
 
 
+@pytest.mark.parametrize("origin_field", ["pathname", "filename", "module", "funcName"])
+def test_connectionpool_filter_detects_registered_token_in_each_origin_field(
+    tmp_path,
+    caplog,
+    origin_field,
+):
+    secret = f"123456789:telegram_Bot-Secret-{origin_field}"
+    TelegramApi(secret, tmp_path, requests_client=FakeRequests())
+    caplog.set_level(logging.DEBUG)
+    logger = logging.getLogger("urllib3.connectionpool")
+    record = logger.makeRecord(
+        logger.name,
+        logging.DEBUG,
+        "/safe/nontelegram.py",
+        1,
+        "generic diagnostic",
+        (),
+        None,
+        "generic_function",
+    )
+    setattr(record, origin_field, secret)
+    logger.handle(record)
+    captured = caplog.records[-1]
+    assert captured.getMessage() == "urllib3 connectionpool event"
+    serialized = caplog.text + " ".join((
+        str(captured.msg),
+        repr(captured.args),
+        str(captured.exc_info),
+        str(captured.exc_text),
+        str(captured.stack_info),
+        captured.pathname,
+        captured.filename,
+        captured.module,
+        captured.funcName,
+    ))
+    assert secret not in serialized
+
+
 def test_get_updates_uses_exact_poll_timeout_and_allowed_updates(tmp_path):
     requests_client = FakeRequests(post_outcomes=[
         FakeResponse({"ok": True, "result": [{"update_id": 40}]})
@@ -1050,6 +1089,334 @@ def test_sanitize_error_uses_closed_metadata_allowlists():
     )
     assert safe == "exception=BaseException"
     assert "OpaquePrivateValue" not in safe
+
+
+def test_telegram_photo_metadata_selects_largest_photo_size():
+    message = {
+        "message_id": 1,
+        "photo": [
+            {
+                "file_id": "small-file",
+                "file_unique_id": "small-unique",
+                "width": 90,
+                "height": 90,
+                "file_size": 800,
+            },
+            {
+                "file_id": "large-file",
+                "file_unique_id": "large-unique",
+                "width": 1920,
+                "height": 1080,
+                "file_size": 5000,
+            },
+            {
+                "file_id": "medium-file",
+                "file_unique_id": "medium-unique",
+                "width": 640,
+                "height": 480,
+                "file_size": 2000,
+            },
+        ],
+    }
+    metadata = telegram_media_metadata(message)
+    assert metadata == {
+        "file_id": "large-file",
+        "message_filename": (
+            "telegram-photo-"
+            "8d43be05474937ae2149ae27707a67ce685d5242fb8375617480f752b76558b2.jpg"
+        ),
+        "mime_type": "image/jpeg",
+        "expected_size": 5000,
+    }
+
+
+def test_telegram_photo_metadata_breaks_largest_tie_deterministically():
+    first = {
+        "file_id": "tie-file-a",
+        "file_unique_id": "tie-unique-a",
+        "width": 100,
+        "height": 200,
+        "file_size": 1000,
+    }
+    second = {
+        "file_id": "tie-file-b",
+        "file_unique_id": "tie-unique-b",
+        "width": 200,
+        "height": 100,
+        "file_size": 1000,
+    }
+    forward = telegram_media_metadata({"photo": [first, second]})
+    reverse = telegram_media_metadata({"photo": [second, first]})
+    assert forward == reverse
+    assert forward["file_id"] == "tie-file-b"
+
+
+def test_telegram_photo_metadata_breaks_identical_unique_id_tie_deterministically():
+    first = {
+        "file_id": "rotating-file-a",
+        "file_unique_id": "shared-unique",
+        "width": 100,
+        "height": 100,
+        "file_size": 1000,
+    }
+    second = {**first, "file_id": "rotating-file-b"}
+    forward = telegram_media_metadata({"photo": [first, second]})
+    reverse = telegram_media_metadata({"photo": [second, first]})
+    assert forward == reverse
+
+
+def test_telegram_photo_metadata_canonicalizes_unsafe_ids_without_collisions():
+    def metadata(unique_id):
+        return telegram_media_metadata({
+            "photo": [{
+                "file_id": "../../raw-file-id",
+                "file_unique_id": unique_id,
+                "width": 100,
+                "height": 100,
+                "file_size": 1000,
+            }]
+        })
+
+    slash = metadata("unsafe/a")
+    question = metadata("unsafe?a")
+    assert slash["file_id"] == "../../raw-file-id"
+    assert slash["message_filename"] != question["message_filename"]
+    for result in (slash, question):
+        filename = result["message_filename"]
+        assert filename.startswith("telegram-photo-")
+        assert filename.endswith(".jpg")
+        assert "/" not in filename
+        assert "\\" not in filename
+        assert ".." not in filename
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda photo: photo.pop("file_size"),
+        lambda photo: photo.update(file_size=True),
+        lambda photo: photo.update(file_size=0),
+        lambda photo: photo.pop("file_id"),
+        lambda photo: photo.pop("width"),
+        lambda photo: photo.update(height=0),
+        lambda photo: photo.update(file_unique_id="\ud800"),
+    ],
+)
+def test_telegram_photo_metadata_missing_or_invalid_fields_fail_closed(mutation):
+    photo = {
+        "file_id": "photo-file",
+        "file_unique_id": "photo-unique",
+        "width": 100,
+        "height": 100,
+        "file_size": 1000,
+    }
+    mutation(photo)
+    with pytest.raises(TelegramApiError) as raised:
+        telegram_media_metadata({"photo": [photo]})
+    assert str(raised.value) == (
+        "operation=media_metadata code=invalid_media_metadata"
+    )
+
+
+def test_telegram_photo_metadata_does_not_fallback_from_invalid_largest_entry():
+    with pytest.raises(TelegramApiError) as raised:
+        telegram_media_metadata({
+            "photo": [
+                {
+                    "file_id": "small-file",
+                    "width": 100,
+                    "height": 100,
+                    "file_size": 1000,
+                },
+                {
+                    "file_id": "largest-file",
+                    "width": 1000,
+                    "height": 1000,
+                },
+            ]
+        })
+    assert str(raised.value) == (
+        "operation=media_metadata code=invalid_media_metadata"
+    )
+
+
+@pytest.mark.parametrize(
+    ("subtype", "payload", "expected_mime", "expected_suffix"),
+    [
+        (
+            "video",
+            {
+                "file_id": "video-file",
+                "file_unique_id": "video-unique",
+                "file_name": "Studio Tour.MOV",
+                "mime_type": "video/quicktime",
+                "file_size": 10_000,
+            },
+            "video/quicktime",
+            ".mov",
+        ),
+        (
+            "document",
+            {
+                "file_id": "document-file",
+                "file_unique_id": "document-unique",
+                "file_name": "brand-photo.PNG",
+                "mime_type": "image/png",
+                "file_size": 20_000,
+            },
+            "image/png",
+            ".png",
+        ),
+    ],
+)
+def test_telegram_video_and_document_metadata_are_canonical(
+    subtype,
+    payload,
+    expected_mime,
+    expected_suffix,
+):
+    metadata = telegram_media_metadata({subtype: payload})
+    assert metadata["file_id"] == payload["file_id"]
+    assert metadata["mime_type"] == expected_mime
+    assert metadata["expected_size"] == payload["file_size"]
+    assert metadata["message_filename"].startswith(f"telegram-{subtype}-")
+    assert metadata["message_filename"].endswith(expected_suffix)
+    assert Path(metadata["message_filename"]).name == metadata["message_filename"]
+
+
+def test_telegram_media_canonical_filenames_avoid_same_name_collisions():
+    def metadata(file_id):
+        return telegram_media_metadata({
+            "document": {
+                "file_id": file_id,
+                "file_name": "same-name.webp",
+                "mime_type": "image/webp",
+                "file_size": 100,
+            }
+        })
+
+    assert metadata("document-a")["message_filename"] != metadata("document-b")[
+        "message_filename"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        ({}, "unsupported_media_type"),
+        ({"animation": {}}, "unsupported_media_type"),
+        ({"photo": [], "video": {}}, "invalid_media_metadata"),
+        (
+            {
+                "video": {
+                    "file_id": "video-file",
+                    "file_name": "clip.mp4",
+                    "mime_type": "video/mp4",
+                }
+            },
+            "invalid_media_metadata",
+        ),
+        (
+            {
+                "video": {
+                    "file_id": "video-file",
+                    "file_name": "clip.mp4",
+                    "mime_type": "video/quicktime",
+                    "file_size": 100,
+                }
+            },
+            "invalid_media_metadata",
+        ),
+        (
+            {
+                "video": {
+                    "file_id": "video-file",
+                    "file_name": "still.jpg",
+                    "mime_type": "image/jpeg",
+                    "file_size": 100,
+                }
+            },
+            "unsupported_media_type",
+        ),
+        (
+            {
+                "document": {
+                    "file_id": "document-file",
+                    "file_name": "../clip.mp4",
+                    "mime_type": "video/mp4",
+                    "file_size": 100,
+                }
+            },
+            "invalid_media_metadata",
+        ),
+        (
+            {
+                "document": {
+                    "file_id": "document-file",
+                    "file_name": "archive.bin",
+                    "mime_type": "application/octet-stream",
+                    "file_size": 100,
+                }
+            },
+            "unsupported_media_type",
+        ),
+    ],
+)
+def test_telegram_media_metadata_malformed_messages_fail_with_reason_code(
+    message,
+    expected_code,
+):
+    with pytest.raises(TelegramApiError) as raised:
+        telegram_media_metadata(message)
+    assert str(raised.value) == f"operation=media_metadata code={expected_code}"
+
+
+@pytest.mark.parametrize(
+    ("subtype", "payload"),
+    [
+        (
+            "photo",
+            [{
+                "file_id": "photo-file",
+                "width": 100,
+                "height": 100,
+                "file_size": telegram_api_module.TELEGRAM_MAX_IMAGE_BYTES + 1,
+            }],
+        ),
+        (
+            "video",
+            {
+                "file_id": "video-file",
+                "file_name": "clip.mp4",
+                "mime_type": "video/mp4",
+                "file_size": telegram_api_module.TELEGRAM_MAX_VIDEO_BYTES + 1,
+            },
+        ),
+    ],
+)
+def test_telegram_media_metadata_enforces_configured_cap(subtype, payload):
+    with pytest.raises(TelegramApiError) as raised:
+        telegram_media_metadata({subtype: payload})
+    assert str(raised.value) == "operation=media_metadata code=file_too_large"
+
+
+def test_telegram_media_metadata_validation_has_no_network_or_file_side_effect(
+    tmp_path,
+):
+    media_root = tmp_path / "media"
+    requests_client = FakeRequests(get_outcomes=[pytest.fail])
+    api = TelegramApi("123456:secret", media_root, requests_client=requests_client)
+    with pytest.raises(TelegramApiError):
+        telegram_media_metadata({
+            "document": {
+                "file_id": "document-file",
+                "file_name": "../../unsafe.mp4",
+                "mime_type": "video/mp4",
+                "file_size": 100,
+            }
+        })
+    assert requests_client.gets == []
+    assert not media_root.exists()
 
 
 def test_download_requires_explicit_message_media_metadata(tmp_path):

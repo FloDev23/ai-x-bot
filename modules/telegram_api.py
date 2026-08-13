@@ -1,5 +1,6 @@
 """Small, bounded Requests transport for the Telegram Bot API."""
 
+import hashlib
 import logging
 import os
 import re
@@ -22,6 +23,7 @@ TELEGRAM_POLL_TIMEOUT = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "25"))
 _DOWNLOAD_CHUNK_SIZE = 64 * 1024
 _MAX_CONTENT_LENGTH_DIGITS = 19
 _MAX_CONTENT_LENGTH_VALUE = (1 << 63) - 1
+_MAX_TELEGRAM_ID_CHARS = 4096
 _MIME_BY_SUFFIX = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -32,6 +34,7 @@ _MIME_BY_SUFFIX = {
     ".m4v": "video/x-m4v",
 }
 _IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+_VIDEO_MIME_TYPES = frozenset({"video/mp4", "video/quicktime", "video/x-m4v"})
 _ALLOWED_OPERATIONS = frozenset({
     "api",
     "cycle",
@@ -40,6 +43,7 @@ _ALLOWED_OPERATIONS = frozenset({
     "error_persistence",
     "http",
     "json",
+    "media_metadata",
     "notification_delivery",
     "opportunity_cycle",
     "performance_cycle",
@@ -66,6 +70,7 @@ _ALLOWED_CODES = frozenset({
     "invalid_object",
     "invalid_result",
     "invalid_status",
+    "unsupported_media_type",
 })
 _ALLOWED_EXCEPTION_CLASSES = frozenset({
     "BaseException",
@@ -217,6 +222,155 @@ def sanitize_error(
     )
 
 
+def _media_metadata_error(code: str) -> TelegramApiError:
+    return TelegramApiError(operation="media_metadata", code=code)
+
+
+def _positive_integer(value: Any) -> bool:
+    return type(value) is int and 0 < value <= _MAX_CONTENT_LENGTH_VALUE
+
+
+def _valid_telegram_file_id(value: Any) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_TELEGRAM_ID_CHARS
+        or any(ord(character) < 32 for character in value)
+    ):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        return False
+    return True
+
+
+def _telegram_file_identity(payload: Dict[str, Any]) -> tuple[str, str]:
+    file_id = payload.get("file_id")
+    if not _valid_telegram_file_id(file_id):
+        raise _media_metadata_error("invalid_media_metadata")
+    file_unique_id = payload.get("file_unique_id")
+    if file_unique_id is None:
+        identity = file_id
+    elif _valid_telegram_file_id(file_unique_id):
+        identity = file_unique_id
+    else:
+        raise _media_metadata_error("invalid_media_metadata")
+    return file_id, identity
+
+
+def _canonical_media_filename(subtype: str, identity: str, suffix: str) -> str:
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"telegram-{subtype}-{digest}{suffix}"
+
+
+def _normalized_media_mime(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.split(";", 1)[0].strip().lower()
+
+
+def _metadata_size_limit(mime_type: str) -> int:
+    return (
+        TELEGRAM_MAX_IMAGE_BYTES
+        if mime_type in _IMAGE_MIME_TYPES
+        else TELEGRAM_MAX_VIDEO_BYTES
+    )
+
+
+def _photo_metadata(photo_sizes: Any) -> Dict[str, Any]:
+    if not isinstance(photo_sizes, list) or not photo_sizes:
+        raise _media_metadata_error("invalid_media_metadata")
+    candidates = []
+    for photo in photo_sizes:
+        if not isinstance(photo, dict):
+            raise _media_metadata_error("invalid_media_metadata")
+        file_id, identity = _telegram_file_identity(photo)
+        width = photo.get("width")
+        height = photo.get("height")
+        file_size = photo.get("file_size")
+        if not all(
+            _positive_integer(value) for value in (width, height, file_size)
+        ):
+            raise _media_metadata_error("invalid_media_metadata")
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        file_id_digest = hashlib.sha256(file_id.encode("utf-8")).hexdigest()
+        candidates.append((
+            (width * height, width, height, file_size, digest, file_id_digest),
+            file_id,
+            identity,
+            file_size,
+        ))
+    _rank, file_id, identity, file_size = max(candidates, key=lambda item: item[0])
+    if file_size > TELEGRAM_MAX_IMAGE_BYTES:
+        raise _media_metadata_error("file_too_large")
+    return {
+        "file_id": file_id,
+        "message_filename": _canonical_media_filename("photo", identity, ".jpg"),
+        "mime_type": "image/jpeg",
+        "expected_size": file_size,
+    }
+
+
+def _named_media_metadata(subtype: str, payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise _media_metadata_error("invalid_media_metadata")
+    file_id, identity = _telegram_file_identity(payload)
+    file_name = payload.get("file_name")
+    if (
+        not isinstance(file_name, str)
+        or not file_name
+        or len(file_name) > 255
+        or "\x00" in file_name
+        or "/" in file_name
+        or "\\" in file_name
+        or file_name in {".", ".."}
+    ):
+        raise _media_metadata_error("invalid_media_metadata")
+    suffix = Path(file_name).suffix.lower()
+    expected_mime = _MIME_BY_SUFFIX.get(suffix)
+    if expected_mime is None or (
+        subtype == "video" and expected_mime not in _VIDEO_MIME_TYPES
+    ):
+        raise _media_metadata_error("unsupported_media_type")
+    mime_type = _normalized_media_mime(payload.get("mime_type"))
+    file_size = payload.get("file_size")
+    if mime_type != expected_mime or not _positive_integer(file_size):
+        raise _media_metadata_error("invalid_media_metadata")
+    if file_size > _metadata_size_limit(mime_type):
+        raise _media_metadata_error("file_too_large")
+    return {
+        "file_id": file_id,
+        "message_filename": _canonical_media_filename(subtype, identity, suffix),
+        "mime_type": mime_type,
+        "expected_size": file_size,
+    }
+
+
+def telegram_media_metadata(message: Any) -> Dict[str, Any]:
+    """Validate Telegram message media into the trusted Task 9 download contract.
+
+    Exactly one of ``photo``, ``video`` or ``document`` is accepted. No
+    transport or filesystem operation occurs here. Telegram ``getFile`` does
+    not supply MIME or original message metadata, so callers must canonicalize
+    the message with this helper before requesting or downloading the file.
+    """
+    if not isinstance(message, dict):
+        raise _media_metadata_error("invalid_media_metadata")
+    subtypes = [
+        subtype for subtype in ("photo", "video", "document")
+        if subtype in message
+    ]
+    if not subtypes:
+        raise _media_metadata_error("unsupported_media_type")
+    if len(subtypes) != 1:
+        raise _media_metadata_error("invalid_media_metadata")
+    subtype = subtypes[0]
+    if subtype == "photo":
+        return _photo_metadata(message[subtype])
+    return _named_media_metadata(subtype, message[subtype])
+
+
 class _ConnectionPoolLogFilter(logging.Filter):
     _telegram_connectionpool_filter = True
 
@@ -229,6 +383,10 @@ class _ConnectionPoolLogFilter(logging.Filter):
             record.args,
             record.exc_text,
             record.stack_info,
+            record.pathname,
+            record.filename,
+            record.module,
+            record.funcName,
         ]
         if record.exc_info is not None:
             fragments.append(record.exc_info[1])
@@ -657,8 +815,10 @@ class TelegramApi:
         """Download media using MIME and size metadata from the Telegram message.
 
         ``getFile`` supplies only the remote path. The caller (Task 9) must
-        preserve and pass the original message filename/MIME/size. The
-        destination may sanitize the basename but must preserve its extension.
+        obtain ``message_filename``, ``mime_type`` and ``expected_size`` from
+        :func:`telegram_media_metadata`, not invent or copy arbitrary fields.
+        The destination basename may differ but must preserve the canonical
+        extension.
         """
         safe_remote_path = self._validate_remote_file_path(file_path)
         requested_destination = Path(destination)
