@@ -57,17 +57,29 @@ class PerformanceAnalyzer:
         observed_on = current_time.astimezone(
             ZoneInfo(BOT_TIMEZONE)
         ).date().isoformat()
+        empty_summary = {
+            "followers_total": 0,
+            "new_total": 0,
+            "new_relevant": 0,
+            "source_counts": {},
+            "follow_backs_by_source": {},
+        }
         try:
-            fetched = self.client.get_followers_profiles()
-            read_succeeded = isinstance(fetched, (list, tuple))
+            read_followers = getattr(self.client, "read_followers_profiles", None)
+            if not callable(read_followers):
+                return empty_summary
+            fetched = read_followers()
+            profiles = getattr(fetched, "profiles", None)
+            read_succeeded = getattr(fetched, "complete", None) is True
         except Exception as error:
             logger.warning(
                 "follower_snapshot_read_failed error_type=%s",
                 type(error).__name__,
             )
-            fetched = []
+            profiles = []
             read_succeeded = False
-        profiles = fetched if isinstance(fetched, (list, tuple)) else []
+        if not read_succeeded or not isinstance(profiles, (list, tuple)):
+            return empty_summary
         valid_profiles = []
         seen = set()
         for profile in profiles:
@@ -79,13 +91,7 @@ class PerformanceAnalyzer:
             seen.add(user_id)
             valid_profiles.append(profile)
 
-        summary = {
-            "followers_total": len(valid_profiles),
-            "new_total": 0,
-            "new_relevant": 0,
-            "source_counts": {},
-            "follow_backs_by_source": {},
-        }
+        observations = []
         for profile in valid_profiles:
             user_id = profile.get("user_id", profile.get("id"))
             candidate = None
@@ -108,38 +114,11 @@ class PerformanceAnalyzer:
                             type(score.get("total")) is int
                             and score["total"] >= GROWTH_SCORE_THRESHOLD
                         )
-            result = self.db.capture_follower_observation(
-                observed_on,
-                current_time,
-                profile,
-                relevant,
-            )
-            if not isinstance(result, dict) or result.get("is_new") is not True:
-                continue
-            summary["new_total"] += 1
-            if result.get("relevant") is True:
-                summary["new_relevant"] += 1
-            source = result.get("attribution_source")
-            if type(source) is not str or not source:
-                source = "unattributed"
-            summary["source_counts"][source] = (
-                summary["source_counts"].get(source, 0) + 1
-            )
-            if result.get("followed_back") is True:
-                summary["follow_backs_by_source"][source] = (
-                    summary["follow_backs_by_source"].get(source, 0) + 1
-                )
-        summary["source_counts"] = dict(sorted(summary["source_counts"].items()))
-        summary["follow_backs_by_source"] = dict(
-            sorted(summary["follow_backs_by_source"].items())
+            observations.append((profile, relevant))
+        result = self.db.capture_follower_snapshot_batch(
+            observed_on, current_time, observations, len(valid_profiles),
         )
-        if read_succeeded:
-            self.db.save_follower_snapshot_run(
-                observed_on,
-                current_time,
-                len(valid_profiles),
-            )
-        return summary
+        return result if isinstance(result, dict) else empty_summary
 
     def build_weekly_report(self, end_date) -> Dict:
         """Build one deterministic seven-operating-day factual report."""

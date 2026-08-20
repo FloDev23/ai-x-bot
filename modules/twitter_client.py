@@ -3,6 +3,7 @@ import os
 import re
 import tweepy
 from collections.abc import Mapping
+from dataclasses import dataclass
 from requests import exceptions as requests_exceptions
 from config import (
     TWITTER_API_KEY,
@@ -11,9 +12,17 @@ from config import (
     TWITTER_ACCESS_TOKEN_SECRET,
     TWITTER_BEARER_TOKEN
 )
-from typing import BinaryIO, Callable, Dict, List, Optional
+from typing import BinaryIO, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FollowerProfilesRead:
+    """One paginated follower traversal and whether it reached the end."""
+
+    profiles: Tuple[Dict, ...]
+    complete: bool
 
 
 class XPublicationError(RuntimeError):
@@ -335,11 +344,11 @@ class TwitterClient:
             "public_metrics",
         ]
 
-    def get_followers_profiles(self) -> List[Dict]:
-        """Read public profiles of accounts currently following this account."""
+    def read_followers_profiles(self) -> FollowerProfilesRead:
+        """Read one full follower traversal with an explicit completion bit."""
         self_id = self.get_authenticated_user_id_cached()
         if not self_id:
-            return []
+            return FollowerProfilesRead((), False)
         profiles = []
         seen_ids = set()
         seen_tokens = set()
@@ -347,7 +356,7 @@ class TwitterClient:
         for _page_number in range(100):
             if pagination_token is not None:
                 if pagination_token in seen_tokens:
-                    break
+                    return FollowerProfilesRead(tuple(profiles), False)
                 seen_tokens.add(pagination_token)
             params = {
                 "id": self_id,
@@ -363,7 +372,7 @@ class TwitterClient:
                     "x_growth_followers_read_failed error_type=%s",
                     type(error).__name__,
                 )
-                break
+                return FollowerProfilesRead(tuple(profiles), False)
             try:
                 response_users = getattr(response, "data", None)
                 if not isinstance(response_users, (list, tuple)):
@@ -373,7 +382,7 @@ class TwitterClient:
                     "x_growth_followers_page_skipped error_type=%s",
                     type(error).__name__,
                 )
-                break
+                return FollowerProfilesRead(tuple(profiles), False)
             for user in response_users:
                 try:
                     profile = self._profile_dict(user)
@@ -389,21 +398,25 @@ class TwitterClient:
                 profiles.append(profile)
             try:
                 meta = getattr(response, "meta", None)
-                next_token = (
-                    meta.get("next_token") if isinstance(meta, Mapping) else None
-                )
+                if not isinstance(meta, Mapping):
+                    raise ValueError("malformed follower page metadata")
+                next_token = meta.get("next_token")
             except Exception as error:
                 logger.warning(
                     "x_growth_followers_page_skipped error_type=%s",
                     type(error).__name__,
                 )
-                break
+                return FollowerProfilesRead(tuple(profiles), False)
             if next_token is None:
-                break
+                return FollowerProfilesRead(tuple(profiles), True)
             if type(next_token) is not str or not next_token:
-                break
+                return FollowerProfilesRead(tuple(profiles), False)
             pagination_token = next_token
-        return profiles
+        return FollowerProfilesRead(tuple(profiles), False)
+
+    def get_followers_profiles(self) -> List[Dict]:
+        """Legacy Task 10 boundary: retain valid rows from a partial traversal."""
+        return list(self.read_followers_profiles().profiles)
 
     def _search_recent_profiles(self, query: str, limit: int) -> List[Dict]:
         try:

@@ -1,6 +1,10 @@
 import json
 import multiprocessing
+import os
+import sqlite3
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -87,6 +91,26 @@ class FollowerX:
         self.follower_reads += 1
         return list(self.followers)
 
+    def read_followers_profiles(self):
+        self.follower_reads += 1
+        return SimpleNamespace(profiles=tuple(self.followers), complete=True)
+
+
+class IncompleteFollowerX:
+    def __init__(self, followers):
+        self.followers = list(followers)
+        self.follower_reads = 0
+        self.legacy_reads = 0
+        self.write_calls = []
+
+    def read_followers_profiles(self):
+        self.follower_reads += 1
+        return SimpleNamespace(profiles=tuple(self.followers), complete=False)
+
+    def get_followers_profiles(self):
+        self.legacy_reads += 1
+        return list(self.followers)
+
 
 def analyzer_for(tmp_path, followers=None, name="analytics.db"):
     database = Database(str(tmp_path / name))
@@ -134,6 +158,30 @@ def _capture_worker(db_path, start_event, result_queue):
         result_queue.put({"error": f"{type(error).__name__}: {error}"})
 
 
+class _HardCrashDatabase(Database):
+    @contextmanager
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.create_function("task11_hard_crash", 0, lambda: os._exit(73))
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _hard_crash_capture_worker(db_path):
+    database = _HardCrashDatabase(db_path)
+    PerformanceAnalyzer(
+        FollowerX([
+            follower_profile("501", "first_owner"),
+            follower_profile("502", "second_owner"),
+        ]),
+        database,
+    ).capture_follower_snapshot(NOW)
+
+
 def _insert_post(database, tweet_id, category, created_at, impressions=None):
     with database._conn() as conn:
         conn.execute(
@@ -173,6 +221,178 @@ def test_snapshot_detects_new_relevant_follower_from_canonical_cache(tmp_path):
     }
     assert fake_x.follower_reads == 1
     assert fake_x.write_calls == []
+
+
+def test_incomplete_follower_read_writes_nothing(tmp_path):
+    profile = follower_profile("120", "partial_owner")
+    database = Database(str(tmp_path / "incomplete.db"))
+    fake_x = IncompleteFollowerX([profile])
+    analyzer = PerformanceAnalyzer(fake_x, database)
+
+    summary = analyzer.capture_follower_snapshot(NOW)
+
+    assert summary == {
+        "followers_total": 0,
+        "new_total": 0,
+        "new_relevant": 0,
+        "source_counts": {},
+        "follow_backs_by_source": {},
+    }
+    assert fake_x.follower_reads == 1
+    assert fake_x.legacy_reads == 0
+    with database._conn() as conn:
+        snapshot_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM follower_snapshots"
+        ).fetchone()["count"]
+        run_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM follower_snapshot_runs"
+        ).fetchone()["count"]
+    assert (snapshot_count, run_count) == (0, 0)
+
+
+def test_hard_crash_rolls_back_rows_conversion_and_run_then_retry_matches_report(
+    tmp_path,
+):
+    db_path = str(tmp_path / "hard-crash.db")
+    database = Database(db_path)
+    first_profile = follower_profile("501", "first_owner")
+    candidate_id = add_candidate(database, first_profile, source="network")
+    assert database.mark_candidate_decision(
+        candidate_id,
+        "followed_manually",
+        decided_at=NOW - timedelta(hours=1),
+    )
+    with database._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER task11_crash_on_second_follower
+            BEFORE INSERT ON follower_snapshots
+            WHEN NEW.user_id = '502'
+            BEGIN
+                SELECT task11_hard_crash();
+            END
+        """)
+
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(target=_hard_crash_capture_worker, args=(db_path,))
+    process.start()
+    process.join(timeout=20)
+
+    assert process.exitcode == 73
+    with Database(db_path)._conn() as conn:
+        snapshots = conn.execute(
+            "SELECT user_id FROM follower_snapshots ORDER BY user_id"
+        ).fetchall()
+        runs = conn.execute(
+            "SELECT observed_on FROM follower_snapshot_runs"
+        ).fetchall()
+        conn.execute("DROP TRIGGER task11_crash_on_second_follower")
+    assert snapshots == []
+    assert runs == []
+    assert Database(db_path).get_growth_candidate("501")["followed_back_at"] is None
+    crashed_report = PerformanceAnalyzer(
+        FollowerX([]), Database(db_path)
+    ).build_weekly_report(date(2026, 8, 10))
+    assert crashed_report["new_followers"] == 0
+    assert crashed_report["followers_total"] == 0
+
+    retry = PerformanceAnalyzer(
+        FollowerX([
+            first_profile,
+            follower_profile("502", "second_owner"),
+        ]),
+        Database(db_path),
+    ).capture_follower_snapshot(NOW)
+    retry_report = PerformanceAnalyzer(
+        FollowerX([]), Database(db_path)
+    ).build_weekly_report(date(2026, 8, 10))
+
+    assert retry["followers_total"] == 2
+    assert retry["new_total"] == retry_report["new_followers"] == 2
+    assert retry["new_relevant"] == retry_report["new_relevant_followers"] == 1
+    assert retry["source_counts"] == retry_report["factual_blocks"][
+        "new_follower_sources"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("first_seen", "expected_conversion"),
+    [
+        (NOW - timedelta(hours=2), False),
+        (NOW - timedelta(hours=1), False),
+        (NOW - timedelta(minutes=30), True),
+        ("malformed", False),
+    ],
+)
+def test_task10_preobservation_uses_preserved_first_seen_for_strict_attribution(
+    tmp_path, first_seen, expected_conversion,
+):
+    profile = follower_profile("121", "preobserved")
+    database = Database(str(tmp_path / f"preobserved-{expected_conversion}.db"))
+    candidate_id = add_candidate(database, profile, source="network")
+    assert database.mark_candidate_decision(
+        candidate_id,
+        "followed_manually",
+        decided_at=NOW - timedelta(hours=1),
+    )
+    observed_on = NOW.date().isoformat()
+    assert database.save_follower_snapshot(
+        observed_on, profile, relevant=True, source="task10",
+    )
+    stored_first_seen = (
+        first_seen.isoformat() if isinstance(first_seen, datetime) else first_seen
+    )
+    with database._conn() as conn:
+        conn.execute(
+            "UPDATE follower_snapshots SET first_seen_at = ? WHERE user_id = ?",
+            (stored_first_seen, profile["id"]),
+        )
+
+    summary = PerformanceAnalyzer(
+        FollowerX([profile]), database,
+    ).capture_follower_snapshot(NOW)
+
+    candidate = database.get_growth_candidate(profile["id"])
+    assert (candidate["followed_back_at"] is not None) is expected_conversion
+    assert summary["follow_backs_by_source"] == (
+        {"network": 1} if expected_conversion else {}
+    )
+    with database._conn() as conn:
+        snapshot = conn.execute(
+            "SELECT first_seen_at FROM follower_snapshots WHERE user_id = ?",
+            (profile["id"],),
+        ).fetchone()
+    assert snapshot["first_seen_at"] == stored_first_seen
+
+
+def test_same_day_older_and_equal_captures_are_idempotent_and_monotonic(tmp_path):
+    newer_profile = follower_profile("122", "newer_owner")
+    stale_profile = follower_profile("123", "stale_owner")
+    equal_profile = follower_profile("124", "equal_owner")
+    analyzer, fake_x, database = analyzer_for(tmp_path, [newer_profile])
+    newest_time = NOW + timedelta(hours=3)
+
+    newest = analyzer.capture_follower_snapshot(newest_time)
+    fake_x.followers = [stale_profile]
+    stale = analyzer.capture_follower_snapshot(NOW)
+    fake_x.followers = [equal_profile]
+    equal = analyzer.capture_follower_snapshot(newest_time)
+
+    assert stale == equal == newest
+    with database._conn() as conn:
+        rows = conn.execute(
+            "SELECT user_id, captured_at FROM follower_snapshots ORDER BY user_id"
+        ).fetchall()
+        run = conn.execute(
+            "SELECT followers_total, captured_at FROM follower_snapshot_runs"
+        ).fetchone()
+    assert [dict(row) for row in rows] == [{
+        "user_id": "122",
+        "captured_at": newest_time.isoformat(),
+    }]
+    assert dict(run) == {
+        "followers_total": 1,
+        "captured_at": newest_time.isoformat(),
+    }
 
 
 def test_snapshot_rerun_upserts_relevance_without_counting_twice(tmp_path):
@@ -267,7 +487,7 @@ def test_snapshot_claim_is_atomic_across_processes_and_restart(tmp_path):
     results = [result_queue.get(timeout=5) for _process in processes]
 
     assert all("error" not in result for result in results), results
-    assert sorted(result["new_total"] for result in results) == [0, 1]
+    assert [result["new_total"] for result in results] == [1, 1]
     with Database(db_path)._conn() as conn:
         rows = conn.execute("SELECT user_id, is_new FROM follower_snapshots").fetchall()
     assert [dict(row) for row in rows] == [{"user_id": "700", "is_new": 1}]
@@ -275,7 +495,7 @@ def test_snapshot_claim_is_atomic_across_processes_and_restart(tmp_path):
         FollowerX([follower_profile("700", "concurrentown")]),
         Database(db_path),
     )
-    assert restarted.capture_follower_snapshot(NOW)["new_total"] == 0
+    assert restarted.capture_follower_snapshot(NOW)["new_total"] == 1
 
 
 def test_malformed_followers_are_isolated_and_exact_ids_are_not_coerced(tmp_path):
@@ -522,6 +742,57 @@ def test_weekly_report_median_is_deterministic_for_odd_and_even_samples(
         "founder_story": len(impressions) // 2,
         "gym_strategy": (len(impressions) + 1) // 2,
     }
+
+
+def test_only_exact_nonempty_string_tweet_ids_feed_reports_and_metrics(tmp_path):
+    analyzer, _fake_x, database = analyzer_for(tmp_path)
+    created_at = NOW - timedelta(days=1)
+    invalid_ids = [None, "", "   ", sqlite3.Binary(b"ghost")]
+    for index, tweet_id in enumerate(invalid_ids):
+        _insert_post(
+            database,
+            tweet_id,
+            f"ghost_{index}",
+            created_at - timedelta(minutes=index),
+            900 + index,
+        )
+    _insert_post(database, "confirmed-1", "confirmed", created_at, 20)
+
+    report = analyzer.build_weekly_report(date(2026, 8, 10))
+
+    assert report["post_count"] == 1
+    assert report["content_by_category"] == {"confirmed": 1}
+    assert report["median_impressions"] == 20
+    assert database.get_category_performance(days=30, end_at=NOW) == {
+        "confirmed": {"impressions": 20, "engagement": 0, "posts": 1},
+    }
+    assert database.get_recent_tweet_ids() == ["confirmed-1"]
+
+
+def test_ghost_post_cannot_open_the_thirty_day_reweighting_gate(tmp_path):
+    analyzer, _fake_x, database = analyzer_for(tmp_path)
+    _insert_post(database, "   ", "ghost", NOW - timedelta(days=45), 999)
+    valid_created_at = NOW - timedelta(days=2)
+    _insert_post(database, "confirmed-2", "strong", valid_created_at, 100)
+    with database._conn() as conn:
+        conn.execute(
+            "UPDATE tweet_metrics SET likes = 10 WHERE tweet_id = 'confirmed-2'"
+        )
+
+    assert database.get_first_posted_at() == valid_created_at.isoformat()
+    assert analyzer.recompute_category_weights(now=NOW) == {}
+    assert database.get_all_category_weights() == {}
+
+
+def test_weekly_report_skips_pathological_counter_without_crashing(tmp_path):
+    analyzer, _fake_x, database = analyzer_for(tmp_path)
+    database.set_state("growth_queries:2026-08-10", "9" * 5000)
+    database.set_state("growth_profile_evaluations:2026-08-10", "7" * 5000)
+
+    report = analyzer.build_weekly_report(date(2026, 8, 10))
+
+    assert report["query_budget_used"] == 0
+    assert report["profiles_evaluated"] == 0
 
 
 def test_weekly_report_counts_period_decisions_conversions_and_budgets(tmp_path):

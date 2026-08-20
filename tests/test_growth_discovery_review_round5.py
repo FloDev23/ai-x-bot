@@ -65,7 +65,10 @@ class TweepyGrowthBackend:
     def get_users_followers(self, **kwargs):
         token = kwargs.get("pagination_token")
         self.follower_tokens.append(token)
-        return self.follower_pages[token]
+        result = self.follower_pages[token]
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     def get_users_tweets(self, **kwargs):
         user_id = str(kwargs["id"])
@@ -195,6 +198,39 @@ def test_follower_pagination_normalizes_only_none_description_and_keeps_partial_
     assert [row["id"] for row in rows] == ["201", "205", "206"]
     assert [row["description"] for row in rows] == ["", "Gym owner", ""]
     assert json.loads(json.dumps(rows)) == rows
+
+
+def test_follower_snapshot_boundary_marks_page_one_outage_incomplete():
+    backend = TweepyGrowthBackend({None: RuntimeError("outage")}, {})
+
+    result = _twitter_client(backend).read_followers_profiles()
+
+    assert result.complete is False
+    assert result.profiles == ()
+    assert backend.follower_tokens == [None]
+
+
+def test_follower_snapshot_boundary_accepts_complete_empty_page():
+    backend = TweepyGrowthBackend({None: _response([])}, {})
+
+    result = _twitter_client(backend).read_followers_profiles()
+
+    assert result.complete is True
+    assert result.profiles == ()
+    assert backend.follower_tokens == [None]
+
+
+def test_follower_snapshot_boundary_isolates_malformed_record_without_partial_run():
+    backend = TweepyGrowthBackend(
+        {None: _response([object(), _tweepy_user(207, "valid_owner", "Gym owner")])},
+        {},
+    )
+
+    result = _twitter_client(backend).read_followers_profiles()
+
+    assert result.complete is True
+    assert [profile["id"] for profile in result.profiles] == ["207"]
+    assert backend.follower_tokens == [None]
 
 
 def test_latest_post_normalizes_only_none_lang_and_isolates_wrong_types():
