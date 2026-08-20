@@ -379,7 +379,10 @@ def test_sqlite_digest_sorts_by_score_then_latest_activity_and_limits_five(tmp_p
             "score_data": {
                 "total": score,
                 "audience_segment": "primary",
+                "reasons": ["primary_operator_role"],
+                "activity_at": activity.isoformat(),
                 "hard_filter_passed": True,
+                "filter_reason": "accepted",
             },
             "discovery_source": "topic_search",
             "profile_expires_at": (NOW + timedelta(days=7)).isoformat(),

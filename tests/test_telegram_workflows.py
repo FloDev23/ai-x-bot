@@ -2010,19 +2010,40 @@ def test_draft_callbacks_delegate_only_to_pipeline_and_manual_media_matcher(tmp_
 
 def test_growth_cards_and_decisions_are_manual_only_with_reason_suppression(tmp_path):
     db = Database(str(tmp_path / "growth.db"))
+    evaluated_at = datetime.now(timezone.utc)
+    activity_at = evaluated_at - timedelta(days=1)
     candidate_id = db.upsert_growth_candidate({
         "user_id": "900",
         "username": "real_owner",
         "profile": {
+            "id": "900",
+            "user_id": "900",
             "username": "real_owner",
             "description": "Independent gym owner",
             "followers_count": 1200,
+            "following_count": 500,
+            "protected": False,
+            "spam_signals": [],
         },
-        "latest_post": {"id": "12345", "text": "A useful studio update"},
+        "latest_post": {
+            "id": "12345",
+            "text": "A useful studio update",
+            "created_at": activity_at.isoformat(),
+            "lang": "en",
+            "is_original": True,
+        },
         "score": 91,
-        "score_data": {"relevance": 91, "hard_filter_passed": True},
+        "score_data": {
+            "total": 91,
+            "audience_segment": "primary",
+            "reasons": ["primary_operator_role"],
+            "activity_at": activity_at.isoformat(),
+            "hard_filter_passed": True,
+            "filter_reason": "accepted",
+        },
         "discovery_source": "search",
-        "profile_expires_at": "2030-08-20T00:00:00+00:00",
+        "last_evaluated_at": evaluated_at.isoformat(),
+        "profile_expires_at": (evaluated_at + timedelta(days=7)).isoformat(),
     })
     telegram = WorkflowTelegramApi(tmp_path)
     controller = workflow_controller(db, telegram)

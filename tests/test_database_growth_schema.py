@@ -193,7 +193,13 @@ def test_rejected_candidate_is_reactivated_after_30_day_suppression(tmp_path):
             "UPDATE growth_candidates SET suppressed_until = ? WHERE id = ?",
             (expired, candidate_id),
         )
-    assert db.get_digest_candidates()[0]["decision"] == "new"
+    assert db.get_digest_candidates() == []
+    with db._conn() as conn:
+        reactivated = conn.execute(
+            "SELECT decision FROM growth_candidates WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+    assert reactivated["decision"] == "new"
 
 
 def test_telegram_results_allowlist_fields_and_redact_credentials(tmp_path):

@@ -2962,7 +2962,8 @@ class Database:
             ).fetchone()
             return row["id"]
 
-    def _decode_growth_candidate(self, row: sqlite3.Row) -> Dict:
+    def _decode_growth_candidate_for_audit(self, row: sqlite3.Row) -> Dict:
+        """Decode an audit row without treating it as discovery-eligible."""
         result = self._decode_json_fields(row, {
             "profile_json": "profile",
             "latest_post_json": "latest_post",
@@ -2999,6 +3000,161 @@ class Database:
         result["direct_url"] = direct_url
         return result
 
+    @staticmethod
+    def _is_json_safe_mapping(value: Any) -> bool:
+        if type(value) is not dict:
+            return False
+        try:
+            json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _parse_aware_datetime(value: Any) -> datetime:
+        if type(value) is not str or not value:
+            raise ValueError("An aware ISO datetime string is required")
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("A timezone offset is required")
+        return parsed.astimezone(timezone.utc)
+
+    def _validated_growth_candidate(
+        self,
+        row: sqlite3.Row,
+        now: datetime,
+    ) -> Optional[Dict]:
+        """Decode one canonical eligible row for both cache and digest reads."""
+        try:
+            result = self._decode_json_fields(row, {
+                "profile_json": "profile",
+                "latest_post_json": "latest_post",
+                "score_json": "score_data",
+            })
+            current_time = self._as_utc(now)
+            profile = result.get("profile")
+            latest_post = result.get("latest_post")
+            score_data = result.get("score_data")
+            user_id = result.get("user_id")
+            username = result.get("username")
+            score = result.get("score")
+
+            if (
+                type(result.get("id")) is not int
+                or result["id"] <= 0
+                or type(user_id) is not str
+                or not user_id
+                or type(username) is not str
+                or re.fullmatch(r"[A-Za-z0-9_]{1,15}", username) is None
+                or type(score) is not int
+                or not 0 <= score <= 100
+                or type(result.get("discovery_source")) is not str
+                or not result["discovery_source"]
+                or not self._is_json_safe_mapping(profile)
+                or not self._is_json_safe_mapping(latest_post)
+                or not self._is_json_safe_mapping(score_data)
+            ):
+                return None
+
+            profile_aliases = [
+                profile[name] for name in ("id", "user_id") if name in profile
+            ]
+            if (
+                not profile_aliases
+                or any(
+                    type(alias) is not str or not alias or alias != user_id
+                    for alias in profile_aliases
+                )
+                or profile.get("username") != username
+                or type(profile.get("description")) is not str
+                or profile.get("protected") is not False
+                or type(profile.get("followers_count")) is not int
+                or profile["followers_count"] < 0
+                or type(profile.get("following_count")) is not int
+                or profile["following_count"] < 0
+                or type(profile.get("spam_signals")) is not list
+                or profile["spam_signals"] != []
+                or (
+                    "follow_farming" in profile
+                    and profile.get("follow_farming") is not False
+                )
+            ):
+                return None
+
+            latest_id = latest_post.get("id")
+            if (
+                type(latest_id) is not str
+                or not latest_id.isascii()
+                or not latest_id.isdigit()
+                or (
+                    "tweet_id" in latest_post
+                    and (
+                        type(latest_post.get("tweet_id")) is not str
+                        or latest_post["tweet_id"] != latest_id
+                    )
+                )
+                or type(latest_post.get("text")) is not str
+                or type(latest_post.get("lang")) is not str
+                or not latest_post["lang"]
+                or latest_post.get("is_original") is not True
+            ):
+                return None
+
+            evaluated_at = self._parse_aware_datetime(
+                result.get("last_evaluated_at")
+            )
+            expires_at = self._parse_aware_datetime(
+                result.get("profile_expires_at")
+            )
+            latest_activity = self._parse_aware_datetime(
+                latest_post.get("created_at")
+            )
+            activity_at = self._parse_aware_datetime(
+                score_data.get("activity_at")
+            )
+            if (
+                evaluated_at > current_time
+                or expires_at <= current_time
+                or expires_at <= evaluated_at
+                or latest_activity != activity_at
+                or activity_at > evaluated_at
+                or activity_at > current_time
+                or current_time - activity_at > timedelta(days=30)
+            ):
+                return None
+
+            reasons = score_data.get("reasons")
+            if (
+                type(score_data.get("total")) is not int
+                or score_data["total"] != score
+                or score_data.get("audience_segment") not in {
+                    "primary", "amplifier", "end_user",
+                }
+                or type(reasons) is not list
+                or any(type(reason) is not str for reason in reasons)
+                or score_data.get("hard_filter_passed") is not True
+                or score_data.get("filter_reason") != "accepted"
+            ):
+                return None
+
+            result["audience_segment"] = score_data["audience_segment"]
+            result["reasons"] = reasons
+            result["activity_at"] = score_data["activity_at"]
+            result["direct_url"] = (
+                f"https://x.com/{username}/status/{latest_id}"
+            )
+            return result
+        except (
+            AttributeError,
+            json.JSONDecodeError,
+            KeyError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
+            return None
+
     def get_growth_candidate(self, user_id: str) -> Optional[Dict]:
         if type(user_id) is not str or not user_id:
             return None
@@ -3010,8 +3166,15 @@ class Database:
         if not row:
             return None
         try:
-            return self._decode_growth_candidate(row)
-        except (AttributeError, json.JSONDecodeError, TypeError, ValueError):
+            return self._decode_growth_candidate_for_audit(row)
+        except (
+            AttributeError,
+            json.JSONDecodeError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
             return None
 
     def get_cached_growth_candidate(
@@ -3019,105 +3182,17 @@ class Database:
         user_id: str,
         now: datetime,
     ) -> Optional[Dict]:
-        candidate = self.get_growth_candidate(user_id)
-        if not candidate:
+        if type(user_id) is not str or not user_id:
             return None
-        try:
-            expires_at = self._parse_datetime(candidate["profile_expires_at"])
-            evaluated_at = self._parse_datetime(candidate["last_evaluated_at"])
-        except (KeyError, TypeError, ValueError):
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM growth_candidates WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        if not row:
             return None
-        current_time = self._as_utc(now)
-        score_data = candidate.get("score_data")
-        profile = candidate.get("profile")
-        latest_post = candidate.get("latest_post")
-        hard_filter_passed = (
-            score_data.get("hard_filter_passed")
-            if isinstance(score_data, dict)
-            else None
-        )
-        reasons = score_data.get("reasons") if isinstance(score_data, dict) else None
-        activity_value = (
-            score_data.get("activity_at") if isinstance(score_data, dict) else None
-        )
-        profile_user_id = (
-            profile.get("user_id", profile.get("id"))
-            if isinstance(profile, dict)
-            else None
-        )
-        if (
-            type(candidate.get("id")) is not int
-            or candidate["id"] <= 0
-            or candidate.get("user_id") != user_id
-            or type(candidate.get("username")) is not str
-            or re.fullmatch(
-                r"[A-Za-z0-9_]{1,15}", candidate["username"]
-            ) is None
-            or type(candidate.get("direct_url")) is not str
-            or type(candidate.get("score")) is not int
-            or not 0 <= candidate["score"] <= 100
-            or type(candidate.get("discovery_source")) is not str
-            or not candidate["discovery_source"]
-            or not isinstance(profile, dict)
-            or type(profile_user_id) is not str
-            or profile_user_id != user_id
-            or profile.get("username") != candidate["username"]
-            or type(profile.get("description")) is not str
-            or type(profile.get("protected")) is not bool
-            or type(profile.get("followers_count")) is not int
-            or profile["followers_count"] < 0
-            or type(profile.get("following_count")) is not int
-            or profile["following_count"] < 0
-            or type(profile.get("spam_signals")) is not list
-            or any(type(signal) is not str for signal in profile["spam_signals"])
-            or not isinstance(score_data, dict)
-            or type(hard_filter_passed) is not bool
-            or type(score_data.get("total")) is not int
-            or score_data["total"] != candidate["score"]
-            or score_data.get("audience_segment") not in {
-                "primary", "amplifier", "end_user",
-            }
-            or type(reasons) is not list
-            or any(type(reason) is not str for reason in reasons)
-            or type(score_data.get("filter_reason")) is not str
-            or evaluated_at > current_time
-            or expires_at <= current_time
-        ):
-            return None
-        if latest_post is not None and not isinstance(latest_post, dict):
-            return None
-        latest_activity = None
-        if isinstance(latest_post, dict):
-            try:
-                latest_activity = self._parse_datetime(
-                    latest_post.get("created_at")
-                )
-            except (TypeError, ValueError):
-                return None
-            if (
-                type(latest_post.get("id")) is not str
-                or not latest_post["id"].isascii()
-                or not latest_post["id"].isdigit()
-                or type(latest_post.get("text")) is not str
-                or type(latest_post.get("lang")) is not str
-                or type(latest_post.get("is_original")) is not bool
-                or latest_activity > current_time
-            ):
-                return None
-        if activity_value is not None:
-            try:
-                activity_at = self._parse_datetime(activity_value)
-            except (TypeError, ValueError):
-                return None
-            if activity_at > current_time:
-                return None
-            if latest_activity is None or activity_at != latest_activity:
-                return None
-        if hard_filter_passed is True and (
-            activity_value is None
-            or not isinstance(latest_post, dict)
-            or latest_post.get("is_original") is not True
-        ):
+        candidate = self._validated_growth_candidate(row, now)
+        if candidate is None or candidate["user_id"] != user_id:
             return None
         return candidate
 
@@ -3165,31 +3240,13 @@ class Database:
         for row in rows:
             try:
                 if (
-                    type(row["user_id"]) is not str
-                    or not row["user_id"]
-                    or type(row["score"]) is not int
-                    or not 0 <= row["score"] <= 100
-                ):
-                    continue
-                evaluated_at = self._parse_datetime(row["last_evaluated_at"])
-                if (
-                    evaluated_at > current_time
-                    or self._parse_datetime(row["profile_expires_at"]) <= current_time
-                ):
-                    continue
-                if (
                     row["suppressed_until"]
                     and self._parse_datetime(row["suppressed_until"]) > current_time
                 ):
                     continue
-                decoded = self._decode_growth_candidate(row)
-                if decoded["score_data"].get("hard_filter_passed") is not True:
+                decoded = self._validated_growth_candidate(row, current_time)
+                if decoded is None:
                     continue
-                activity_value = decoded.get("activity_at")
-                if activity_value is not None:
-                    activity_at = self._parse_datetime(activity_value)
-                    if activity_at > current_time:
-                        continue
             except (
                 AttributeError,
                 json.JSONDecodeError,

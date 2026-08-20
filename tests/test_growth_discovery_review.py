@@ -39,6 +39,17 @@ def review_post(post_id="900", created_at=None, **overrides):
     return value
 
 
+def accepted_score(total=95, activity_at=None):
+    return {
+        "total": total,
+        "audience_segment": "primary",
+        "reasons": ["primary_operator_role"],
+        "activity_at": activity_at or (NOW - timedelta(days=1)).isoformat(),
+        "hard_filter_passed": True,
+        "filter_reason": "accepted",
+    }
+
+
 class CoordinatedDatabase(Database):
     """Test-only probe that exposes the inherited get/set race deterministically."""
 
@@ -195,7 +206,6 @@ def test_hard_filter_rejects_malformed_profile_records(overrides):
 def test_digest_excludes_legacy_and_isolates_malformed_score_rows(tmp_path):
     db = Database(str(tmp_path / "growth.db"))
     common = {
-        "profile": review_profile(),
         "latest_post": review_post(),
         "score": 95,
         "discovery_source": "topic_search",
@@ -206,19 +216,22 @@ def test_digest_excludes_legacy_and_isolates_malformed_score_rows(tmp_path):
         **common,
         "user_id": "legacy",
         "username": "legacy",
+        "profile": review_profile("legacy", "legacy"),
         "score_data": {"total": 95},
     })
     malformed_id = db.upsert_growth_candidate({
         **common,
         "user_id": "malformed",
         "username": "malformed",
+        "profile": review_profile("malformed", "malformed"),
         "score_data": {"total": 95, "hard_filter_passed": True},
     })
     db.upsert_growth_candidate({
         **common,
         "user_id": "valid",
         "username": "valid",
-        "score_data": {"total": 95, "hard_filter_passed": True},
+        "profile": review_profile("valid", "valid"),
+        "score_data": accepted_score(),
     })
     with db._conn() as conn:
         conn.execute(
@@ -234,19 +247,24 @@ def test_digest_excludes_legacy_and_isolates_malformed_score_rows(tmp_path):
 def test_digest_isolates_malformed_sqlite_score_type_before_sorting(tmp_path):
     db = Database(str(tmp_path / "growth.db"))
     common = {
-        "profile": review_profile(),
         "latest_post": review_post(),
         "score": 95,
-        "score_data": {"total": 95, "hard_filter_passed": True},
+        "score_data": accepted_score(),
         "discovery_source": "topic_search",
         "profile_expires_at": (NOW + timedelta(days=7)).isoformat(),
         "last_evaluated_at": NOW.isoformat(),
     }
     malformed_id = db.upsert_growth_candidate({
-        **common, "user_id": "malformed_score", "username": "malformed_score",
+        **common,
+        "user_id": "malformed_score",
+        "username": "malformed_score",
+        "profile": review_profile("malformed_score", "malformed_score"),
     })
     db.upsert_growth_candidate({
-        **common, "user_id": "valid_score", "username": "valid_score",
+        **common,
+        "user_id": "valid_score",
+        "username": "valid_score",
+        "profile": review_profile("valid_score", "valid_score"),
     })
     with db._conn() as conn:
         conn.execute(
@@ -534,9 +552,7 @@ def test_cache_and_digest_fail_closed_after_clock_rollback_and_future_activity(t
     db = Database(path)
     future = NOW + timedelta(days=1)
     common = {
-        "profile": review_profile(),
         "score": 95,
-        "score_data": {"total": 95, "hard_filter_passed": True},
         "discovery_source": "topic_search",
         "profile_expires_at": (future + timedelta(days=7)).isoformat(),
     }
@@ -544,21 +560,27 @@ def test_cache_and_digest_fail_closed_after_clock_rollback_and_future_activity(t
         **common,
         "user_id": "future_eval",
         "username": "future_eval",
+        "profile": review_profile("future_eval", "future_eval"),
         "latest_post": review_post("701"),
+        "score_data": accepted_score(),
         "last_evaluated_at": future.isoformat(),
     })
     db.upsert_growth_candidate({
         **common,
         "user_id": "future_post",
         "username": "future_post",
+        "profile": review_profile("future_post", "future_post"),
         "latest_post": review_post("702", future.isoformat()),
+        "score_data": accepted_score(activity_at=future.isoformat()),
         "last_evaluated_at": NOW.isoformat(),
     })
     db.upsert_growth_candidate({
         **common,
         "user_id": "valid_clock",
         "username": "valid_clock",
+        "profile": review_profile("valid_clock", "valid_clock"),
         "latest_post": review_post("703"),
+        "score_data": accepted_score(),
         "last_evaluated_at": NOW.isoformat(),
     })
 
@@ -579,7 +601,7 @@ def test_digest_ties_are_deterministic_by_exact_user_id_across_restart(tmp_path)
             "profile": review_profile(user_id, user_id),
             "latest_post": review_post("600"),
             "score": 90,
-            "score_data": {"total": 90, "hard_filter_passed": True},
+            "score_data": accepted_score(total=90),
             "discovery_source": "topic_search",
             "profile_expires_at": (NOW + timedelta(days=7)).isoformat(),
             "last_evaluated_at": NOW.isoformat(),
