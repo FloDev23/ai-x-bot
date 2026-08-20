@@ -1002,8 +1002,8 @@ class RecordingCreateTweetApi:
 
 def _twitter_client(api, create_client):
     client = TwitterClient.__new__(TwitterClient)
-    client.api = api
-    client.client = create_client
+    client._api = api
+    client._client = create_client
     return client
 
 

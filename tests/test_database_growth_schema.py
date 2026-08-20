@@ -115,7 +115,7 @@ def test_digest_excludes_low_score_and_expired_offset_candidates(tmp_path):
         "username": "owner",
         "profile": {"username": "owner"},
         "latest_post": {},
-        "score_data": {},
+        "score_data": {"hard_filter_passed": True},
         "discovery_source": "search",
     }
     db.upsert_growth_candidate({
@@ -174,7 +174,7 @@ def test_rejected_candidate_is_reactivated_after_30_day_suppression(tmp_path):
         "profile": {"username": "owner"},
         "latest_post": {},
         "score": 90,
-        "score_data": {"total": 90},
+        "score_data": {"total": 90, "hard_filter_passed": True},
         "discovery_source": "search",
     })
     assert db.mark_candidate_decision(candidate_id, "rejected", "not relevant")

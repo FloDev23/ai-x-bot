@@ -1,6 +1,8 @@
 import logging
 import os
+import re
 import tweepy
+from collections.abc import Mapping
 from requests import exceptions as requests_exceptions
 from config import (
     TWITTER_API_KEY,
@@ -101,7 +103,7 @@ class TwitterClient:
     
     def __init__(self):
         # Autenticazione con OAuth 2.0
-        self.client = tweepy.Client(
+        self._client = tweepy.Client(
             bearer_token=TWITTER_BEARER_TOKEN,
             consumer_key=TWITTER_API_KEY,
             consumer_secret=TWITTER_API_SECRET,
@@ -113,7 +115,7 @@ class TwitterClient:
         # API v1.1 per alcune operazioni
         auth = tweepy.OAuthHandler(TWITTER_API_KEY, TWITTER_API_SECRET)
         auth.set_access_token(TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET)
-        self.api = tweepy.API(auth, wait_on_rate_limit=True)
+        self._api = tweepy.API(auth, wait_on_rate_limit=True)
     
     def _upload_media(
         self,
@@ -135,14 +137,14 @@ class TwitterClient:
             raise XPublicationRejected("invalid_media_filename")
         try:
             if media_type == "video":
-                media = self.api.media_upload(
+                media = self._api.media_upload(
                     safe_filename,
                     file=media_file,
                     chunked=True,
                     media_category="tweet_video",
                 )
             else:
-                media = self.api.media_upload(safe_filename, file=media_file)
+                media = self._api.media_upload(safe_filename, file=media_file)
         except Exception as error:
             logger.error(
                 "x_media_upload_failed error_type=%s", type(error).__name__
@@ -186,7 +188,7 @@ class TwitterClient:
                 raise XPublicationPaused("publication_paused")
 
         try:
-            response = self.client.create_tweet(**params)
+            response = self._client.create_tweet(**params)
         except Exception as error:
             logger.error("x_tweet_write_failed error_type=%s", type(error).__name__)
             _raise_publication_error(error)
@@ -214,7 +216,7 @@ class TwitterClient:
             Lista di tweet
         """
         try:
-            tweets = self.client.search_recent_tweets(
+            tweets = self._client.search_recent_tweets(
                 query=query,
                 max_results=max(10, min(limit, 100)),
                 tweet_fields=['public_metrics', 'author_id', 'created_at'],
@@ -259,32 +261,64 @@ class TwitterClient:
     def _iso_datetime(value) -> Optional[str]:
         if value is None:
             return None
+        if type(value) is str:
+            return value
         if hasattr(value, "isoformat"):
-            return value.isoformat()
-        return value if type(value) is str else None
+            normalized = value.isoformat()
+            return normalized if type(normalized) is str else None
+        return None
 
     @classmethod
     def _profile_dict(cls, user) -> Optional[Dict]:
         user_id = getattr(user, "id", None)
         username = getattr(user, "username", None)
-        if isinstance(user_id, bool) or user_id is None:
+        if type(user_id) is int and user_id > 0:
+            normalized_id = str(user_id)
+        elif (
+            type(user_id) is str
+            and user_id.isascii()
+            and user_id.isdigit()
+        ):
+            normalized_id = user_id
+        else:
             return None
-        normalized_id = str(user_id)
-        if type(username) is not str or not username:
+        if (
+            type(username) is not str
+            or re.fullmatch(r"[A-Za-z0-9_]{1,15}", username) is None
+        ):
             return None
-        metrics = getattr(user, "public_metrics", None) or {}
+        description = getattr(user, "description", None)
+        protected = getattr(user, "protected", None)
+        location = getattr(user, "location", None)
+        created_at = cls._iso_datetime(getattr(user, "created_at", None))
+        metrics = getattr(user, "public_metrics", None)
+        if (
+            type(description) is not str
+            or type(protected) is not bool
+            or (location is not None and type(location) is not str)
+            or not isinstance(metrics, Mapping)
+        ):
+            return None
+        normalized_metrics = {}
+        for name in ("followers_count", "following_count"):
+            value = metrics.get(name)
+            if type(value) is not int or value < 0:
+                return None
+            normalized_metrics[name] = value
+        for name in ("tweet_count", "listed_count"):
+            value = metrics.get(name, 0)
+            if type(value) is not int or value < 0:
+                return None
+            normalized_metrics[name] = value
         return {
             "id": normalized_id,
             "user_id": normalized_id,
             "username": username,
-            "description": getattr(user, "description", "") or "",
-            "protected": getattr(user, "protected", False),
-            "location": getattr(user, "location", None),
-            "created_at": cls._iso_datetime(getattr(user, "created_at", None)),
-            "followers_count": metrics.get("followers_count", 0),
-            "following_count": metrics.get("following_count", 0),
-            "tweet_count": metrics.get("tweet_count", 0),
-            "listed_count": metrics.get("listed_count", 0),
+            "description": description,
+            "protected": protected,
+            "location": location,
+            "created_at": created_at,
+            **normalized_metrics,
             "spam_signals": [],
         }
 
@@ -301,30 +335,77 @@ class TwitterClient:
 
     def get_followers_profiles(self) -> List[Dict]:
         """Read public profiles of accounts currently following this account."""
-        try:
-            self_id = self.get_authenticated_user_id_cached()
-            if not self_id:
-                return []
-            response = self.client.get_users_followers(
-                id=self_id,
-                max_results=1000,
-                user_fields=self._growth_user_fields(),
-            )
-        except Exception as error:
-            logger.warning(
-                "x_growth_followers_read_failed error_type=%s",
-                type(error).__name__,
-            )
+        self_id = self.get_authenticated_user_id_cached()
+        if not self_id:
             return []
-        return [
-            profile
-            for user in (getattr(response, "data", None) or [])
-            if (profile := self._profile_dict(user)) is not None
-        ]
+        profiles = []
+        seen_ids = set()
+        seen_tokens = set()
+        pagination_token = None
+        for _page_number in range(100):
+            if pagination_token is not None:
+                if pagination_token in seen_tokens:
+                    break
+                seen_tokens.add(pagination_token)
+            params = {
+                "id": self_id,
+                "max_results": 1000,
+                "user_fields": self._growth_user_fields(),
+            }
+            if pagination_token is not None:
+                params["pagination_token"] = pagination_token
+            try:
+                response = self._client.get_users_followers(**params)
+            except Exception as error:
+                logger.warning(
+                    "x_growth_followers_read_failed error_type=%s",
+                    type(error).__name__,
+                )
+                break
+            try:
+                response_users = getattr(response, "data", None)
+                if not isinstance(response_users, (list, tuple)):
+                    raise ValueError("malformed follower page data")
+            except Exception as error:
+                logger.warning(
+                    "x_growth_followers_page_skipped error_type=%s",
+                    type(error).__name__,
+                )
+                break
+            for user in response_users:
+                try:
+                    profile = self._profile_dict(user)
+                except Exception as error:
+                    logger.warning(
+                        "x_growth_follower_record_skipped error_type=%s",
+                        type(error).__name__,
+                    )
+                    continue
+                if profile is None or profile["id"] in seen_ids:
+                    continue
+                seen_ids.add(profile["id"])
+                profiles.append(profile)
+            try:
+                meta = getattr(response, "meta", None)
+                next_token = (
+                    meta.get("next_token") if isinstance(meta, Mapping) else None
+                )
+            except Exception as error:
+                logger.warning(
+                    "x_growth_followers_page_skipped error_type=%s",
+                    type(error).__name__,
+                )
+                break
+            if next_token is None:
+                break
+            if type(next_token) is not str or not next_token:
+                break
+            pagination_token = next_token
+        return profiles
 
     def _search_recent_profiles(self, query: str, limit: int) -> List[Dict]:
         try:
-            response = self.client.search_recent_tweets(
+            response = self._client.search_recent_tweets(
                 query=query,
                 max_results=max(10, min(limit, 100)),
                 tweet_fields=["author_id", "created_at", "lang"],
@@ -339,10 +420,19 @@ class TwitterClient:
             return []
         includes = getattr(response, "includes", None) or {}
         users = includes.get("users", []) if isinstance(includes, dict) else []
+        if not isinstance(users, (list, tuple)):
+            users = []
         result = []
         seen = set()
         for user in users:
-            profile = self._profile_dict(user)
+            try:
+                profile = self._profile_dict(user)
+            except Exception as error:
+                logger.warning(
+                    "x_growth_search_record_skipped error_type=%s",
+                    type(error).__name__,
+                )
+                continue
             if profile is None or profile["id"] in seen:
                 continue
             seen.add(profile["id"])
@@ -362,9 +452,10 @@ class TwitterClient:
     ) -> List[Dict]:
         """Discover authors around configured seeds with one read-only search."""
         seeds = [
-            seed.strip().lstrip("@")
+            seed.strip()
             for seed in seed_accounts
-            if type(seed) is str and seed.strip().lstrip("@")
+            if type(seed) is str
+            and re.fullmatch(r"[A-Za-z0-9_]{1,15}", seed.strip()) is not None
         ]
         if not seeds:
             return []
@@ -376,7 +467,7 @@ class TwitterClient:
         if type(user_id) is not str or not user_id:
             return None
         try:
-            response = self.client.get_users_tweets(
+            response = self._client.get_users_tweets(
                 id=user_id,
                 max_results=5,
                 exclude=["retweets", "replies"],
@@ -389,17 +480,34 @@ class TwitterClient:
             )
             return None
         tweets = getattr(response, "data", None) or []
-        if not tweets:
+        if not isinstance(tweets, (list, tuple)) or not tweets:
             return None
         latest = tweets[0]
         latest_id = getattr(latest, "id", None)
-        if isinstance(latest_id, bool) or latest_id is None:
+        if type(latest_id) is int and latest_id > 0:
+            normalized_id = str(latest_id)
+        elif (
+            type(latest_id) is str
+            and latest_id.isascii()
+            and latest_id.isdigit()
+        ):
+            normalized_id = latest_id
+        else:
+            return None
+        text = getattr(latest, "text", None)
+        created_at = self._iso_datetime(getattr(latest, "created_at", None))
+        lang = getattr(latest, "lang", None)
+        if (
+            type(text) is not str
+            or type(created_at) is not str
+            or type(lang) is not str
+        ):
             return None
         return {
-            "id": str(latest_id),
-            "text": getattr(latest, "text", "") or "",
-            "created_at": self._iso_datetime(getattr(latest, "created_at", None)),
-            "lang": getattr(latest, "lang", None),
+            "id": normalized_id,
+            "text": text,
+            "created_at": created_at,
+            "lang": lang,
             "is_original": True,
         }
 
@@ -410,7 +518,7 @@ class TwitterClient:
         anche questa è una lettura a pagamento.
         """
         try:
-            user = self.client.get_user(
+            user = self._client.get_user(
                 username=username.lstrip('@'),
                 user_fields=['public_metrics', 'verified']
             )
@@ -434,7 +542,7 @@ class TwitterClient:
             info = self.get_user_info(username)
             if not info:
                 return None
-            tweets = self.client.get_users_tweets(
+            tweets = self._client.get_users_tweets(
                 id=info['id'], max_results=5, tweet_fields=['public_metrics']
             )
             if not tweets.data:
@@ -453,7 +561,7 @@ class TwitterClient:
         """
         result = {}
         try:
-            tweets = self.client.get_tweets(
+            tweets = self._client.get_tweets(
                 ids=tweet_ids,
                 tweet_fields=['public_metrics', 'non_public_metrics']
             )
@@ -479,7 +587,7 @@ class TwitterClient:
             ID dell'utente
         """
         try:
-            user = self.client.get_me()
+            user = self._client.get_me()
             return user.data.id
         except Exception as e:
             logger.error(f"❌ Errore nell'ottenere l'ID utente: {e}")

@@ -2020,7 +2020,7 @@ def test_growth_cards_and_decisions_are_manual_only_with_reason_suppression(tmp_
         },
         "latest_post": {"id": "12345", "text": "A useful studio update"},
         "score": 91,
-        "score_data": {"relevance": 91},
+        "score_data": {"relevance": 91, "hard_filter_passed": True},
         "discovery_source": "search",
         "profile_expires_at": "2030-08-20T00:00:00+00:00",
     })
@@ -2062,7 +2062,7 @@ def test_growth_cards_and_decisions_are_manual_only_with_reason_suppression(tmp_
         "profile": {"username": "second_owner"},
         "latest_post": {},
         "score": 90,
-        "score_data": {"total": 90},
+        "score_data": {"total": 90, "hard_filter_passed": True},
         "discovery_source": "network",
     })
     assert controller.process_update(

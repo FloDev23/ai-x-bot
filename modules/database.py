@@ -2959,10 +2959,17 @@ class Database:
             "latest_post_json": "latest_post",
             "score_json": "score_data",
         })
-        score_data = result.get("score_data") or {}
-        latest_post = result.get("latest_post") or {}
+        profile = result.get("profile")
+        score_data = result.get("score_data")
+        latest_post = result.get("latest_post")
+        if not isinstance(profile, dict) or not isinstance(score_data, dict):
+            raise ValueError("Malformed growth candidate JSON")
+        if latest_post is not None and not isinstance(latest_post, dict):
+            raise ValueError("Malformed growth candidate latest post")
+        latest_post = latest_post or {}
         result["audience_segment"] = score_data.get("audience_segment")
-        result["reasons"] = score_data.get("reasons") or []
+        reasons = score_data.get("reasons") or []
+        result["reasons"] = reasons if isinstance(reasons, list) else []
         result["activity_at"] = (
             score_data.get("activity_at") or latest_post.get("created_at")
         )
@@ -2991,7 +2998,12 @@ class Database:
                 "SELECT * FROM growth_candidates WHERE user_id = ?",
                 (user_id,),
             ).fetchone()
-        return self._decode_growth_candidate(row) if row else None
+        if not row:
+            return None
+        try:
+            return self._decode_growth_candidate(row)
+        except (AttributeError, json.JSONDecodeError, TypeError, ValueError):
+            return None
 
     def get_cached_growth_candidate(
         self,
@@ -3003,9 +3015,19 @@ class Database:
             return None
         try:
             expires_at = self._parse_datetime(candidate["profile_expires_at"])
+            evaluated_at = self._parse_datetime(candidate["last_evaluated_at"])
         except (KeyError, TypeError, ValueError):
             return None
-        return candidate if expires_at > self._as_utc(now) else None
+        current_time = self._as_utc(now)
+        score_data = candidate.get("score_data")
+        if (
+            not isinstance(score_data, dict)
+            or type(score_data.get("hard_filter_passed")) is not bool
+            or evaluated_at > current_time
+            or expires_at <= current_time
+        ):
+            return None
+        return candidate
 
     def is_growth_candidate_suppressed(self, user_id: str, now: datetime) -> bool:
         candidate = self.get_growth_candidate(user_id)
@@ -3044,17 +3066,39 @@ class Database:
         eligible = []
         for row in rows:
             try:
-                if self._parse_datetime(row["profile_expires_at"]) <= current_time:
+                if (
+                    type(row["user_id"]) is not str
+                    or not row["user_id"]
+                    or type(row["score"]) is not int
+                    or not 0 <= row["score"] <= 100
+                ):
+                    continue
+                evaluated_at = self._parse_datetime(row["last_evaluated_at"])
+                if (
+                    evaluated_at > current_time
+                    or self._parse_datetime(row["profile_expires_at"]) <= current_time
+                ):
                     continue
                 if (
                     row["suppressed_until"]
                     and self._parse_datetime(row["suppressed_until"]) > current_time
                 ):
                     continue
-            except (TypeError, ValueError):
-                continue
-            decoded = self._decode_growth_candidate(row)
-            if decoded["score_data"].get("hard_filter_passed") is False:
+                decoded = self._decode_growth_candidate(row)
+                if decoded["score_data"].get("hard_filter_passed") is not True:
+                    continue
+                activity_value = decoded.get("activity_at")
+                if activity_value is not None:
+                    activity_at = self._parse_datetime(activity_value)
+                    if activity_at > current_time:
+                        continue
+            except (
+                AttributeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
                 continue
             eligible.append(decoded)
 
@@ -3065,10 +3109,10 @@ class Database:
             except (TypeError, ValueError):
                 return float("-inf")
 
+        eligible.sort(key=lambda candidate: candidate["user_id"])
         eligible.sort(
             key=lambda candidate: (
-                candidate["score"],
-                activity_timestamp(candidate),
+                candidate["score"], activity_timestamp(candidate)
             ),
             reverse=True,
         )
@@ -3201,6 +3245,114 @@ class Database:
                     value = excluded.value,
                     updated_at = excluded.updated_at
             """, (key, value, self._now_iso()))
+
+    def claim_growth_counter(self, key: str, limit: int) -> bool:
+        """Atomically reserve one paid growth read before contacting X."""
+        if type(key) is not str or not key or type(limit) is not int or limit <= 0:
+            return False
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (key,)
+            ).fetchone()
+            raw_value = row["value"] if row else "0"
+            if (
+                type(raw_value) is not str
+                or not raw_value.isascii()
+                or not raw_value.isdigit()
+            ):
+                return False
+            used = int(raw_value)
+            if used >= limit:
+                return False
+            conn.execute("""
+                INSERT INTO bot_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+            """, (key, str(used + 1), self._now_iso()))
+            return True
+
+    def claim_growth_query(
+        self,
+        day_key: str,
+        limit: int,
+        source_count: int = 3,
+    ) -> Optional[int]:
+        """Atomically reserve a daily query and its rotated source index."""
+        if (
+            type(day_key) is not str
+            or not day_key
+            or type(limit) is not int
+            or limit <= 0
+            or type(source_count) is not int
+            or source_count <= 0
+        ):
+            return None
+        count_key = f"growth_queries:{day_key}"
+        start_key = f"growth_query_start:{day_key}"
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            count_row = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (count_key,)
+            ).fetchone()
+            raw_count = count_row["value"] if count_row else "0"
+            if (
+                type(raw_count) is not str
+                or not raw_count.isascii()
+                or not raw_count.isdigit()
+            ):
+                return None
+            used = int(raw_count)
+            if used >= limit:
+                return None
+
+            start_row = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (start_key,)
+            ).fetchone()
+            if start_row:
+                raw_start = start_row["value"]
+                if (
+                    type(raw_start) is not str
+                    or not raw_start.isascii()
+                    or not raw_start.isdigit()
+                ):
+                    return None
+                start = int(raw_start) % source_count
+            else:
+                offset_row = conn.execute(
+                    "SELECT value FROM bot_state WHERE key = 'growth_source_offset'"
+                ).fetchone()
+                raw_offset = offset_row["value"] if offset_row else "0"
+                if (
+                    type(raw_offset) is not str
+                    or not raw_offset.isascii()
+                    or not raw_offset.isdigit()
+                ):
+                    return None
+                start = int(raw_offset) % source_count
+                now = self._now_iso()
+                conn.execute(
+                    "INSERT INTO bot_state (key, value, updated_at) VALUES (?, ?, ?)",
+                    (start_key, str(start), now),
+                )
+                conn.execute("""
+                    INSERT INTO bot_state (key, value, updated_at)
+                    VALUES ('growth_source_offset', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                """, (str((start - 1) % source_count), now))
+
+            conn.execute("""
+                INSERT INTO bot_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+            """, (count_key, str(used + 1), self._now_iso()))
+            return (start + used) % source_count
 
     def get_state(self, key: str, default: Optional[str] = None) -> Optional[str]:
         with self._conn() as conn:

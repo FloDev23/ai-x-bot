@@ -1,11 +1,14 @@
 """Budgeted, deterministic, read-only discovery of relevant X accounts."""
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 from config import (
+    BOT_TIMEZONE,
     GROWTH_DIGEST_LIMIT,
     GROWTH_NEW_PROFILE_BUDGET,
     GROWTH_PROFILE_CACHE_DAYS,
@@ -84,7 +87,7 @@ def passes_candidate_filters(
 ) -> Tuple[bool, str]:
     """Apply non-negotiable eligibility gates without an AI fallback."""
     current_time = _utc(now)
-    if not isinstance(profile, dict) or profile.get("protected") is True:
+    if not isinstance(profile, dict) or profile.get("protected") is not False:
         return False, "protected_profile"
     latest_post = latest_post if isinstance(latest_post, dict) else {}
     activity_at = _parse_datetime(latest_post.get("created_at"))
@@ -97,14 +100,35 @@ def passes_candidate_filters(
         return False, "no_original_post_within_30_days"
     bio = profile.get("description")
     text = latest_post.get("text")
-    bio_context = bio.strip() if type(bio) is str else ""
-    post_context = text.strip() if type(text) is str else ""
+    spam_signals = profile.get("spam_signals")
+    followers = profile.get("followers_count")
+    following = profile.get("following_count")
+    if (
+        type(bio) is not str
+        or type(text) is not str
+        or type(latest_post.get("lang")) is not str
+        or type(spam_signals) is not list
+        or any(type(signal) is not str for signal in spam_signals)
+        or type(followers) is not int
+        or followers < 0
+        or type(following) is not int
+        or following < 0
+        or (
+            "follow_farming" in profile
+            and type(profile.get("follow_farming")) is not bool
+        )
+    ):
+        return False, "malformed_candidate_record"
+    bio_context = bio.strip()
+    post_context = text.strip()
     if not bio_context and not post_context:
         return False, "insufficient_bio_post_context"
-    spam_signals = profile.get("spam_signals")
     if spam_signals or profile.get("follow_farming") is True:
         return False, "spam_or_follow_farming_signals"
-    suppressed_until = _parse_datetime(profile.get("suppressed_until"))
+    raw_suppressed_until = profile.get("suppressed_until")
+    suppressed_until = _parse_datetime(raw_suppressed_until)
+    if raw_suppressed_until is not None and suppressed_until is None:
+        return False, "malformed_candidate_record"
     if suppressed_until is not None and suppressed_until > current_time:
         return False, "suppressed_within_30_days"
     return True, "accepted"
@@ -240,16 +264,12 @@ class GrowthDiscovery:
         self.new_profile_budget = new_profile_budget
         self.profile_cache_days = profile_cache_days
         self.digest_limit = min(digest_limit, 5)
-        self.seed_accounts = tuple(seed_accounts)
+        self.seed_accounts = tuple(
+            seed for seed in seed_accounts
+            if type(seed) is str
+            and re.fullmatch(r"[A-Za-z0-9_]{1,15}", seed) is not None
+        )
         self.topic_queries = tuple(topic_queries)
-
-    @staticmethod
-    def _state_count(db, key: str) -> int:
-        try:
-            value = int(db.get_state(key, "0"))
-        except (TypeError, ValueError):
-            return 2**31 - 1
-        return max(value, 0)
 
     @staticmethod
     def _valid_profile(profile) -> bool:
@@ -257,12 +277,51 @@ class GrowthDiscovery:
             return False
         user_id = profile.get("user_id", profile.get("id"))
         username = profile.get("username")
-        return (
+        valid = (
             type(user_id) is str
             and bool(user_id)
             and type(username) is str
             and re.fullmatch(r"[A-Za-z0-9_]{1,15}", username) is not None
+            and type(profile.get("description")) is str
+            and type(profile.get("protected")) is bool
+            and type(profile.get("followers_count")) is int
+            and profile["followers_count"] >= 0
+            and type(profile.get("following_count")) is int
+            and profile["following_count"] >= 0
+            and type(profile.get("spam_signals")) is list
+            and all(
+                type(signal) is str for signal in profile["spam_signals"]
+            )
         )
+        if not valid:
+            return False
+        try:
+            json.dumps(profile, allow_nan=False)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _valid_latest_post(latest_post) -> bool:
+        if latest_post is None:
+            return True
+        if not isinstance(latest_post, dict):
+            return False
+        valid = (
+            type(latest_post.get("id")) is str
+            and bool(latest_post["id"])
+            and type(latest_post.get("text")) is str
+            and _parse_datetime(latest_post.get("created_at")) is not None
+            and type(latest_post.get("lang")) is str
+            and type(latest_post.get("is_original")) is bool
+        )
+        if not valid:
+            return False
+        try:
+            json.dumps(latest_post, allow_nan=False)
+        except (TypeError, ValueError):
+            return False
+        return True
 
     def _read_followers(self) -> List[Dict]:
         try:
@@ -275,13 +334,6 @@ class GrowthDiscovery:
         return list(result) if isinstance(result, (list, tuple)) else []
 
     def _query_sources(self, day_key: str) -> List[Tuple[str, List[Dict]]]:
-        count_key = f"growth_queries:{day_key}"
-        used = self._state_count(self.db, count_key)
-        remaining = max(0, self.query_budget - used)
-        try:
-            offset = int(self.db.get_state("growth_source_offset", "0")) % 3
-        except (TypeError, ValueError):
-            offset = 0
         sources = [
             (
                 f"topic_search:{self.topic_queries[0]}",
@@ -293,11 +345,14 @@ class GrowthDiscovery:
             ),
             ("network", lambda: self.x.get_network_candidates(self.seed_accounts)),
         ]
-        ordered = sources[offset:] + sources[:offset]
         results = []
-        for source, read in ordered[:remaining]:
-            used += 1
-            self.db.set_state(count_key, str(used))
+        while True:
+            source_index = self.db.claim_growth_query(
+                day_key, self.query_budget, len(sources)
+            )
+            if source_index is None:
+                break
+            source, read = sources[source_index]
             try:
                 profiles = read()
             except Exception as error:
@@ -311,29 +366,56 @@ class GrowthDiscovery:
                 source,
                 list(profiles) if isinstance(profiles, (list, tuple)) else [],
             ))
-        if remaining:
-            self.db.set_state("growth_source_offset", str((offset - 1) % 3))
         return results
 
     def run(self, now: datetime) -> List[Dict]:
         current_time = _utc(now)
-        observed_on = current_time.date().isoformat()
+        observed_on = (
+            current_time.astimezone(ZoneInfo(BOT_TIMEZONE)).date().isoformat()
+        )
         followers = self._read_followers()
-        follower_candidates = []
+        known_followers = self.db.get_known_follower_ids(before_date=observed_on)
+        new_followers = []
+        deferred_followers = []
+        expired_followers = []
         for candidate_profile in followers:
             if not self._valid_profile(candidate_profile):
                 continue
+            user_id = candidate_profile.get("user_id", candidate_profile.get("id"))
             self.db.save_follower_snapshot(
                 observed_on,
                 candidate_profile,
                 relevant=False,
                 source="x_followers",
             )
-            follower_candidates.append(candidate_profile)
+            existing = self.db.get_growth_candidate(user_id)
+            if self.db.is_growth_candidate_suppressed(user_id, current_time):
+                continue
+            cached = self.db.get_cached_growth_candidate(user_id, current_time)
+            if cached is not None:
+                score_data = cached.get("score_data") or {}
+                self.db.save_follower_snapshot(
+                    observed_on,
+                    candidate_profile,
+                    relevant=(
+                        score_data.get("hard_filter_passed") is True
+                        and cached["score"] >= self.score_threshold
+                    ),
+                    source=f"candidate:{cached['id']}",
+                )
+                continue
+            if user_id not in known_followers:
+                new_followers.append(candidate_profile)
+            elif existing is None:
+                deferred_followers.append(candidate_profile)
+            else:
+                expired_followers.append(candidate_profile)
 
         collected: List[Tuple[str, Dict]] = [
             ("new_follower", candidate_profile)
-            for candidate_profile in follower_candidates
+            for candidate_profile in (
+                new_followers + deferred_followers + expired_followers
+            )
         ]
         for source, profiles in self._query_sources(observed_on):
             collected.extend(
@@ -341,7 +423,6 @@ class GrowthDiscovery:
             )
 
         evaluation_key = f"growth_profile_evaluations:{observed_on}"
-        evaluations = self._state_count(self.db, evaluation_key)
         seen = set()
         for source, candidate_profile in collected:
             if not self._valid_profile(candidate_profile):
@@ -360,17 +441,16 @@ class GrowthDiscovery:
                         observed_on,
                         candidate_profile,
                         relevant=(
-                            score_data.get("hard_filter_passed") is not False
+                            score_data.get("hard_filter_passed") is True
                             and cached["score"] >= self.score_threshold
                         ),
                         source=f"candidate:{cached['id']}",
                     )
                 continue
-            if evaluations >= self.new_profile_budget:
+            if not self.db.claim_growth_counter(
+                evaluation_key, self.new_profile_budget
+            ):
                 break
-
-            evaluations += 1
-            self.db.set_state(evaluation_key, str(evaluations))
             try:
                 latest_post = self.x.get_latest_original_post(user_id)
             except Exception as error:
@@ -378,6 +458,11 @@ class GrowthDiscovery:
                     "x_growth_profile_read_failed user_id=%s error_type=%s",
                     user_id,
                     type(error).__name__,
+                )
+                latest_post = None
+            if not self._valid_latest_post(latest_post):
+                logger.warning(
+                    "x_growth_profile_record_skipped user_id=%s", user_id
                 )
                 latest_post = None
             passed, filter_reason = passes_candidate_filters(

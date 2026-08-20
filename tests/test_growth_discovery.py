@@ -376,7 +376,11 @@ def test_sqlite_digest_sorts_by_score_then_latest_activity_and_limits_five(tmp_p
             "profile": profile(str(index), f"owner_{index}"),
             "latest_post": post(str(910 + index), activity.isoformat()),
             "score": score,
-            "score_data": {"total": score, "audience_segment": "primary"},
+            "score_data": {
+                "total": score,
+                "audience_segment": "primary",
+                "hard_filter_passed": True,
+            },
             "discovery_source": "topic_search",
             "profile_expires_at": (NOW + timedelta(days=7)).isoformat(),
             "last_evaluated_at": NOW.isoformat(),
@@ -496,7 +500,7 @@ def test_twitter_read_methods_request_complete_profile_and_original_post_fields(
             return SimpleNamespace(data=[tweet])
 
     client = TwitterClient.__new__(TwitterClient)
-    client.client = ReadClient()
+    client._client = ReadClient()
 
     followers = client.get_followers_profiles()
     authors = client.search_recent_authors("gym owner")
