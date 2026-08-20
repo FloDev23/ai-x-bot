@@ -457,6 +457,15 @@ class Database:
             """)
 
             c.execute("""
+                CREATE TABLE IF NOT EXISTS growth_profile_claims (
+                    observed_on TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    PRIMARY KEY (observed_on, user_id)
+                )
+            """)
+
+            c.execute("""
                 CREATE TABLE IF NOT EXISTS follower_snapshots (
                     observed_on TEXT NOT NULL,
                     user_id TEXT NOT NULL,
@@ -3020,21 +3029,110 @@ class Database:
             return None
         current_time = self._as_utc(now)
         score_data = candidate.get("score_data")
+        profile = candidate.get("profile")
+        latest_post = candidate.get("latest_post")
+        hard_filter_passed = (
+            score_data.get("hard_filter_passed")
+            if isinstance(score_data, dict)
+            else None
+        )
+        reasons = score_data.get("reasons") if isinstance(score_data, dict) else None
+        activity_value = (
+            score_data.get("activity_at") if isinstance(score_data, dict) else None
+        )
+        profile_user_id = (
+            profile.get("user_id", profile.get("id"))
+            if isinstance(profile, dict)
+            else None
+        )
         if (
-            not isinstance(score_data, dict)
-            or type(score_data.get("hard_filter_passed")) is not bool
+            type(candidate.get("id")) is not int
+            or candidate["id"] <= 0
+            or candidate.get("user_id") != user_id
+            or type(candidate.get("username")) is not str
+            or re.fullmatch(
+                r"[A-Za-z0-9_]{1,15}", candidate["username"]
+            ) is None
+            or type(candidate.get("direct_url")) is not str
+            or type(candidate.get("score")) is not int
+            or not 0 <= candidate["score"] <= 100
+            or type(candidate.get("discovery_source")) is not str
+            or not candidate["discovery_source"]
+            or not isinstance(profile, dict)
+            or type(profile_user_id) is not str
+            or profile_user_id != user_id
+            or profile.get("username") != candidate["username"]
+            or type(profile.get("description")) is not str
+            or type(profile.get("protected")) is not bool
+            or type(profile.get("followers_count")) is not int
+            or profile["followers_count"] < 0
+            or type(profile.get("following_count")) is not int
+            or profile["following_count"] < 0
+            or type(profile.get("spam_signals")) is not list
+            or any(type(signal) is not str for signal in profile["spam_signals"])
+            or not isinstance(score_data, dict)
+            or type(hard_filter_passed) is not bool
+            or type(score_data.get("total")) is not int
+            or score_data["total"] != candidate["score"]
+            or score_data.get("audience_segment") not in {
+                "primary", "amplifier", "end_user",
+            }
+            or type(reasons) is not list
+            or any(type(reason) is not str for reason in reasons)
+            or type(score_data.get("filter_reason")) is not str
             or evaluated_at > current_time
             or expires_at <= current_time
+        ):
+            return None
+        if latest_post is not None and not isinstance(latest_post, dict):
+            return None
+        latest_activity = None
+        if isinstance(latest_post, dict):
+            try:
+                latest_activity = self._parse_datetime(
+                    latest_post.get("created_at")
+                )
+            except (TypeError, ValueError):
+                return None
+            if (
+                type(latest_post.get("id")) is not str
+                or not latest_post["id"].isascii()
+                or not latest_post["id"].isdigit()
+                or type(latest_post.get("text")) is not str
+                or type(latest_post.get("lang")) is not str
+                or type(latest_post.get("is_original")) is not bool
+                or latest_activity > current_time
+            ):
+                return None
+        if activity_value is not None:
+            try:
+                activity_at = self._parse_datetime(activity_value)
+            except (TypeError, ValueError):
+                return None
+            if activity_at > current_time:
+                return None
+            if latest_activity is None or activity_at != latest_activity:
+                return None
+        if hard_filter_passed is True and (
+            activity_value is None
+            or not isinstance(latest_post, dict)
+            or latest_post.get("is_original") is not True
         ):
             return None
         return candidate
 
     def is_growth_candidate_suppressed(self, user_id: str, now: datetime) -> bool:
-        candidate = self.get_growth_candidate(user_id)
-        if not candidate or not candidate.get("suppressed_until"):
+        if type(user_id) is not str or not user_id:
+            return False
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT suppressed_until FROM growth_candidates WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        if not row or row["suppressed_until"] is None:
             return False
         try:
-            return self._parse_datetime(candidate["suppressed_until"]) > self._as_utc(now)
+            return self._parse_datetime(row["suppressed_until"]) > self._as_utc(now)
         except (TypeError, ValueError):
             return True
 
@@ -3246,14 +3344,38 @@ class Database:
                     updated_at = excluded.updated_at
             """, (key, value, self._now_iso()))
 
-    def claim_growth_counter(self, key: str, limit: int) -> bool:
-        """Atomically reserve one paid growth read before contacting X."""
-        if type(key) is not str or not key or type(limit) is not int or limit <= 0:
-            return False
+    def claim_growth_profile_evaluation(
+        self,
+        observed_on: str,
+        user_id: str,
+        limit: int,
+    ) -> str:
+        """Atomically reserve one daily paid profile read for one exact user."""
+        if (
+            type(observed_on) is not str
+            or re.fullmatch(r"\d{4}-\d{2}-\d{2}", observed_on) is None
+            or type(user_id) is not str
+            or not user_id
+            or type(limit) is not int
+            or limit <= 0
+        ):
+            return "budget_exhausted"
+        try:
+            if date.fromisoformat(observed_on).isoformat() != observed_on:
+                return "budget_exhausted"
+        except ValueError:
+            return "budget_exhausted"
+        count_key = f"growth_profile_evaluations:{observed_on}"
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("""
+                SELECT 1 FROM growth_profile_claims
+                WHERE observed_on = ? AND user_id = ?
+            """, (observed_on, user_id)).fetchone()
+            if existing:
+                return "already_claimed"
             row = conn.execute(
-                "SELECT value FROM bot_state WHERE key = ?", (key,)
+                "SELECT value FROM bot_state WHERE key = ?", (count_key,)
             ).fetchone()
             raw_value = row["value"] if row else "0"
             if (
@@ -3261,18 +3383,24 @@ class Database:
                 or not raw_value.isascii()
                 or not raw_value.isdigit()
             ):
-                return False
+                return "budget_exhausted"
             used = int(raw_value)
             if used >= limit:
-                return False
+                return "budget_exhausted"
+            claimed_at = self._now_iso()
+            conn.execute("""
+                INSERT INTO growth_profile_claims (
+                    observed_on, user_id, claimed_at
+                ) VALUES (?, ?, ?)
+            """, (observed_on, user_id, claimed_at))
             conn.execute("""
                 INSERT INTO bot_state (key, value, updated_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET
                     value = excluded.value,
                     updated_at = excluded.updated_at
-            """, (key, str(used + 1), self._now_iso()))
-            return True
+            """, (count_key, str(used + 1), claimed_at))
+            return "claimed"
 
     def claim_growth_query(
         self,

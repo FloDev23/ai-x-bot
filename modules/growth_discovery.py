@@ -422,7 +422,6 @@ class GrowthDiscovery:
                 (source, candidate_profile) for candidate_profile in profiles
             )
 
-        evaluation_key = f"growth_profile_evaluations:{observed_on}"
         seen = set()
         for source, candidate_profile in collected:
             if not self._valid_profile(candidate_profile):
@@ -447,9 +446,12 @@ class GrowthDiscovery:
                         source=f"candidate:{cached['id']}",
                     )
                 continue
-            if not self.db.claim_growth_counter(
-                evaluation_key, self.new_profile_budget
-            ):
+            claim_outcome = self.db.claim_growth_profile_evaluation(
+                observed_on, user_id, self.new_profile_budget
+            )
+            if claim_outcome == "already_claimed":
+                continue
+            if claim_outcome != "claimed":
                 break
             try:
                 latest_post = self.x.get_latest_original_post(user_id)
