@@ -28,6 +28,13 @@ from modules.media_store import (
     record_has_media_identity,
     verify_pinned_media,
 )
+from modules.growth_candidate_schema import (
+    evaluate_growth_candidate_filters,
+    is_canonical_growth_latest_post,
+    is_canonical_growth_profile,
+    is_json_safe_mapping,
+    parse_growth_datetime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3000,25 +3007,6 @@ class Database:
         result["direct_url"] = direct_url
         return result
 
-    @staticmethod
-    def _is_json_safe_mapping(value: Any) -> bool:
-        if type(value) is not dict:
-            return False
-        try:
-            json.dumps(value, allow_nan=False)
-        except (TypeError, ValueError):
-            return False
-        return True
-
-    @staticmethod
-    def _parse_aware_datetime(value: Any) -> datetime:
-        if type(value) is not str or not value:
-            raise ValueError("An aware ISO datetime string is required")
-        parsed = datetime.fromisoformat(value)
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise ValueError("A timezone offset is required")
-        return parsed.astimezone(timezone.utc)
-
     def _validated_growth_candidate(
         self,
         row: sqlite3.Row,
@@ -3050,76 +3038,51 @@ class Database:
                 or not 0 <= score <= 100
                 or type(result.get("discovery_source")) is not str
                 or not result["discovery_source"]
-                or not self._is_json_safe_mapping(profile)
-                or not self._is_json_safe_mapping(latest_post)
-                or not self._is_json_safe_mapping(score_data)
+                or not is_json_safe_mapping(profile)
+                or not is_json_safe_mapping(latest_post)
+                or not is_json_safe_mapping(score_data)
             ):
                 return None
 
-            profile_aliases = [
-                profile[name] for name in ("id", "user_id") if name in profile
-            ]
-            if (
-                not profile_aliases
-                or any(
-                    type(alias) is not str or not alias or alias != user_id
-                    for alias in profile_aliases
-                )
-                or profile.get("username") != username
-                or type(profile.get("description")) is not str
-                or profile.get("protected") is not False
-                or type(profile.get("followers_count")) is not int
-                or profile["followers_count"] < 0
-                or type(profile.get("following_count")) is not int
-                or profile["following_count"] < 0
-                or type(profile.get("spam_signals")) is not list
-                or profile["spam_signals"] != []
-                or (
-                    "follow_farming" in profile
-                    and profile.get("follow_farming") is not False
-                )
+            if not is_canonical_growth_profile(
+                profile,
+                user_id=user_id,
+                username=username,
             ):
                 return None
 
             latest_id = latest_post.get("id")
-            if (
-                type(latest_id) is not str
-                or not latest_id.isascii()
-                or not latest_id.isdigit()
-                or (
-                    "tweet_id" in latest_post
-                    and (
-                        type(latest_post.get("tweet_id")) is not str
-                        or latest_post["tweet_id"] != latest_id
-                    )
-                )
-                or type(latest_post.get("text")) is not str
-                or type(latest_post.get("lang")) is not str
-                or not latest_post["lang"]
-                or latest_post.get("is_original") is not True
-            ):
+            if not is_canonical_growth_latest_post(latest_post):
+                return None
+            if evaluate_growth_candidate_filters(
+                profile,
+                latest_post,
+                current_time,
+            ) != (True, "accepted"):
                 return None
 
-            evaluated_at = self._parse_aware_datetime(
+            evaluated_at = parse_growth_datetime(
                 result.get("last_evaluated_at")
             )
-            expires_at = self._parse_aware_datetime(
+            expires_at = parse_growth_datetime(
                 result.get("profile_expires_at")
             )
-            latest_activity = self._parse_aware_datetime(
+            latest_activity = parse_growth_datetime(
                 latest_post.get("created_at")
             )
-            activity_at = self._parse_aware_datetime(
+            activity_at = parse_growth_datetime(
                 score_data.get("activity_at")
             )
             if (
-                evaluated_at > current_time
+                evaluated_at is None
+                or expires_at is None
+                or latest_activity is None
+                or activity_at is None
+                or evaluated_at > current_time
                 or expires_at <= current_time
                 or expires_at <= evaluated_at
                 or latest_activity != activity_at
                 or activity_at > evaluated_at
-                or activity_at > current_time
-                or current_time - activity_at > timedelta(days=30)
             ):
                 return None
 

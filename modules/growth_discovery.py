@@ -1,9 +1,8 @@
 """Budgeted, deterministic, read-only discovery of relevant X accounts."""
 
-import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
@@ -15,6 +14,13 @@ from config import (
     GROWTH_QUERY_BUDGET,
     GROWTH_SCORE_THRESHOLD,
     GROWTH_SEED_ACCOUNTS,
+)
+from modules.growth_candidate_schema import (
+    as_utc,
+    evaluate_growth_candidate_filters,
+    is_canonical_growth_latest_post,
+    is_canonical_growth_profile,
+    parse_growth_datetime,
 )
 
 
@@ -59,18 +65,11 @@ _AFFINITY_TERMS = ("drop-in", "drop in", "class booking", "flexdropin")
 
 
 def _utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+    return as_utc(value)
 
 
 def _parse_datetime(value) -> Optional[datetime]:
-    if type(value) is not str or not value:
-        return None
-    try:
-        return _utc(datetime.fromisoformat(value))
-    except ValueError:
-        return None
+    return parse_growth_datetime(value)
 
 
 def _contains(text: str, term: str) -> bool:
@@ -86,52 +85,7 @@ def passes_candidate_filters(
     now: datetime,
 ) -> Tuple[bool, str]:
     """Apply non-negotiable eligibility gates without an AI fallback."""
-    current_time = _utc(now)
-    if not isinstance(profile, dict) or profile.get("protected") is not False:
-        return False, "protected_profile"
-    latest_post = latest_post if isinstance(latest_post, dict) else {}
-    activity_at = _parse_datetime(latest_post.get("created_at"))
-    if (
-        latest_post.get("is_original") is not True
-        or activity_at is None
-        or activity_at > current_time
-        or current_time - activity_at > timedelta(days=30)
-    ):
-        return False, "no_original_post_within_30_days"
-    bio = profile.get("description")
-    text = latest_post.get("text")
-    spam_signals = profile.get("spam_signals")
-    followers = profile.get("followers_count")
-    following = profile.get("following_count")
-    if (
-        type(bio) is not str
-        or type(text) is not str
-        or type(latest_post.get("lang")) is not str
-        or type(spam_signals) is not list
-        or any(type(signal) is not str for signal in spam_signals)
-        or type(followers) is not int
-        or followers < 0
-        or type(following) is not int
-        or following < 0
-        or (
-            "follow_farming" in profile
-            and type(profile.get("follow_farming")) is not bool
-        )
-    ):
-        return False, "malformed_candidate_record"
-    bio_context = bio.strip()
-    post_context = text.strip()
-    if not bio_context and not post_context:
-        return False, "insufficient_bio_post_context"
-    if spam_signals or profile.get("follow_farming") is True:
-        return False, "spam_or_follow_farming_signals"
-    raw_suppressed_until = profile.get("suppressed_until")
-    suppressed_until = _parse_datetime(raw_suppressed_until)
-    if raw_suppressed_until is not None and suppressed_until is None:
-        return False, "malformed_candidate_record"
-    if suppressed_until is not None and suppressed_until > current_time:
-        return False, "suppressed_within_30_days"
-    return True, "accepted"
+    return evaluate_growth_candidate_filters(profile, latest_post, now)
 
 
 def score_growth_candidate(
@@ -273,55 +227,13 @@ class GrowthDiscovery:
 
     @staticmethod
     def _valid_profile(profile) -> bool:
-        if not isinstance(profile, dict):
-            return False
-        user_id = profile.get("user_id", profile.get("id"))
-        username = profile.get("username")
-        valid = (
-            type(user_id) is str
-            and bool(user_id)
-            and type(username) is str
-            and re.fullmatch(r"[A-Za-z0-9_]{1,15}", username) is not None
-            and type(profile.get("description")) is str
-            and type(profile.get("protected")) is bool
-            and type(profile.get("followers_count")) is int
-            and profile["followers_count"] >= 0
-            and type(profile.get("following_count")) is int
-            and profile["following_count"] >= 0
-            and type(profile.get("spam_signals")) is list
-            and all(
-                type(signal) is str for signal in profile["spam_signals"]
-            )
-        )
-        if not valid:
-            return False
-        try:
-            json.dumps(profile, allow_nan=False)
-        except (TypeError, ValueError):
-            return False
-        return True
+        return is_canonical_growth_profile(profile)
 
     @staticmethod
     def _valid_latest_post(latest_post) -> bool:
         if latest_post is None:
             return True
-        if not isinstance(latest_post, dict):
-            return False
-        valid = (
-            type(latest_post.get("id")) is str
-            and bool(latest_post["id"])
-            and type(latest_post.get("text")) is str
-            and _parse_datetime(latest_post.get("created_at")) is not None
-            and type(latest_post.get("lang")) is str
-            and type(latest_post.get("is_original")) is bool
-        )
-        if not valid:
-            return False
-        try:
-            json.dumps(latest_post, allow_nan=False)
-        except (TypeError, ValueError):
-            return False
-        return True
+        return is_canonical_growth_latest_post(latest_post)
 
     def _read_followers(self) -> List[Dict]:
         try:
