@@ -457,11 +457,21 @@ class Database:
                     last_evaluated_at TEXT NOT NULL,
                     profile_expires_at TEXT NOT NULL,
                     digest_sent_at TEXT,
+                    decision_at TEXT,
                     manual_followed_at TEXT,
                     followed_back_at TEXT,
                     suppressed_until TEXT
                 )
             """)
+            growth_candidate_columns = {
+                row["name"] for row in c.execute(
+                    "PRAGMA table_info(growth_candidates)"
+                )
+            }
+            if "decision_at" not in growth_candidate_columns:
+                c.execute(
+                    "ALTER TABLE growth_candidates ADD COLUMN decision_at TEXT"
+                )
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS growth_profile_claims (
@@ -479,9 +489,36 @@ class Database:
                     username TEXT NOT NULL,
                     relevant INTEGER NOT NULL,
                     source TEXT,
+                    attribution_source TEXT,
                     profile_json TEXT NOT NULL,
                     first_seen_at TEXT NOT NULL,
+                    is_new INTEGER NOT NULL DEFAULT 0,
+                    captured_at TEXT,
                     PRIMARY KEY (observed_on, user_id)
+                )
+            """)
+            follower_snapshot_columns = {
+                row["name"] for row in c.execute(
+                    "PRAGMA table_info(follower_snapshots)"
+                )
+            }
+            follower_snapshot_migrations = {
+                "attribution_source": "TEXT",
+                "is_new": "INTEGER NOT NULL DEFAULT 0",
+                "captured_at": "TEXT",
+            }
+            for column, definition in follower_snapshot_migrations.items():
+                if column not in follower_snapshot_columns:
+                    c.execute(
+                        f"ALTER TABLE follower_snapshots "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS follower_snapshot_runs (
+                    observed_on TEXT PRIMARY KEY,
+                    followers_total INTEGER NOT NULL,
+                    captured_at TEXT NOT NULL
                 )
             """)
 
@@ -2149,16 +2186,44 @@ class Database:
             """, (tweet_id, impressions, likes, retweets, replies, bookmarks,
                   datetime.now().isoformat()))
 
-    def get_category_performance(self, days: int = 30) -> Dict[str, Dict]:
+    def get_first_posted_at(self) -> Optional[str]:
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT created_at FROM posted_tweets
+                WHERE julianday(created_at) IS NOT NULL
+                ORDER BY julianday(created_at), id
+                LIMIT 1
+            """).fetchone()
+        return row["created_at"] if row else None
+
+    def get_category_performance(
+        self,
+        days: int = 30,
+        *,
+        end_at: Optional[datetime] = None,
+    ) -> Dict[str, Dict]:
         """Aggrega metriche per categoria: usato dal modulo analytics per l'auto-learning"""
-        since = (datetime.now() - timedelta(days=days)).isoformat()
+        if type(days) is not int or days <= 0:
+            return {}
+        current_time = end_at or datetime.now(timezone.utc)
+        if (
+            type(current_time) is not datetime
+            or current_time.tzinfo is None
+            or current_time.utcoffset() is None
+        ):
+            raise ValueError("end_at must be timezone-aware")
+        current_time = current_time.astimezone(timezone.utc)
+        since = (current_time - timedelta(days=days)).isoformat()
+        until = current_time.isoformat()
         with self._conn() as conn:
             rows = conn.execute("""
                 SELECT p.category, m.impressions, m.likes, m.retweets, m.replies, m.bookmarks
                 FROM posted_tweets p
                 JOIN tweet_metrics m ON p.tweet_id = m.tweet_id
-                WHERE p.created_at >= ? AND p.tweet_id != ''
-            """, (since,)).fetchall()
+                WHERE julianday(p.created_at) >= julianday(?)
+                  AND julianday(p.created_at) <= julianday(?)
+                  AND p.tweet_id != ''
+            """, (since, until)).fetchall()
 
         agg: Dict[str, Dict] = {}
         for r in rows:
@@ -3241,8 +3306,26 @@ class Database:
         candidate_id: int,
         decision: str,
         reason: Optional[str] = None,
+        *,
+        decided_at: Optional[datetime] = None,
     ) -> bool:
-        now = datetime.now(timezone.utc)
+        if (
+            type(candidate_id) is not int
+            or candidate_id <= 0
+            or decision not in {
+                "saved", "followed_manually", "discarded", "rejected",
+            }
+            or (reason is not None and type(reason) is not str)
+        ):
+            return False
+        now = datetime.now(timezone.utc) if decided_at is None else decided_at
+        if (
+            type(now) is not datetime
+            or now.tzinfo is None
+            or now.utcoffset() is None
+        ):
+            raise ValueError("decided_at must be timezone-aware")
+        now = now.astimezone(timezone.utc)
         now_iso = now.isoformat()
         manual_followed_at = now_iso if decision == "followed_manually" else None
         suppressed_until = None
@@ -3252,12 +3335,14 @@ class Database:
             cursor = conn.execute("""
                 UPDATE growth_candidates
                 SET decision = ?, rejection_reason = ?,
+                    decision_at = ?,
                     manual_followed_at = COALESCE(?, manual_followed_at),
                     suppressed_until = ?
                 WHERE id = ? AND decision = 'new'
             """, (
                 decision,
                 reason,
+                now_iso,
                 manual_followed_at,
                 suppressed_until,
                 candidate_id,
@@ -3271,9 +3356,19 @@ class Database:
         relevant: bool,
         source: Optional[str],
     ) -> bool:
+        try:
+            normalized_date = date.fromisoformat(observed_on).isoformat()
+        except (TypeError, ValueError):
+            raise ValueError("observed_on must be an exact ISO date") from None
+        if normalized_date != observed_on:
+            raise ValueError("observed_on must be an exact ISO date")
+        if not is_canonical_growth_profile(profile):
+            raise ValueError("Follower profile must match the canonical schema")
+        if type(relevant) is not bool:
+            raise ValueError("relevant must be an exact boolean")
+        if source is not None and type(source) is not str:
+            raise ValueError("source must be a string or None")
         user_id = profile.get("user_id", profile.get("id"))
-        if type(user_id) is not str or not user_id:
-            raise ValueError("Follower profile requires an exact string user_id or id")
         username = profile.get("username", "")
         with self._conn() as conn:
             cursor = conn.execute("""
@@ -3290,10 +3385,148 @@ class Database:
                 observed_on,
                 user_id,
                 username,
-                int(relevant),
+                1 if relevant else 0,
                 source,
-                json.dumps(profile),
+                json.dumps(profile, allow_nan=False),
                 self._now_iso(),
+            ))
+            return cursor.rowcount == 1
+
+    def capture_follower_observation(
+        self,
+        observed_on: str,
+        observed_at: datetime,
+        profile: Dict,
+        relevant: bool,
+    ) -> Optional[Dict]:
+        """Atomically persist one capture and attribute a manual conversion."""
+        try:
+            normalized_date = date.fromisoformat(observed_on).isoformat()
+        except (TypeError, ValueError):
+            return None
+        if (
+            normalized_date != observed_on
+            or type(observed_at) is not datetime
+            or observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+            or type(relevant) is not bool
+            or not is_canonical_growth_profile(profile)
+        ):
+            return None
+        observed_iso = observed_at.astimezone(timezone.utc).isoformat()
+        user_id = profile.get("user_id", profile.get("id"))
+        username = profile["username"]
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            other_snapshot = conn.execute("""
+                SELECT 1 FROM follower_snapshots
+                WHERE user_id = ? AND observed_on != ?
+                LIMIT 1
+            """, (user_id, observed_on)).fetchone()
+            current = conn.execute("""
+                SELECT captured_at FROM follower_snapshots
+                WHERE observed_on = ? AND user_id = ?
+            """, (observed_on, user_id)).fetchone()
+            is_new = other_snapshot is None and (
+                current is None or current["captured_at"] is None
+            )
+            candidate = conn.execute("""
+                SELECT id, decision, discovery_source
+                FROM growth_candidates WHERE user_id = ?
+            """, (user_id,)).fetchone()
+            attribution_source = "unattributed"
+            snapshot_source = "x_followers"
+            if candidate is not None:
+                candidate_id = candidate["id"]
+                discovery_source = candidate["discovery_source"]
+                if type(candidate_id) is int and candidate_id > 0:
+                    snapshot_source = f"candidate:{candidate_id}"
+                if type(discovery_source) is str and discovery_source:
+                    attribution_source = discovery_source
+
+            conn.execute("""
+                INSERT INTO follower_snapshots (
+                    observed_on, user_id, username, relevant, source,
+                    attribution_source, profile_json, first_seen_at,
+                    is_new, captured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(observed_on, user_id) DO UPDATE SET
+                    username = excluded.username,
+                    relevant = excluded.relevant,
+                    source = excluded.source,
+                    attribution_source = excluded.attribution_source,
+                    profile_json = excluded.profile_json,
+                    is_new = CASE
+                        WHEN follower_snapshots.captured_at IS NULL
+                        THEN excluded.is_new
+                        ELSE follower_snapshots.is_new
+                    END,
+                    captured_at = COALESCE(
+                        follower_snapshots.captured_at, excluded.captured_at
+                    )
+            """, (
+                observed_on,
+                user_id,
+                username,
+                1 if relevant else 0,
+                snapshot_source,
+                attribution_source,
+                json.dumps(profile, allow_nan=False),
+                observed_iso,
+                1 if is_new else 0,
+                observed_iso,
+            ))
+
+            followed_back = False
+            if is_new and candidate is not None:
+                cursor = conn.execute("""
+                    UPDATE growth_candidates
+                    SET followed_back_at = ?
+                    WHERE user_id = ?
+                      AND decision = 'followed_manually'
+                      AND followed_back_at IS NULL
+                      AND julianday(manual_followed_at) <= julianday(?)
+                """, (observed_iso, user_id, observed_iso))
+                followed_back = cursor.rowcount == 1
+            return {
+                "is_new": is_new,
+                "relevant": relevant,
+                "attribution_source": attribution_source,
+                "followed_back": followed_back,
+            }
+
+    def save_follower_snapshot_run(
+        self,
+        observed_on: str,
+        observed_at: datetime,
+        followers_total: int,
+    ) -> bool:
+        """Persist the daily total, including a successful empty snapshot."""
+        try:
+            normalized_date = date.fromisoformat(observed_on).isoformat()
+        except (TypeError, ValueError):
+            return False
+        if (
+            normalized_date != observed_on
+            or type(observed_at) is not datetime
+            or observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+            or type(followers_total) is not int
+            or followers_total < 0
+        ):
+            return False
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                INSERT INTO follower_snapshot_runs (
+                    observed_on, followers_total, captured_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(observed_on) DO UPDATE SET
+                    followers_total = excluded.followers_total,
+                    captured_at = excluded.captured_at
+            """, (
+                observed_on,
+                followers_total,
+                observed_at.astimezone(timezone.utc).isoformat(),
             ))
             return cursor.rowcount == 1
 
@@ -3319,9 +3552,204 @@ class Database:
         with self._conn() as conn:
             cursor = conn.execute("""
                 UPDATE growth_candidates SET followed_back_at = ?
-                WHERE user_id = ? AND followed_back_at IS NULL
-            """, (observed_at, user_id))
+                WHERE user_id = ? AND decision = 'followed_manually'
+                  AND followed_back_at IS NULL
+                  AND julianday(manual_followed_at) <= julianday(?)
+            """, (observed_at, user_id, observed_at))
             return cursor.rowcount == 1
+
+    def get_weekly_growth_analytics(
+        self,
+        start_on: str,
+        end_on: str,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> Dict:
+        """Return factual rows for one inclusive operating-date window."""
+        try:
+            start_date = date.fromisoformat(start_on)
+            end_date = date.fromisoformat(end_on)
+        except (TypeError, ValueError):
+            raise ValueError("growth report dates must be exact ISO dates") from None
+        if (
+            start_date.isoformat() != start_on
+            or end_date.isoformat() != end_on
+            or start_date > end_date
+            or type(start_at) is not datetime
+            or type(end_at) is not datetime
+            or start_at.tzinfo is None
+            or start_at.utcoffset() is None
+            or end_at.tzinfo is None
+            or end_at.utcoffset() is None
+            or start_at >= end_at
+        ):
+            raise ValueError("invalid growth report window")
+        start_iso = start_at.astimezone(timezone.utc).isoformat()
+        end_iso = end_at.astimezone(timezone.utc).isoformat()
+        decision_counts = {
+            "saved": 0,
+            "followed_manually": 0,
+            "discarded": 0,
+            "rejected": 0,
+        }
+        with self._conn() as conn:
+            latest_run = conn.execute("""
+                SELECT followers_total FROM follower_snapshot_runs
+                WHERE observed_on <= ?
+                ORDER BY observed_on DESC
+                LIMIT 1
+            """, (end_on,)).fetchone()
+            latest = conn.execute("""
+                SELECT MAX(observed_on) AS observed_on
+                FROM follower_snapshots
+                WHERE observed_on <= ?
+            """, (end_on,)).fetchone()
+            latest_on = latest["observed_on"] if latest else None
+            followers_total = (
+                latest_run["followers_total"] if latest_run else 0
+            )
+            if latest_run is None and type(latest_on) is str:
+                row = conn.execute("""
+                    SELECT COUNT(*) AS count
+                    FROM follower_snapshots WHERE observed_on = ?
+                """, (latest_on,)).fetchone()
+                followers_total = row["count"] if row else 0
+
+            new_rows = conn.execute("""
+                SELECT relevant, attribution_source
+                FROM follower_snapshots
+                WHERE observed_on >= ? AND observed_on <= ? AND is_new = 1
+            """, (start_on, end_on)).fetchall()
+            new_followers = len(new_rows)
+            new_relevant_followers = sum(
+                row["relevant"] == 1 for row in new_rows
+            )
+            follower_sources: Dict[str, int] = {}
+            for row in new_rows:
+                source = row["attribution_source"]
+                if type(source) is not str or not source:
+                    source = "unattributed"
+                follower_sources[source] = follower_sources.get(source, 0) + 1
+
+            candidate_count_row = conn.execute("""
+                SELECT COUNT(*) AS count FROM growth_candidates
+                WHERE julianday(first_seen_at) >= julianday(?)
+                  AND julianday(first_seen_at) < julianday(?)
+            """, (start_iso, end_iso)).fetchone()
+            candidate_count = (
+                candidate_count_row["count"] if candidate_count_row else 0
+            )
+            candidate_source_rows = conn.execute("""
+                SELECT DISTINCT discovery_source FROM growth_candidates
+                WHERE julianday(first_seen_at) >= julianday(?)
+                  AND julianday(first_seen_at) < julianday(?)
+            """, (start_iso, end_iso)).fetchall()
+            candidate_sources = {
+                row["discovery_source"]
+                for row in candidate_source_rows
+                if type(row["discovery_source"]) is str
+                and row["discovery_source"]
+            }
+
+            for row in conn.execute("""
+                SELECT decision, COUNT(*) AS count FROM growth_candidates
+                WHERE julianday(decision_at) >= julianday(?)
+                  AND julianday(decision_at) < julianday(?)
+                GROUP BY decision
+            """, (start_iso, end_iso)).fetchall():
+                if row["decision"] in decision_counts:
+                    decision_counts[row["decision"]] = row["count"]
+
+            manual_by_source: Dict[str, int] = {}
+            followed_back_by_source: Dict[str, int] = {}
+            for row in conn.execute("""
+                SELECT discovery_source, manual_followed_at, followed_back_at
+                FROM growth_candidates
+                WHERE decision = 'followed_manually'
+                  AND julianday(manual_followed_at) >= julianday(?)
+                  AND julianday(manual_followed_at) < julianday(?)
+            """, (start_iso, end_iso)).fetchall():
+                source = row["discovery_source"]
+                if type(source) is not str or not source:
+                    source = "unattributed"
+                manual_by_source[source] = manual_by_source.get(source, 0) + 1
+                followed_at = row["followed_back_at"]
+                if (
+                    type(followed_at) is str
+                    and conn.execute(
+                        """
+                        SELECT CASE WHEN julianday(?) >= julianday(?)
+                                          AND julianday(?) < julianday(?)
+                                    THEN 1 ELSE 0 END AS valid
+                        """,
+                        (
+                            followed_at,
+                            row["manual_followed_at"],
+                            followed_at,
+                            end_iso,
+                        ),
+                    ).fetchone()["valid"] == 1
+                ):
+                    followed_back_by_source[source] = (
+                        followed_back_by_source.get(source, 0) + 1
+                    )
+
+            post_rows = conn.execute("""
+                SELECT p.category, m.impressions
+                FROM posted_tweets p
+                LEFT JOIN tweet_metrics m ON m.tweet_id = p.tweet_id
+                WHERE julianday(p.created_at) >= julianday(?)
+                  AND julianday(p.created_at) < julianday(?)
+                ORDER BY p.created_at, p.id
+            """, (start_iso, end_iso)).fetchall()
+
+            budget_rows = conn.execute("""
+                SELECT key, value FROM bot_state
+                WHERE key LIKE 'growth_queries:%'
+                   OR key LIKE 'growth_profile_evaluations:%'
+            """).fetchall()
+
+        query_budget_used = 0
+        profiles_evaluated = 0
+        valid_days = {
+            (start_date + timedelta(days=offset)).isoformat()
+            for offset in range((end_date - start_date).days + 1)
+        }
+        for row in budget_rows:
+            key = row["key"]
+            value = row["value"]
+            if (
+                type(key) is not str
+                or type(value) is not str
+                or not value.isascii()
+                or not value.isdigit()
+            ):
+                continue
+            if key.startswith("growth_queries:"):
+                day_key = key.removeprefix("growth_queries:")
+                if day_key in valid_days:
+                    query_budget_used += int(value)
+            elif key.startswith("growth_profile_evaluations:"):
+                day_key = key.removeprefix("growth_profile_evaluations:")
+                if day_key in valid_days:
+                    profiles_evaluated += int(value)
+
+        return {
+            "followers_total": followers_total,
+            "new_followers": new_followers,
+            "new_relevant_followers": new_relevant_followers,
+            "new_follower_sources": dict(sorted(follower_sources.items())),
+            "candidate_count": candidate_count,
+            "candidate_sources": sorted(candidate_sources),
+            "decision_counts": decision_counts,
+            "manual_follows_by_source": dict(sorted(manual_by_source.items())),
+            "follow_backs_by_source": dict(
+                sorted(followed_back_by_source.items())
+            ),
+            "posts": [dict(row) for row in post_rows],
+            "query_budget_used": query_budget_used,
+            "profiles_evaluated": profiles_evaluated,
+        }
 
     # ---------- Telegram updates, state and safe errors ----------
 

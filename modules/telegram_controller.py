@@ -501,6 +501,9 @@ class TelegramController:
         return "\n".join(lines), self._callback_markup(rows) if rows else None
 
     def _growth(self, chat_id: str):
+        report = self._build_weekly_analytics_report(self._now())
+        if isinstance(report, dict) and report:
+            self._send(chat_id, self.format_weekly_report(report))
         candidates = self.db.get_digest_candidates(limit=5)
         if not candidates:
             self._send(chat_id, "Nessun candidato growth disponibile.")
@@ -511,10 +514,15 @@ class TelegramController:
             self._send(chat_id, text, reply_markup=markup)
         return "growth"
 
-    def _stats(self, chat_id: str):
+    def _build_weekly_analytics_report(self, end_date):
         report = None
         if self.analytics is not None:
+            build = getattr(self.analytics, "build_weekly_report", None)
+            if callable(build):
+                report = build(end_date)
             for method_name in ("weekly_report", "get_weekly_report"):
+                if report is not None:
+                    break
                 method = getattr(self.analytics, method_name, None)
                 if callable(method):
                     report = method()
@@ -523,19 +531,118 @@ class TelegramController:
                 ranking = getattr(self.analytics, "get_ranking", None)
                 if callable(ranking):
                     report = {"ranking": ranking(days=7)}
+        return report
+
+    @classmethod
+    def format_weekly_report(cls, report: Dict[str, Any]) -> str:
+        """Render the one canonical plain-text weekly analytics summary."""
+        if not isinstance(report, dict) or not report:
+            return "Statistiche non ancora disponibili."
+
+        def integer(key):
+            value = report.get(key)
+            return value if type(value) is int and value >= 0 else 0
+
+        def decimal(key):
+            value = report.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return 0.0
+            return max(float(value), 0.0)
+
+        factual = report.get("factual_blocks")
+        factual = factual if isinstance(factual, dict) else {}
+        period = factual.get("period")
+        period = period if isinstance(period, dict) else {}
+        start_date = cls._clean_text(period.get("start_date"), 20) or "n/d"
+        end_date = cls._clean_text(period.get("end_date"), 20) or "n/d"
+        lines = [
+            "Riepilogo settimanale",
+            f"periodo: {start_date} — {end_date}",
+            f"follower totali (followers_total: {integer('followers_total')})",
+            (
+                "nuovi follower: "
+                f"{integer('new_followers')} "
+                f"(pertinenti: {integer('new_relevant_followers')}, "
+                f"tasso: {decimal('relevant_follower_rate') * 100:.1f}%)"
+            ),
+            f"candidati valutati nel report: {integer('candidate_count')}",
+        ]
+
+        decision_counts = report.get("decision_counts")
+        decision_counts = (
+            decision_counts if isinstance(decision_counts, dict) else {}
+        )
+        lines.append(
+            "decisioni: "
+            f"salvati {decision_counts.get('saved', 0) if type(decision_counts.get('saved')) is int else 0}, "
+            f"seguiti manualmente {decision_counts.get('followed_manually', 0) if type(decision_counts.get('followed_manually')) is int else 0}, "
+            f"scartati {decision_counts.get('discarded', 0) if type(decision_counts.get('discarded')) is int else 0}, "
+            f"rifiutati {decision_counts.get('rejected', 0) if type(decision_counts.get('rejected')) is int else 0}"
+        )
+
+        rates = report.get("follow_back_rate_by_source")
+        rates = rates if isinstance(rates, dict) else {}
+        rate_parts = []
+        for source in sorted(rates, key=lambda value: str(value))[:12]:
+            rate = rates[source]
+            if type(source) is not str or isinstance(rate, bool) or not isinstance(
+                rate, (int, float),
+            ):
+                continue
+            safe_source = cls._clean_text(source, 80)
+            if safe_source:
+                rate_parts.append(f"{safe_source} {max(float(rate), 0.0) * 100:.1f}%")
+        lines.append(
+            "follow-back per fonte: " + (", ".join(rate_parts) or "nessun dato")
+        )
+        lines.extend([
+            (
+                f"post: {integer('post_count')}; "
+                f"impression mediane: {decimal('median_impressions'):g}"
+            ),
+            (
+                f"budget query usato: {integer('query_budget_used')}; "
+                f"profili valutati: {integer('profiles_evaluated')}"
+            ),
+        ])
+        categories = report.get("content_by_category")
+        categories = categories if isinstance(categories, dict) else {}
+        category_parts = []
+        for category in sorted(categories, key=lambda value: str(value))[:12]:
+            count = categories[category]
+            if type(category) is not str or type(count) is not int or count < 0:
+                continue
+            safe_category = cls._clean_text(category, 80)
+            if safe_category:
+                category_parts.append(f"{safe_category} {count}")
+        lines.append(
+            "contenuti per categoria: "
+            + (", ".join(category_parts) or "nessun dato")
+        )
+        attribution = cls._clean_text(report.get("attribution_label"), 40)
+        lines.append(f"attribuzione post/follower: {attribution or 'correlation'}")
+        return "\n".join(lines)
+
+    def _stats(self, chat_id: str):
+        report = self._build_weekly_analytics_report(self._now())
         if not isinstance(report, dict) or not report:
             self._send(chat_id, "Statistiche non ancora disponibili.")
             return "stats_empty"
-        lines = ["Statistiche"]
-        for key in sorted(report):
-            value = report[key]
-            if isinstance(value, (dict, list, tuple)):
-                rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
-            else:
-                rendered = str(value)
-            lines.append(f"{self._clean_text(str(key), 80)}: {self._clean_text(rendered, 800)}")
-        self._send(chat_id, "\n".join(lines))
+        self._send(chat_id, self.format_weekly_report(report))
         return "stats"
+
+    def push_weekly_report(self, end_date=None):
+        """Callable Task 12 may schedule; this task registers no job."""
+        report = self._build_weekly_analytics_report(
+            self._now() if end_date is None else end_date
+        )
+        if not isinstance(report, dict) or not report:
+            return "weekly_report_empty"
+        self._send(
+            self.authorized_chat_id,
+            self.format_weekly_report(report),
+        )
+        return "weekly_report_sent"
 
     def _source_type_markup(self):
         return self._callback_markup([
