@@ -1,5 +1,6 @@
 import json
 import inspect
+import os
 import sqlite3
 import subprocess
 import sys
@@ -8,10 +9,13 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from modules.database import Database
 from modules.draft_pipeline import DraftPipeline
 from modules.fact_guard import FactCheckResult
 from modules.media_processor import MediaProcessor
+from modules.media_store import media_store_lock
 from modules.telegram_api import TelegramApi, telegram_media_metadata
 from modules.telegram_controller import TelegramController
 
@@ -242,7 +246,7 @@ def attach_verified_preview(
     mime_type="image/jpeg",
 ):
     media_root = tmp_path / f"media-{draft_id}"
-    media_root.mkdir(mode=0o700)
+    media_root.mkdir(mode=0o700, parents=True)
     staged = media_root / ("staged" + Path(filename).suffix)
     staged.write_bytes(content)
     record = MediaProcessor(db).process_new_file(
@@ -1157,6 +1161,568 @@ def test_preview_revalidates_draft_media_binding_under_open_media_lease(tmp_path
         "Post whose preview binding changed" in message[1]
         for message in telegram.messages
     )
+
+
+def test_preview_send_linearizes_before_same_draft_transition_and_frees_sqlite(
+    tmp_path,
+    monkeypatch,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    class BlockingPreviewTelegramApi(WorkflowTelegramApi):
+        def __init__(self, media_library_dir):
+            super().__init__(media_library_dir)
+            self.send_started = threading.Event()
+            self.allow_send_return = threading.Event()
+
+        def send_media(self, chat_id, media, media_type, **kwargs):
+            self.events.append(("media_send_started",))
+            self.send_started.set()
+            if not self.allow_send_return.wait(timeout=2):
+                raise AssertionError("preview send was never released")
+            result = super().send_media(chat_id, media, media_type, **kwargs)
+            self.events.append(("media_send_finished",))
+            return result
+
+    path = str(tmp_path / "preview-linearization.db")
+    db = Database(path)
+    _source_id, draft_id = add_pending_draft(
+        db,
+        text="Preview remains valid until its send returns",
+    )
+    attach_verified_preview(db, tmp_path, draft_id)
+    telegram = BlockingPreviewTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+    controller_result = []
+    transition_result = []
+    transition_started = threading.Event()
+    transition_attempted_root = threading.Event()
+    transition_finished = threading.Event()
+    unrelated_writer_finished = threading.Event()
+
+    @contextmanager
+    def observed_media_store_lock(directory):
+        transition_attempted_root.set()
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module,
+        "media_store_lock",
+        observed_media_store_lock,
+    )
+
+    def render_posts():
+        controller_result.append(
+            controller.process_update(message_update(311, "/posts"))
+        )
+
+    def discard_draft():
+        transition_started.set()
+        transition_result.append(db.transition_post_draft(
+            draft_id,
+            ["pending_approval"],
+            "discarded",
+            error="user_discarded",
+        ))
+        telegram.events.append(("draft_transition_finished",))
+        transition_finished.set()
+
+    def write_unrelated_state():
+        Database(path).set_state("unrelated_writer", "complete")
+        unrelated_writer_finished.set()
+
+    controller_thread = threading.Thread(target=render_posts)
+    transition_thread = threading.Thread(target=discard_draft)
+    writer_thread = threading.Thread(target=write_unrelated_state)
+    try:
+        controller_thread.start()
+        assert telegram.send_started.wait(timeout=2)
+        transition_thread.start()
+        assert transition_started.wait(timeout=1)
+        assert transition_attempted_root.wait(timeout=1)
+        writer_thread.start()
+        writer_completed_during_send = unrelated_writer_finished.wait(timeout=1)
+        transition_completed_during_send = transition_finished.is_set()
+    finally:
+        telegram.allow_send_return.set()
+        controller_thread.join(timeout=2)
+        transition_thread.join(timeout=2)
+        if writer_thread.ident is not None:
+            writer_thread.join(timeout=2)
+
+    assert writer_completed_during_send is True
+    assert transition_completed_during_send is False
+    assert not controller_thread.is_alive()
+    assert not transition_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert controller_result == ["processed"]
+    assert transition_result == [True]
+    assert len(telegram.media_messages) == 1
+    assert db.get_post_draft(draft_id)["status"] == "discarded"
+    event_names = [event[0] for event in telegram.events]
+    assert event_names.index("media_send_finished") < event_names.index(
+        "draft_transition_finished"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation_name",
+    [
+        "transition",
+        "approve",
+        "postpone",
+        "postpone_session",
+        "claim",
+        "restore_claim",
+        "mark_unknown",
+        "replace",
+        "replace_session",
+        "detach",
+        "finalize",
+        "fail_publication",
+    ],
+)
+def test_existing_draft_mutations_wait_for_bound_media_root(
+    tmp_path,
+    monkeypatch,
+    mutation_name,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    case_root = tmp_path / mutation_name
+    case_root.mkdir()
+    db = Database(str(case_root / "binding.db"))
+    source_id, draft_id = add_pending_draft(
+        db,
+        text=f"Bound mutation {mutation_name}",
+    )
+    record = attach_verified_preview(db, case_root, draft_id)
+    draft = db.get_post_draft(draft_id)
+    state_key = "telegram_session:42"
+    state_value = _session_json(
+        "draft_postpone" if mutation_name == "postpone_session" else "draft_edit",
+        "slot" if mutation_name == "postpone_session" else "text",
+        {"draft_id": draft_id},
+    )
+    claim = None
+    if mutation_name in {"claim", "restore_claim", "mark_unknown", "finalize", "fail_publication"}:
+        with db._conn() as conn:
+            conn.execute(
+                "UPDATE post_drafts SET status = 'approved' WHERE id = ?",
+                (draft_id,),
+            )
+        draft = db.get_post_draft(draft_id)
+    if mutation_name in {"restore_claim", "mark_unknown", "finalize", "fail_publication"}:
+        _claimed_draft, claim = db.claim_post_draft_for_publication(
+            draft_id, draft["revision"],
+        )
+        draft = db.get_post_draft(draft_id)
+    if mutation_name in {"postpone_session", "replace_session"}:
+        db.set_state(state_key, state_value)
+
+    def mutate():
+        current = db.get_post_draft(draft_id)
+        if mutation_name == "transition":
+            return db.transition_post_draft(
+                draft_id, ["pending_approval"], "discarded",
+            )
+        if mutation_name == "approve":
+            return db.approve_post_draft_atomic(
+                draft_id,
+                current["revision"],
+                current["intended_slot"],
+                "floriano",
+                lambda: datetime(2029, 8, 15, tzinfo=timezone.utc),
+            )
+        if mutation_name == "postpone":
+            return db.postpone_post_draft_atomic(
+                draft_id,
+                current["revision"],
+                ["pending_approval"],
+                "2030-08-17T12:00:00+00:00",
+            )
+        if mutation_name == "postpone_session":
+            return db.postpone_post_draft_consuming_state_atomic(
+                state_key=state_key,
+                expected_state_value=state_value,
+                draft_id=draft_id,
+                expected_revision=current["revision"],
+                expected_statuses=["pending_approval"],
+                new_slot="2030-08-17T12:00:00+00:00",
+            )
+        if mutation_name == "claim":
+            return db.claim_post_draft_for_publication(
+                draft_id, current["revision"],
+            )
+        if mutation_name == "restore_claim":
+            return db.restore_post_draft_publication_claim(claim)
+        if mutation_name == "mark_unknown":
+            return db.mark_post_draft_publication_unknown(claim, "TimeoutError")
+        if mutation_name in {"replace", "replace_session"}:
+            values = {
+                "prior_draft_id": draft_id,
+                "expected_revision": current["revision"],
+                "expected_slot": current["intended_slot"],
+                "expected_category": current["category"],
+                "expected_source_ids": current["source_ids"],
+                "text": "Replacement copy",
+                "score_data": {"total": 90},
+                "publication_key": f"round2:{mutation_name}",
+            }
+            if mutation_name == "replace_session":
+                return db.replace_post_draft_consuming_state_atomic(
+                    state_key=state_key,
+                    expected_state_value=state_value,
+                    **values,
+                )
+            return db.replace_post_draft_atomic(**values)
+        if mutation_name == "detach":
+            return db.detach_media_from_draft(draft_id)
+        if mutation_name == "finalize":
+            return db.finalize_post_draft_publication(
+                claim, "tweet-round2", db.get_media_by_id(record["id"]),
+            )
+        if mutation_name == "fail_publication":
+            return db.fail_post_draft_publication(claim, "RuntimeError")
+        raise AssertionError("unhandled mutation")
+
+    root_attempted = threading.Event()
+    mutation_finished = threading.Event()
+    mutation_errors = []
+
+    @contextmanager
+    def observed_media_store_lock(directory):
+        if Path(directory).resolve() == Path(record["filepath"]).parent.resolve():
+            root_attempted.set()
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module,
+        "media_store_lock",
+        observed_media_store_lock,
+    )
+
+    def run_mutation():
+        try:
+            mutate()
+        except BaseException as error:
+            mutation_errors.append(error)
+        finally:
+            mutation_finished.set()
+
+    thread = threading.Thread(target=run_mutation)
+    with media_store_lock(Path(record["filepath"]).parent):
+        thread.start()
+        attempted_bound_root = root_attempted.wait(timeout=1)
+        finished_while_root_held = mutation_finished.is_set()
+    thread.join(timeout=2)
+
+    assert attempted_bound_root is True
+    assert finished_while_root_held is False
+    assert not thread.is_alive()
+    assert mutation_errors == []
+
+
+def test_transition_that_wins_root_first_invalidates_preview_without_deadlock(
+    tmp_path,
+    monkeypatch,
+):
+    from modules import database as database_module
+    from modules import media_store as media_store_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    path = str(tmp_path / "transition-wins-root.db")
+    db = Database(path)
+    _source_id, draft_id = add_pending_draft(
+        db,
+        text="Transition wins the bound root",
+    )
+    record = attach_verified_preview(db, tmp_path, draft_id)
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+    mutation_has_root = threading.Event()
+    preview_attempted_root = threading.Event()
+    allow_mutation_db = threading.Event()
+    mutation_finished = threading.Event()
+    controller_result = []
+    mutation_result = []
+    mutation_thread_id = []
+    controller_thread_id = []
+
+    @contextmanager
+    def controlled_media_store_lock(directory):
+        caller = threading.get_ident()
+        if controller_thread_id and caller == controller_thread_id[0]:
+            preview_attempted_root.set()
+        with real_media_store_lock(directory) as lease:
+            if mutation_thread_id and caller == mutation_thread_id[0]:
+                mutation_has_root.set()
+                if not allow_mutation_db.wait(timeout=2):
+                    raise AssertionError("mutation DB phase was never released")
+            yield lease
+
+    monkeypatch.setattr(
+        database_module,
+        "media_store_lock",
+        controlled_media_store_lock,
+    )
+    monkeypatch.setattr(
+        media_store_module,
+        "media_store_lock",
+        controlled_media_store_lock,
+    )
+
+    def mutate():
+        mutation_thread_id.append(threading.get_ident())
+        mutation_result.append(db.transition_post_draft(
+            draft_id, ["pending_approval"], "discarded",
+        ))
+        mutation_finished.set()
+
+    def render_posts():
+        controller_thread_id.append(threading.get_ident())
+        controller_result.append(
+            controller.process_update(message_update(312, "/posts"))
+        )
+
+    mutation_thread = threading.Thread(target=mutate)
+    controller_thread = threading.Thread(target=render_posts)
+    mutation_thread.start()
+    acquired_before_db = mutation_has_root.wait(timeout=1)
+    if acquired_before_db:
+        controller_thread.start()
+        preview_waited_for_root = preview_attempted_root.wait(timeout=1)
+    else:
+        preview_waited_for_root = False
+    allow_mutation_db.set()
+    mutation_thread.join(timeout=2)
+    if controller_thread.ident is not None:
+        controller_thread.join(timeout=2)
+
+    assert acquired_before_db is True
+    assert preview_waited_for_root is True
+    assert not mutation_thread.is_alive()
+    assert not controller_thread.is_alive()
+    assert mutation_result == [True]
+    assert controller_result == ["processed"]
+    assert mutation_finished.is_set()
+    assert db.get_post_draft(draft_id)["status"] == "discarded"
+    assert telegram.media_messages == []
+
+
+def test_waiting_on_bound_root_does_not_hold_sqlite_or_block_unrelated_root(
+    tmp_path,
+    monkeypatch,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    path = str(tmp_path / "unrelated-roots.db")
+    db = Database(path)
+    _source_a, draft_a = add_pending_draft(db, text="Root A draft")
+    _source_b, draft_b = add_pending_draft(
+        db,
+        slot="2030-08-16T12:00:00+00:00",
+        text="Root B draft",
+    )
+    media_a = attach_verified_preview(db, tmp_path / "a", draft_a)
+    media_b = attach_verified_preview(db, tmp_path / "b", draft_b)
+    root_a = Path(media_a["filepath"]).parent.resolve()
+    root_b = Path(media_b["filepath"]).parent.resolve()
+    attempted_a = threading.Event()
+    attempted_b = threading.Event()
+    finished_a = threading.Event()
+    finished_b = threading.Event()
+    results = {}
+
+    @contextmanager
+    def observed_media_store_lock(directory):
+        resolved = Path(directory).resolve()
+        if resolved == root_a:
+            attempted_a.set()
+        if resolved == root_b:
+            attempted_b.set()
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module,
+        "media_store_lock",
+        observed_media_store_lock,
+    )
+
+    def transition_a():
+        results["a"] = db.transition_post_draft(
+            draft_a, ["pending_approval"], "discarded",
+        )
+        finished_a.set()
+
+    def transition_b():
+        results["b"] = Database(path).transition_post_draft(
+            draft_b, ["pending_approval"], "approved",
+        )
+        finished_b.set()
+
+    thread_a = threading.Thread(target=transition_a)
+    thread_b = threading.Thread(target=transition_b)
+    with real_media_store_lock(root_a):
+        thread_a.start()
+        assert attempted_a.wait(timeout=1)
+        assert not finished_a.is_set()
+        thread_b.start()
+        b_attempted_own_root = attempted_b.wait(timeout=1)
+        b_finished_while_a_waited = finished_b.wait(timeout=1)
+    thread_a.join(timeout=2)
+    thread_b.join(timeout=2)
+
+    assert b_attempted_own_root is True
+    assert b_finished_while_a_waited is True
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert results == {"a": True, "b": True}
+    assert Database(path).get_post_draft(draft_a)["status"] == "discarded"
+    assert Database(path).get_post_draft(draft_b)["status"] == "approved"
+
+
+def test_draft_binding_retargets_and_retries_roots_in_sorted_order(
+    tmp_path,
+    monkeypatch,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    path = str(tmp_path / "retarget.db")
+    db = Database(path)
+    _source_id, draft_id = add_pending_draft(db, text="Retargeted binding")
+    record_a = attach_verified_preview(db, tmp_path / "a-root", draft_id)
+    root_b = tmp_path / "z-root"
+    root_b.mkdir(mode=0o700)
+    staged_b = root_b / "staged.jpg"
+    staged_b.write_bytes(_PREVIEW_JPEG)
+    record_b = MediaProcessor(db).process_new_file(
+        str(staged_b),
+        "second.jpg",
+        "image/jpeg",
+        len(_PREVIEW_JPEG),
+        "Second media",
+    )
+    root_a = Path(record_a["filepath"]).parent.resolve()
+    resolved_b = Path(record_b["filepath"]).parent.resolve()
+    assert str(root_a) < str(resolved_b)
+    attempted_a = threading.Event()
+    attempted_b = threading.Event()
+    attempts = []
+    finished = threading.Event()
+    results = []
+    errors = []
+
+    @contextmanager
+    def observed_media_store_lock(directory):
+        resolved = Path(directory).resolve()
+        attempts.append(resolved)
+        if resolved == root_a:
+            attempted_a.set()
+        if resolved == resolved_b:
+            attempted_b.set()
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module,
+        "media_store_lock",
+        observed_media_store_lock,
+    )
+    prior = db.get_post_draft(draft_id)
+
+    def approve_after_discovery():
+        try:
+            results.append(db.approve_post_draft_atomic(
+                draft_id,
+                prior["revision"],
+                prior["intended_slot"],
+                "floriano",
+                lambda: datetime(2029, 8, 15, tzinfo=timezone.utc),
+            ))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=approve_after_discovery)
+    guard_a = real_media_store_lock(root_a)
+    guard_b = real_media_store_lock(resolved_b)
+    a_held = False
+    b_held = False
+    try:
+        guard_a.__enter__()
+        a_held = True
+        thread.start()
+        assert attempted_a.wait(timeout=1)
+        with db._conn() as conn:
+            conn.execute(
+                "UPDATE post_drafts SET media_id = ? WHERE id = ?",
+                (record_b["id"], draft_id),
+            )
+        guard_b.__enter__()
+        b_held = True
+        guard_a.__exit__(None, None, None)
+        a_held = False
+        retried_to_b = attempted_b.wait(timeout=1)
+        finished_while_b_held = finished.is_set()
+    finally:
+        if a_held:
+            guard_a.__exit__(None, None, None)
+        if b_held:
+            guard_b.__exit__(None, None, None)
+        thread.join(timeout=2)
+
+    assert retried_to_b is True
+    assert finished_while_b_held is False
+    assert not thread.is_alive()
+    assert errors == []
+    assert results == [True]
+    assert attempts[-2:] == [root_a, resolved_b]
+    current = db.get_post_draft(draft_id)
+    assert current["status"] == "approved"
+    assert current["media_id"] == record_b["id"]
+
+
+def test_draft_binding_lock_closes_each_discovered_root_descriptor(
+    tmp_path,
+    monkeypatch,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    db = Database(str(tmp_path / "closed-root-fd.db"))
+    _source_id, draft_id = add_pending_draft(db, text="Close root descriptor")
+    attach_verified_preview(db, tmp_path, draft_id)
+    closed_descriptors = []
+
+    @contextmanager
+    def checked_media_store_lock(directory):
+        root_fd = None
+        with real_media_store_lock(directory) as lease:
+            root_fd = lease[1]
+            yield lease
+        with pytest.raises(OSError):
+            os.fstat(root_fd)
+        closed_descriptors.append(root_fd)
+
+    monkeypatch.setattr(
+        database_module,
+        "media_store_lock",
+        checked_media_store_lock,
+    )
+
+    assert db.transition_post_draft(
+        draft_id, ["pending_approval"], "discarded",
+    )
+    assert len(closed_descriptors) == 1
 
 
 def test_draft_callback_sends_preview_then_card_then_answers_once(tmp_path):

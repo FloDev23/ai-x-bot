@@ -70,7 +70,7 @@ _PUBLICATION_MEDIA_IDENTITY_COLUMNS = (
     "file_size",
     "file_sha256",
 )
-_PREVIEW_DRAFT_SNAPSHOT_COLUMNS = (
+_DRAFT_BINDING_SNAPSHOT_COLUMNS = (
     "id",
     "revision",
     "status",
@@ -1220,8 +1220,7 @@ class Database:
         new_slot = self._normalize_datetime_iso(new_slot)
         placeholders = ", ".join("?" for _ in expected_statuses)
         try:
-            with self._conn() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+            with self._post_draft_mutation_lock(draft_id) as conn:
                 current = conn.execute(
                     "SELECT status, revision FROM post_drafts WHERE id = ?",
                     (draft_id,),
@@ -1274,8 +1273,7 @@ class Database:
             return "draft_conflict"
         new_slot = self._normalize_datetime_iso(new_slot)
         placeholders = ", ".join("?" for _ in expected_statuses)
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._post_draft_mutation_lock(draft_id) as conn:
             consumed = conn.execute(
                 "DELETE FROM bot_state WHERE key = ? AND value = ?",
                 (state_key, expected_state_value),
@@ -1332,8 +1330,7 @@ class Database:
     ) -> bool:
         """Approve one exact pending revision before its unchanged slot."""
         expected_slot = self._normalize_datetime_iso(expected_slot)
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._post_draft_mutation_lock(draft_id) as conn:
             raw_now = (
                 now_fn() if callable(now_fn) else datetime.now(timezone.utc)
             )
@@ -1652,8 +1649,7 @@ class Database:
             or expected_revision < 0
         ):
             return None
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._post_draft_mutation_lock(draft_id) as conn:
             candidate = conn.execute(
                 "SELECT * FROM post_drafts WHERE id = ?",
                 (draft_id,),
@@ -1725,7 +1721,7 @@ class Database:
         try:
             expected_draft_values = tuple(
                 expected_draft[column]
-                for column in _PREVIEW_DRAFT_SNAPSHOT_COLUMNS
+                for column in _DRAFT_BINDING_SNAPSHOT_COLUMNS
             )
             expected_media_values = tuple(
                 expected_media[column]
@@ -1763,7 +1759,7 @@ class Database:
                 and current_media is not None
                 and tuple(
                     current_draft[column]
-                    for column in _PREVIEW_DRAFT_SNAPSHOT_COLUMNS
+                    for column in _DRAFT_BINDING_SNAPSHOT_COLUMNS
                 ) == expected_draft_values
                 and tuple(
                     current_media[column]
@@ -1787,6 +1783,16 @@ class Database:
             raise ValueError(
                 "Unsupported draft fields: " + ", ".join(sorted(invalid))
             )
+        changed_media_id = changes.get("media_id")
+        if (
+            "media_id" in changes
+            and changed_media_id is not None
+            and (
+                type(changed_media_id) is not int
+                or changed_media_id <= 0
+            )
+        ):
+            raise ValueError("invalid_media_id")
         if not expected_statuses:
             return False
         assignments = [
@@ -1804,8 +1810,17 @@ class Database:
             values.append(value)
         placeholders = ", ".join("?" for _ in expected_statuses)
         values.extend([draft_id] + list(expected_statuses))
+        extra_media_ids = ()
+        if (
+            type(changed_media_id) is int
+            and changed_media_id > 0
+        ):
+            extra_media_ids = (changed_media_id,)
         try:
-            with self._conn() as conn:
+            with self._post_draft_mutation_lock(
+                draft_id,
+                extra_media_ids=extra_media_ids,
+            ) as conn:
                 cursor = conn.execute(
                     "UPDATE post_drafts SET " + ", ".join(assignments)
                     + " WHERE id = ? AND status IN (" + placeholders + ")",
@@ -1967,8 +1982,7 @@ class Database:
             return False
         if safe_error is not None:
             safe_error = self._sanitize_persisted_text(safe_error)
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._post_draft_mutation_lock(claim.draft_id) as conn:
             draft = conn.execute(
                 "SELECT * FROM post_drafts WHERE id = ?",
                 (claim.draft_id,),
@@ -2257,6 +2271,92 @@ class Database:
             roots.add(str(locator.parent.resolve(strict=True)))
         return tuple(sorted(roots))
 
+    @staticmethod
+    def _post_draft_binding_snapshot(
+        conn: sqlite3.Connection,
+        draft_id: int,
+        extra_media_ids: Tuple[int, ...] = (),
+    ) -> Tuple[Optional[Tuple[Any, ...]], Tuple[Tuple[Any, ...], ...]]:
+        draft_columns = ", ".join(_DRAFT_BINDING_SNAPSHOT_COLUMNS)
+        draft = conn.execute(
+            f"SELECT {draft_columns} FROM post_drafts WHERE id = ?",
+            (draft_id,),
+        ).fetchone()
+        draft_snapshot = (
+            tuple(
+                draft[column]
+                for column in _DRAFT_BINDING_SNAPSHOT_COLUMNS
+            )
+            if draft is not None
+            else None
+        )
+        media_columns = ", ".join(_MEDIA_MUTATION_SNAPSHOT_COLUMNS)
+        conditions = [
+            "id = (SELECT media_id FROM post_drafts WHERE id = ?)",
+            "reserved_by_draft_id = ?",
+        ]
+        parameters: List[Any] = [draft_id, draft_id]
+        if extra_media_ids:
+            conditions.append(
+                "id IN (" + ", ".join("?" for _ in extra_media_ids) + ")"
+            )
+            parameters.extend(extra_media_ids)
+        media_rows = conn.execute(
+            f"SELECT {media_columns} FROM media_library WHERE "
+            + " OR ".join(conditions)
+            + " ORDER BY id",
+            parameters,
+        ).fetchall()
+        media_snapshot = tuple(
+            tuple(row[column] for column in _MEDIA_MUTATION_SNAPSHOT_COLUMNS)
+            for row in media_rows
+        )
+        return draft_snapshot, media_snapshot
+
+    @contextmanager
+    def _post_draft_mutation_lock(
+        self,
+        draft_id: int,
+        *,
+        extra_media_ids: Tuple[int, ...] = (),
+    ):
+        """Fence one draft binding from preview through its mutation commit.
+
+        Discovery never owns SQLite's write lock.  Bound media roots are
+        acquired in stable order first; only then is the exact draft/media
+        snapshot revalidated under ``BEGIN IMMEDIATE``.  A retarget retries
+        from discovery so no stale or unrelated root is held during mutation.
+        """
+        safe_extra_media_ids = tuple(sorted({
+            media_id
+            for media_id in extra_media_ids
+            if type(media_id) is int and media_id > 0
+        }))
+        for _attempt in range(_MEDIA_STORE_MUTATION_MAX_ATTEMPTS):
+            with self._conn() as snapshot_conn:
+                candidate = self._post_draft_binding_snapshot(
+                    snapshot_conn,
+                    draft_id,
+                    safe_extra_media_ids,
+                )
+            roots = self._media_mutation_roots(candidate[1])
+            with ExitStack() as stack:
+                for root in roots:
+                    stack.enter_context(media_store_lock(Path(root)))
+                with self._conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    validated = self._post_draft_binding_snapshot(
+                        conn,
+                        draft_id,
+                        safe_extra_media_ids,
+                    )
+                    if validated != candidate:
+                        conn.rollback()
+                        continue
+                    yield conn
+                    return
+        raise RuntimeError("post_draft_binding_snapshot_unstable")
+
     @contextmanager
     def _media_store_mutation_lock(
         self,
@@ -2530,7 +2630,17 @@ class Database:
             return [dict(row) for row in rows]
 
     def reserve_media(self, media_id: int, draft_id: int) -> bool:
-        with self._media_store_mutation_lock("media", media_id) as conn:
+        if (
+            type(media_id) is not int
+            or media_id <= 0
+            or type(draft_id) is not int
+            or draft_id <= 0
+        ):
+            return False
+        with self._post_draft_mutation_lock(
+            draft_id,
+            extra_media_ids=(media_id,),
+        ) as conn:
             cursor = conn.execute("""
                 UPDATE media_library
                 SET lifecycle_state = 'reserved', reserved_by_draft_id = ?

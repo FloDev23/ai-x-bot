@@ -2,6 +2,7 @@ from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import json
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 
@@ -397,6 +398,403 @@ def _stored_media(db, tmp_path, filename="gym.jpg"):
     return MediaProcessor(db).process_new_file(
         str(staged), filename, "image/jpeg", len(JPEG_BYTES), "Studio floor"
     )
+
+
+def test_reserve_media_waits_for_the_drafts_existing_media_root(
+    tmp_path,
+    monkeypatch,
+):
+    from modules import database as database_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    db = Database(str(tmp_path / "reserve-binding.db"))
+    root_a = tmp_path / "a-bound"
+    root_b = tmp_path / "z-prospective"
+    root_a.mkdir(mode=0o700)
+    root_b.mkdir(mode=0o700)
+    media_a = _stored_media(db, root_a, "bound.jpg")
+    media_b = _stored_media(db, root_b, "prospective.jpg")
+    draft_id = _approved_sqlite_draft(
+        db,
+        slot=SLOT,
+        key="reserve-existing-binding",
+        media_record=media_a,
+    )
+    bound_root = Path(media_a["filepath"]).parent.resolve()
+    attempted_bound_root = threading.Event()
+    reserve_finished = threading.Event()
+    results = []
+    errors = []
+
+    @contextmanager
+    def observed_media_store_lock(directory):
+        if Path(directory).resolve() == bound_root:
+            attempted_bound_root.set()
+        with real_media_store_lock(directory) as lease:
+            yield lease
+
+    monkeypatch.setattr(
+        database_module,
+        "media_store_lock",
+        observed_media_store_lock,
+    )
+
+    def reserve_prospective_media():
+        try:
+            results.append(db.reserve_media(media_b["id"], draft_id))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            reserve_finished.set()
+
+    thread = threading.Thread(target=reserve_prospective_media)
+    with real_media_store_lock(bound_root):
+        thread.start()
+        attempted_while_bound = attempted_bound_root.wait(timeout=1)
+        finished_while_bound = reserve_finished.is_set()
+    thread.join(timeout=2)
+
+    assert attempted_while_bound is True
+    assert finished_while_bound is False
+    assert not thread.is_alive()
+    assert errors == []
+    assert results == [True]
+    stored_b = db.get_media_by_id(media_b["id"])
+    assert stored_b["lifecycle_state"] == "reserved"
+    assert stored_b["reserved_by_draft_id"] == draft_id
+
+
+@pytest.mark.parametrize(
+    ("media_value", "draft_value"),
+    [
+        (True, 7),
+        ("1", 7),
+        (0, 7),
+        (None, 7),
+        (1, True),
+        (1, "7"),
+        (1, 0),
+        (1, None),
+    ],
+)
+def test_reserve_media_rejects_noncanonical_identifiers_without_mutation(
+    tmp_path,
+    media_value,
+    draft_value,
+):
+    from modules.media_store import media_store_lock
+
+    db = Database(str(tmp_path / "reserve-id-contract.db"))
+    media = _stored_media(db, tmp_path, "identity.jpg")
+    assert media["id"] == 1
+    root = Path(media["filepath"]).parent.resolve()
+
+    with media_store_lock(root):
+        result = db.reserve_media(media_value, draft_value)
+
+    assert result is False
+    stored = db.get_media_by_id(media["id"])
+    assert stored["lifecycle_state"] == "available"
+    assert stored["reserved_by_draft_id"] is None
+
+
+@pytest.mark.parametrize("invalid_media_id", [True, "1", 0, -1])
+def test_transition_rejects_media_ids_that_could_bypass_the_root_fence(
+    tmp_path,
+    invalid_media_id,
+):
+    from modules.media_store import media_store_lock
+
+    db = Database(str(tmp_path / "transition-media-id-contract.db"))
+    media = _stored_media(db, tmp_path, "transition-identity.jpg")
+    draft_id = _approved_sqlite_draft(
+        db,
+        slot=SLOT,
+        key=f"transition-invalid-media:{invalid_media_id!r}",
+    )
+    before = db.get_post_draft(draft_id)
+    root = Path(media["filepath"]).parent.resolve()
+
+    with media_store_lock(root):
+        with pytest.raises(ValueError, match="invalid_media_id"):
+            db.transition_post_draft(
+                draft_id,
+                ["approved"],
+                "approved",
+                media_id=invalid_media_id,
+            )
+
+    after = db.get_post_draft(draft_id)
+    assert after["media_id"] is None
+    assert after["revision"] == before["revision"]
+
+
+def test_publisher_and_prospective_reservation_avoid_two_root_deadlock(
+    tmp_path,
+    monkeypatch,
+):
+    from modules import database as database_module
+    from modules import media_store as media_store_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    class BlockingXClient(RecordingXClient):
+        def __init__(self):
+            super().__init__(tweet_id="tweet-lock-order")
+            self.write_started = threading.Event()
+            self.allow_return = threading.Event()
+
+        def post_tweet(self, text, media_path=None, media_type="image", **kwargs):
+            self.media_bytes = media_path.read()
+            self.posts.append(text)
+            self.write_started.set()
+            if not self.allow_return.wait(timeout=3):
+                raise AssertionError("X write was never released")
+            return SimpleNamespace(data={"id": self.tweet_id})
+
+    db = Database(str(tmp_path / "two-root-order.db"))
+    root_b = tmp_path / "a-prospective"
+    root_a = tmp_path / "z-bound"
+    root_b.mkdir(mode=0o700)
+    root_a.mkdir(mode=0o700)
+    media_a = _stored_media(db, root_a, "bound.jpg")
+    media_b = _stored_media(db, root_b, "prospective.jpg")
+    draft_id = _approved_sqlite_draft(
+        db,
+        slot=SLOT,
+        key="publisher-two-root-order",
+        media_record=media_a,
+    )
+    resolved_a = Path(media_a["filepath"]).parent.resolve()
+    resolved_b = Path(media_b["filepath"]).parent.resolve()
+    assert str(resolved_b) < str(resolved_a)
+
+    test_locks = {
+        resolved_a: threading.RLock(),
+        resolved_b: threading.RLock(),
+    }
+    reserve_attempted_a = threading.Event()
+    reserve_attempted_b = threading.Event()
+    release_holds_b = threading.Event()
+    lock_timeouts = []
+
+    @contextmanager
+    def bounded_media_store_lock(directory):
+        root = Path(directory).resolve()
+        name = threading.current_thread().name
+        if name == "reserve-B" and root == resolved_a:
+            reserve_attempted_a.set()
+        if name == "reserve-B" and root == resolved_b:
+            reserve_attempted_b.set()
+        lock = test_locks.setdefault(root, threading.RLock())
+        acquired = lock.acquire(timeout=0.5)
+        if not acquired:
+            lock_timeouts.append((name, root))
+            raise RuntimeError("bounded_media_store_lock_timeout")
+        try:
+            if name == "release-draft" and root == resolved_b:
+                release_holds_b.set()
+            with real_media_store_lock(directory) as lease:
+                yield lease
+        finally:
+            lock.release()
+
+    monkeypatch.setattr(
+        database_module,
+        "media_store_lock",
+        bounded_media_store_lock,
+    )
+    monkeypatch.setattr(
+        media_store_module,
+        "media_store_lock",
+        bounded_media_store_lock,
+    )
+
+    x_client = BlockingXClient()
+    publisher_results = []
+    publisher_errors = []
+    reserve_results = []
+    reserve_errors = []
+    reserve_finished = threading.Event()
+    release_errors = []
+
+    def publish():
+        try:
+            publisher_results.append(
+                Publisher(db, x_client, dry_run=False).publish(draft_id, SLOT)
+            )
+        except BaseException as error:
+            publisher_errors.append(error)
+
+    def reserve_b():
+        try:
+            reserve_results.append(db.reserve_media(media_b["id"], draft_id))
+        except BaseException as error:
+            reserve_errors.append(error)
+        finally:
+            reserve_finished.set()
+
+    def release_draft():
+        try:
+            db.release_media_for_draft(draft_id)
+        except BaseException as error:
+            release_errors.append(error)
+
+    publisher_thread = threading.Thread(target=publish, name="publisher-A")
+    reserve_thread = threading.Thread(target=reserve_b, name="reserve-B")
+    release_thread = threading.Thread(target=release_draft, name="release-draft")
+    publisher_thread.start()
+    assert x_client.write_started.wait(timeout=2)
+    reserve_thread.start()
+    assert reserve_attempted_b.wait(timeout=1)
+    reserve_waits_for_a = reserve_attempted_a.wait(timeout=0.2)
+    legacy_reservation_committed = False
+    if not reserve_waits_for_a:
+        legacy_reservation_committed = reserve_finished.wait(timeout=1)
+        if legacy_reservation_committed:
+            release_thread.start()
+            assert release_holds_b.wait(timeout=1)
+    x_client.allow_return.set()
+    publisher_thread.join(timeout=3)
+    reserve_thread.join(timeout=3)
+    if release_thread.ident is not None:
+        release_thread.join(timeout=3)
+
+    assert lock_timeouts == []
+    assert reserve_waits_for_a is True
+    assert legacy_reservation_committed is False
+    assert not publisher_thread.is_alive()
+    assert not reserve_thread.is_alive()
+    assert not release_thread.is_alive()
+    assert publisher_errors == []
+    assert reserve_errors == []
+    assert release_errors == []
+    assert [result.status for result in publisher_results] == [
+        "publication_unknown"
+    ]
+    assert x_client.posts == ["A useful, approved post."]
+    assert db.get_post_draft(draft_id)["status"] == "publication_unknown"
+    assert reserve_results == [True]
+
+
+def test_prewrite_validation_failure_releases_stream_root_before_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    from modules import database as database_module
+    from modules import media_store as media_store_module
+    from modules.media_store import media_store_lock as real_media_store_lock
+
+    db = Database(str(tmp_path / "legacy-multi-reservation.db"))
+    root_b = tmp_path / "a-legacy-extra"
+    root_a = tmp_path / "z-bound"
+    root_b.mkdir(mode=0o700)
+    root_a.mkdir(mode=0o700)
+    media_a = _stored_media(db, root_a, "bound.jpg")
+    media_b = _stored_media(db, root_b, "legacy-extra.jpg")
+    draft_id = _approved_sqlite_draft(
+        db,
+        slot=SLOT,
+        key="legacy-multi-reservation-cleanup",
+        media_record=media_a,
+    )
+    assert db.reserve_media(media_b["id"], draft_id)
+    resolved_a = Path(media_a["filepath"]).parent.resolve()
+    resolved_b = Path(media_b["filepath"]).parent.resolve()
+    assert str(resolved_b) < str(resolved_a)
+
+    validation_started = threading.Event()
+    allow_validation = threading.Event()
+    real_validate = db.validate_post_draft_publication_media
+
+    def pause_validation(claim, expected_media):
+        validation_started.set()
+        if not allow_validation.wait(timeout=3):
+            raise AssertionError("validation was never released")
+        return real_validate(claim, expected_media)
+
+    monkeypatch.setattr(
+        db,
+        "validate_post_draft_publication_media",
+        pause_validation,
+    )
+
+    test_locks = {
+        resolved_a: threading.RLock(),
+        resolved_b: threading.RLock(),
+    }
+    release_holds_b = threading.Event()
+    lock_timeouts = []
+
+    @contextmanager
+    def bounded_media_store_lock(directory):
+        root = Path(directory).resolve()
+        name = threading.current_thread().name
+        lock = test_locks.setdefault(root, threading.RLock())
+        acquired = lock.acquire(timeout=0.5)
+        if not acquired:
+            lock_timeouts.append((name, root))
+            raise RuntimeError("bounded_media_store_lock_timeout")
+        try:
+            with real_media_store_lock(directory) as lease:
+                if name == "release-draft" and root == resolved_b:
+                    release_holds_b.set()
+                yield lease
+        finally:
+            lock.release()
+
+    monkeypatch.setattr(
+        database_module,
+        "media_store_lock",
+        bounded_media_store_lock,
+    )
+    monkeypatch.setattr(
+        media_store_module,
+        "media_store_lock",
+        bounded_media_store_lock,
+    )
+
+    x_client = RecordingXClient(tweet_id="must-not-write")
+    publisher_results = []
+    publisher_errors = []
+    release_errors = []
+
+    def publish():
+        try:
+            publisher_results.append(
+                Publisher(db, x_client, dry_run=False).publish(draft_id, SLOT)
+            )
+        except BaseException as error:
+            publisher_errors.append(error)
+
+    def release_draft():
+        try:
+            db.release_media_for_draft(draft_id)
+        except BaseException as error:
+            release_errors.append(error)
+
+    publisher_thread = threading.Thread(target=publish, name="publisher-A")
+    release_thread = threading.Thread(target=release_draft, name="release-draft")
+    try:
+        publisher_thread.start()
+        assert validation_started.wait(timeout=2)
+        release_thread.start()
+        assert release_holds_b.wait(timeout=1)
+    finally:
+        allow_validation.set()
+        publisher_thread.join(timeout=3)
+        if release_thread.ident is not None:
+            release_thread.join(timeout=3)
+
+    assert lock_timeouts == []
+    assert not publisher_thread.is_alive()
+    assert not release_thread.is_alive()
+    assert publisher_errors == []
+    assert release_errors == []
+    assert [result.status for result in publisher_results] == [
+        "publication_failed"
+    ]
+    assert x_client.posts == []
+    assert db.get_post_draft(draft_id)["status"] == "publication_failed"
 
 
 def test_verified_reserved_media_is_uploaded_and_preserved_on_success(tmp_path):

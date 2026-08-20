@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import inspect
 import logging
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from modules.media_store import open_verified_media
@@ -21,6 +22,13 @@ logger = logging.getLogger(__name__)
 class PublishResult:
     status: str
     tweet_id: str = ""
+
+
+@dataclass(frozen=True)
+class _XTransportOutcome:
+    kind: str
+    tweet_id: str = ""
+    error: Optional[Exception] = None
 
 
 class Publisher:
@@ -122,8 +130,9 @@ class Publisher:
                 claim, ValueError("invalid_media_reservation")
             )
 
-        x_attempted = False
-        write_result = None
+        transport_outcome = None
+        local_failure = None
+        media_exit_error = None
         try:
             with open_verified_media(media) as media_file:
                 try:
@@ -133,30 +142,38 @@ class Publisher:
                         )
                     )
                 except Exception as error:
-                    return self._definite_local_failure(claim, error)
-                if not reservation_valid:
-                    return self._definite_local_failure(
-                        claim,
-                        ValueError("media_reservation_changed_under_lease"),
+                    local_failure = error
+                else:
+                    if not reservation_valid:
+                        local_failure = ValueError(
+                            "media_reservation_changed_under_lease"
+                        )
+                if local_failure is None:
+                    transport_outcome = self._transport_to_x(
+                        draft,
+                        media_file,
+                        media.get("media_type") or "image",
+                        media.get("filename"),
                     )
-                x_attempted = True
-                write_result = self._write_to_x(
-                    draft,
-                    claim,
-                    media_file,
-                    media.get("media_type") or "image",
-                    media.get("filename"),
-                    media,
-                )
-                return write_result
         except (OSError, PermissionError, RuntimeError, ValueError) as error:
-            if write_result is not None:
-                if write_result.status == "published":
-                    return self._unknown_outcome(claim, error)
-                return write_result
-            if x_attempted:
-                return self._unknown_outcome(claim, error)
-            return self._definite_local_failure(claim, error)
+            media_exit_error = error
+
+        if transport_outcome is None:
+            return self._definite_local_failure(
+                claim,
+                media_exit_error
+                or local_failure
+                or RuntimeError("media_transport_unavailable"),
+            )
+
+        write_result = self._persist_transport_outcome(
+            claim,
+            transport_outcome,
+            media,
+        )
+        if media_exit_error is not None and write_result.status == "published":
+            return self._unknown_outcome(claim, media_exit_error)
+        return write_result
 
     def _write_to_x(
         self,
@@ -167,32 +184,71 @@ class Publisher:
         media_filename,
         expected_media,
     ):
+        outcome = self._transport_to_x(
+            draft,
+            media_file,
+            media_type,
+            media_filename,
+        )
+        return self._persist_transport_outcome(
+            claim,
+            outcome,
+            expected_media,
+        )
+
+    def _transport_to_x(
+        self,
+        draft,
+        media_file,
+        media_type,
+        media_filename,
+    ):
         if self._publication_is_paused():
-            return self._restore_after_pause(claim)
+            return _XTransportOutcome("paused")
 
         try:
             response = self._call_post_tweet(
                 draft["text"], media_file, media_type, media_filename
             )
         except XPublicationPaused:
-            return self._restore_after_pause(claim)
+            return _XTransportOutcome("paused")
         except XPublicationRejected as error:
-            return self._definite_x_failure(claim, error)
+            return _XTransportOutcome("rejected", error=error)
         except (XPublicationUnknown, TimeoutError, ConnectionError) as error:
-            return self._unknown_outcome(claim, error)
+            return _XTransportOutcome("unknown", error=error)
         except Exception as error:
             # An arbitrary client error may have happened after the write.  It
             # is therefore unsafe to reinterpret it as a definite rejection.
-            return self._unknown_outcome(claim, error)
+            return _XTransportOutcome("unknown", error=error)
 
         tweet_id = self._tweet_id(response)
         if not tweet_id:
+            return _XTransportOutcome(
+                "unknown",
+                error=ValueError("publication_response_missing_id"),
+            )
+        return _XTransportOutcome("confirmed", tweet_id=tweet_id)
+
+    def _persist_transport_outcome(
+        self,
+        claim,
+        outcome,
+        expected_media,
+    ):
+        if outcome.kind == "paused":
+            return self._restore_after_pause(claim)
+        if outcome.kind == "rejected":
+            return self._definite_x_failure(claim, outcome.error)
+        if outcome.kind == "unknown":
+            return self._unknown_outcome(claim, outcome.error)
+        if outcome.kind != "confirmed":
             return self._unknown_outcome(
-                claim, ValueError("publication_response_missing_id")
+                claim,
+                RuntimeError("invalid_x_transport_outcome"),
             )
         try:
             finalized = self._finalize_success(
-                claim, tweet_id, expected_media,
+                claim, outcome.tweet_id, expected_media,
             )
         except Exception as error:
             return self._unknown_outcome(claim, error)
@@ -200,7 +256,7 @@ class Publisher:
             return self._unknown_outcome(
                 claim, RuntimeError("publication_finalization_conflict")
             )
-        return PublishResult("published", tweet_id)
+        return PublishResult("published", outcome.tweet_id)
 
     def _call_post_tweet(
         self, text, media_file, media_type, media_filename
