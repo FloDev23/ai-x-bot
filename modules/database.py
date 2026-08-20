@@ -359,9 +359,9 @@ class Database:
                         f"ALTER TABLE media_library ADD COLUMN {column} {definition}"
                     )
 
-            # Crescita rete: account seguiti dal ciclo di growth, per capire
-            # chi ha ricambiato e decidere l'unfollow automatico se non lo
-            # fa entro GROWTH_UNFOLLOW_AFTER_DAYS
+            # Legacy data only: retained for non-destructive schema compatibility.
+            # Read-only discovery and manual candidate decisions use the tables
+            # below; no production method reads or writes growth_follows.
             c.execute("""
                 CREATE TABLE IF NOT EXISTS growth_follows (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2895,57 +2895,15 @@ class Database:
         with self._media_store_mutation_lock("media", media_id) as conn:
             conn.execute("DELETE FROM media_library WHERE id = ?", (media_id,))
 
-    # ---------- Crescita rete (follow/unfollow per costruire seguito reale) ----------
-
-    def add_growth_follow(self, username: str, user_id: str):
-        with self._conn() as conn:
-            conn.execute("""
-                INSERT INTO growth_follows (username, user_id) VALUES (?, ?)
-            """, (username, user_id))
-
-    def count_growth_follows_today(self) -> int:
-        with self._conn() as conn:
-            row = conn.execute("""
-                SELECT COUNT(*) as c FROM growth_follows WHERE date(followed_at) = date('now')
-            """).fetchone()
-            return row['c'] if row else 0
-
-    def already_growth_followed(self, user_id: str) -> bool:
-        with self._conn() as conn:
-            row = conn.execute("""
-                SELECT 1 FROM growth_follows WHERE user_id = ? LIMIT 1
-            """, (user_id,)).fetchone()
-            return row is not None
-
-    def get_growth_follows_pending_check(self, days_old: int = 21) -> List[Dict]:
-        """
-        Account seguiti da almeno `days_old` giorni, non ancora segnati come
-        'ha ricambiato' e non ancora rimossi: candidati per il controllo di
-        unfollow automatico.
-        """
-        with self._conn() as conn:
-            rows = conn.execute("""
-                SELECT * FROM growth_follows
-                WHERE unfollowed = 0 AND followed_back = 0
-                AND julianday('now') - julianday(followed_at) >= ?
-            """, (days_old,)).fetchall()
-            return [dict(r) for r in rows]
-
-    def mark_growth_followed_back(self, follow_id: int):
-        with self._conn() as conn:
-            conn.execute("""
-                UPDATE growth_follows SET followed_back = 1, checked_at = ? WHERE id = ?
-            """, (datetime.now().isoformat(), follow_id))
-
-    def mark_growth_unfollowed(self, follow_id: int):
-        with self._conn() as conn:
-            conn.execute("""
-                UPDATE growth_follows SET unfollowed = 1, unfollowed_at = ? WHERE id = ?
-            """, (datetime.now().isoformat(), follow_id))
-
     # ---------- Growth candidates and follower snapshots ----------
 
     def upsert_growth_candidate(self, candidate: Dict) -> int:
+        user_id = candidate.get("user_id")
+        if type(user_id) is not str or not user_id:
+            raise ValueError("Growth candidate user_id must be a non-empty string")
+        username = candidate.get("username")
+        if type(username) is not str or not username:
+            raise ValueError("Growth candidate username must be a non-empty string")
         now = self._now_iso()
         profile_expires_at = candidate.get("profile_expires_at") or (
             datetime.now(timezone.utc) + timedelta(days=7)
@@ -2972,8 +2930,8 @@ class Database:
                     last_evaluated_at = excluded.last_evaluated_at,
                     profile_expires_at = excluded.profile_expires_at
             """, (
-                str(candidate["user_id"]),
-                candidate["username"],
+                user_id,
+                username,
                 json.dumps(profile),
                 json.dumps(latest_post) if latest_post is not None else None,
                 int(candidate["score"]),
@@ -2991,19 +2949,83 @@ class Database:
             ))
             row = conn.execute(
                 "SELECT id FROM growth_candidates WHERE user_id = ?",
-                (str(candidate["user_id"]),),
+                (user_id,),
             ).fetchone()
             return row["id"]
 
     def _decode_growth_candidate(self, row: sqlite3.Row) -> Dict:
-        return self._decode_json_fields(row, {
+        result = self._decode_json_fields(row, {
             "profile_json": "profile",
             "latest_post_json": "latest_post",
             "score_json": "score_data",
         })
+        score_data = result.get("score_data") or {}
+        latest_post = result.get("latest_post") or {}
+        result["audience_segment"] = score_data.get("audience_segment")
+        result["reasons"] = score_data.get("reasons") or []
+        result["activity_at"] = (
+            score_data.get("activity_at") or latest_post.get("created_at")
+        )
+        username = result.get("username")
+        tweet_id = latest_post.get("id", latest_post.get("tweet_id"))
+        direct_url = None
+        if (
+            type(username) is str
+            and re.fullmatch(r"[A-Za-z0-9_]{1,15}", username)
+        ):
+            direct_url = f"https://x.com/{username}"
+            if (
+                type(tweet_id) is str
+                and tweet_id.isascii()
+                and tweet_id.isdigit()
+            ):
+                direct_url += f"/status/{tweet_id}"
+        result["direct_url"] = direct_url
+        return result
 
-    def get_digest_candidates(self, limit: int = 5) -> List[Dict]:
-        now = datetime.now(timezone.utc)
+    def get_growth_candidate(self, user_id: str) -> Optional[Dict]:
+        if type(user_id) is not str or not user_id:
+            return None
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM growth_candidates WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return self._decode_growth_candidate(row) if row else None
+
+    def get_cached_growth_candidate(
+        self,
+        user_id: str,
+        now: datetime,
+    ) -> Optional[Dict]:
+        candidate = self.get_growth_candidate(user_id)
+        if not candidate:
+            return None
+        try:
+            expires_at = self._parse_datetime(candidate["profile_expires_at"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return candidate if expires_at > self._as_utc(now) else None
+
+    def is_growth_candidate_suppressed(self, user_id: str, now: datetime) -> bool:
+        candidate = self.get_growth_candidate(user_id)
+        if not candidate or not candidate.get("suppressed_until"):
+            return False
+        try:
+            return self._parse_datetime(candidate["suppressed_until"]) > self._as_utc(now)
+        except (TypeError, ValueError):
+            return True
+
+    def get_digest_candidates(
+        self,
+        limit: int = 5,
+        *,
+        now: Optional[datetime] = None,
+        threshold: int = 75,
+    ) -> List[Dict]:
+        if type(limit) is not int or limit <= 0:
+            return []
+        current_time = self._as_utc(now or datetime.now(timezone.utc))
         with self._conn() as conn:
             conn.execute("""
                 UPDATE growth_candidates
@@ -3014,28 +3036,43 @@ class Database:
                       suppressed_until IS NULL
                       OR julianday(suppressed_until) <= julianday(?)
                   )
-            """, (now.isoformat(),))
+            """, (current_time.isoformat(),))
             rows = conn.execute("""
                 SELECT * FROM growth_candidates
-                WHERE decision = 'new' AND score >= 75
-                ORDER BY score DESC, first_seen_at ASC
-            """).fetchall()
+                WHERE decision = 'new' AND score >= ?
+            """, (threshold,)).fetchall()
         eligible = []
         for row in rows:
             try:
-                if self._parse_datetime(row["profile_expires_at"]) <= now:
+                if self._parse_datetime(row["profile_expires_at"]) <= current_time:
                     continue
                 if (
                     row["suppressed_until"]
-                    and self._parse_datetime(row["suppressed_until"]) > now
+                    and self._parse_datetime(row["suppressed_until"]) > current_time
                 ):
                     continue
             except (TypeError, ValueError):
                 continue
-            eligible.append(self._decode_growth_candidate(row))
-            if len(eligible) == limit:
-                break
-        return eligible
+            decoded = self._decode_growth_candidate(row)
+            if decoded["score_data"].get("hard_filter_passed") is False:
+                continue
+            eligible.append(decoded)
+
+        def activity_timestamp(candidate):
+            value = candidate.get("activity_at")
+            try:
+                return self._parse_datetime(value).timestamp()
+            except (TypeError, ValueError):
+                return float("-inf")
+
+        eligible.sort(
+            key=lambda candidate: (
+                candidate["score"],
+                activity_timestamp(candidate),
+            ),
+            reverse=True,
+        )
+        return eligible[:limit]
 
     def mark_candidate_decision(
         self,
@@ -3073,18 +3110,23 @@ class Database:
         source: Optional[str],
     ) -> bool:
         user_id = profile.get("user_id", profile.get("id"))
-        if user_id is None:
-            raise ValueError("Follower profile requires user_id or id")
+        if type(user_id) is not str or not user_id:
+            raise ValueError("Follower profile requires an exact string user_id or id")
         username = profile.get("username", "")
         with self._conn() as conn:
             cursor = conn.execute("""
-                INSERT OR IGNORE INTO follower_snapshots (
+                INSERT INTO follower_snapshots (
                     observed_on, user_id, username, relevant, source,
                     profile_json, first_seen_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(observed_on, user_id) DO UPDATE SET
+                    username = excluded.username,
+                    relevant = excluded.relevant,
+                    source = excluded.source,
+                    profile_json = excluded.profile_json
             """, (
                 observed_on,
-                str(user_id),
+                user_id,
                 username,
                 int(relevant),
                 source,
@@ -3110,11 +3152,13 @@ class Database:
         return {row["user_id"] for row in rows}
 
     def mark_candidate_followed_back(self, user_id: str, observed_at: str) -> bool:
+        if type(user_id) is not str or not user_id:
+            return False
         with self._conn() as conn:
             cursor = conn.execute("""
                 UPDATE growth_candidates SET followed_back_at = ?
                 WHERE user_id = ? AND followed_back_at IS NULL
-            """, (observed_at, str(user_id)))
+            """, (observed_at, user_id))
             return cursor.rowcount == 1
 
     # ---------- Telegram updates, state and safe errors ----------

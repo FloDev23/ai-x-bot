@@ -255,29 +255,153 @@ class TwitterClient:
             self._cached_self_id = self.get_authenticated_user_id()
         return self._cached_self_id
 
-    def get_follower_ids(self, max_results: int = 1000) -> set:
-        """
-        Recupera gli ID di chi segue il bot, per verificare se un account
-        che il bot ha seguito ha ricambiato (usato dal ciclo di unfollow
-        automatico). Una singola chiamata paginata, non per ogni utente
-        singolarmente: molto più economica.
-        """
-        follower_ids = set()
+    @staticmethod
+    def _iso_datetime(value) -> Optional[str]:
+        if value is None:
+            return None
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return value if type(value) is str else None
+
+    @classmethod
+    def _profile_dict(cls, user) -> Optional[Dict]:
+        user_id = getattr(user, "id", None)
+        username = getattr(user, "username", None)
+        if isinstance(user_id, bool) or user_id is None:
+            return None
+        normalized_id = str(user_id)
+        if type(username) is not str or not username:
+            return None
+        metrics = getattr(user, "public_metrics", None) or {}
+        return {
+            "id": normalized_id,
+            "user_id": normalized_id,
+            "username": username,
+            "description": getattr(user, "description", "") or "",
+            "protected": getattr(user, "protected", False),
+            "location": getattr(user, "location", None),
+            "created_at": cls._iso_datetime(getattr(user, "created_at", None)),
+            "followers_count": metrics.get("followers_count", 0),
+            "following_count": metrics.get("following_count", 0),
+            "tweet_count": metrics.get("tweet_count", 0),
+            "listed_count": metrics.get("listed_count", 0),
+            "spam_signals": [],
+        }
+
+    @staticmethod
+    def _growth_user_fields() -> List[str]:
+        return [
+            "username",
+            "description",
+            "protected",
+            "location",
+            "created_at",
+            "public_metrics",
+        ]
+
+    def get_followers_profiles(self) -> List[Dict]:
+        """Read public profiles of accounts currently following this account."""
         try:
             self_id = self.get_authenticated_user_id_cached()
             if not self_id:
-                return follower_ids
-            paginator = tweepy.Paginator(
-                self.client.get_users_followers, self_id, max_results=1000,
+                return []
+            response = self.client.get_users_followers(
+                id=self_id,
+                max_results=1000,
+                user_fields=self._growth_user_fields(),
             )
-            for page in paginator:
-                if page.data:
-                    follower_ids.update(str(u.id) for u in page.data)
-                if len(follower_ids) >= max_results:
-                    break
-        except Exception as e:
-            logger.error(f"❌ Errore nel recupero follower: {e}")
-        return follower_ids
+        except Exception as error:
+            logger.warning(
+                "x_growth_followers_read_failed error_type=%s",
+                type(error).__name__,
+            )
+            return []
+        return [
+            profile
+            for user in (getattr(response, "data", None) or [])
+            if (profile := self._profile_dict(user)) is not None
+        ]
+
+    def _search_recent_profiles(self, query: str, limit: int) -> List[Dict]:
+        try:
+            response = self.client.search_recent_tweets(
+                query=query,
+                max_results=max(10, min(limit, 100)),
+                tweet_fields=["author_id", "created_at", "lang"],
+                expansions=["author_id"],
+                user_fields=self._growth_user_fields(),
+            )
+        except Exception as error:
+            logger.warning(
+                "x_growth_search_read_failed error_type=%s",
+                type(error).__name__,
+            )
+            return []
+        includes = getattr(response, "includes", None) or {}
+        users = includes.get("users", []) if isinstance(includes, dict) else []
+        result = []
+        seen = set()
+        for user in users:
+            profile = self._profile_dict(user)
+            if profile is None or profile["id"] in seen:
+                continue
+            seen.add(profile["id"])
+            result.append(profile)
+        return result
+
+    def search_recent_authors(self, query: str, limit: int = 25) -> List[Dict]:
+        """Read public profiles for authors returned by one recent search."""
+        if type(query) is not str or not query.strip():
+            return []
+        return self._search_recent_profiles(query.strip(), limit)
+
+    def get_network_candidates(
+        self,
+        seed_accounts,
+        limit: int = 25,
+    ) -> List[Dict]:
+        """Discover authors around configured seeds with one read-only search."""
+        seeds = [
+            seed.strip().lstrip("@")
+            for seed in seed_accounts
+            if type(seed) is str and seed.strip().lstrip("@")
+        ]
+        if not seeds:
+            return []
+        mentions = " OR ".join(f"@{seed}" for seed in seeds)
+        return self._search_recent_profiles(f"({mentions}) -is:retweet", limit)
+
+    def get_latest_original_post(self, user_id: str) -> Optional[Dict]:
+        """Read the latest original post, excluding replies and reposts."""
+        if type(user_id) is not str or not user_id:
+            return None
+        try:
+            response = self.client.get_users_tweets(
+                id=user_id,
+                max_results=5,
+                exclude=["retweets", "replies"],
+                tweet_fields=["created_at", "lang", "public_metrics"],
+            )
+        except Exception as error:
+            logger.warning(
+                "x_growth_latest_post_read_failed error_type=%s",
+                type(error).__name__,
+            )
+            return None
+        tweets = getattr(response, "data", None) or []
+        if not tweets:
+            return None
+        latest = tweets[0]
+        latest_id = getattr(latest, "id", None)
+        if isinstance(latest_id, bool) or latest_id is None:
+            return None
+        return {
+            "id": str(latest_id),
+            "text": getattr(latest, "text", "") or "",
+            "created_at": self._iso_datetime(getattr(latest, "created_at", None)),
+            "lang": getattr(latest, "lang", None),
+            "is_original": True,
+        }
 
     def get_user_info(self, username: str) -> Optional[Dict]:
         """

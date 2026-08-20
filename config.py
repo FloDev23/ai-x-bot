@@ -66,6 +66,30 @@ SEMANTIC_DUPLICATE_THRESHOLD = float(os.getenv("SEMANTIC_DUPLICATE_THRESHOLD", "
 MAX_LINKS_PER_WEEK = int(os.getenv("MAX_LINKS_PER_WEEK", "1"))
 ENABLE_LEAD_DISCOVERY = os.getenv("ENABLE_LEAD_DISCOVERY", "false").lower() == "true"
 
+
+def _positive_int_env(name, default, maximum=None):
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return min(value, maximum) if maximum is not None else value
+
+
+# ========== Read-only X growth discovery ==========
+GROWTH_SCORE_THRESHOLD = _positive_int_env("GROWTH_SCORE_THRESHOLD", 75)
+GROWTH_QUERY_BUDGET = _positive_int_env("GROWTH_QUERY_BUDGET", 3, maximum=3)
+GROWTH_NEW_PROFILE_BUDGET = _positive_int_env("GROWTH_NEW_PROFILE_BUDGET", 25)
+GROWTH_PROFILE_CACHE_DAYS = _positive_int_env("GROWTH_PROFILE_CACHE_DAYS", 7)
+GROWTH_DIGEST_LIMIT = _positive_int_env("GROWTH_DIGEST_LIMIT", 5)
+GROWTH_SEED_ACCOUNTS = tuple(
+    value.strip().lstrip("@")
+    for value in os.getenv("GROWTH_SEED_ACCOUNTS", "").split(",")
+    if value.strip().lstrip("@")
+)
+
 # ========== NewsAPI ==========
 NEWSAPI_KEY = os.getenv('NEWSAPI_KEY', '')
 NEWSAPI_BASE_URL = 'https://newsapi.org/v2'
