@@ -288,6 +288,8 @@ class TwitterClient:
         ):
             return None
         description = getattr(user, "description", None)
+        if description is None:
+            description = ""
         protected = getattr(user, "protected", None)
         location = getattr(user, "location", None)
         created_at = cls._iso_datetime(getattr(user, "created_at", None))
@@ -497,6 +499,8 @@ class TwitterClient:
         text = getattr(latest, "text", None)
         created_at = self._iso_datetime(getattr(latest, "created_at", None))
         lang = getattr(latest, "lang", None)
+        if lang is None:
+            lang = ""
         if (
             type(text) is not str
             or type(created_at) is not str
