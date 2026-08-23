@@ -54,14 +54,28 @@ MEDIA_MATCH_THRESHOLD = int(os.getenv('MEDIA_MATCH_THRESHOLD', '80'))
 MEDIA_MATCH_REASON_MAX_CHARS = 500
 
 # ========== Approval-only publishing rollout ==========
+def _strict_boolean_env(name, default):
+    """Parse a canonical lower-case boolean without weakening safety."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default, True
+    if raw_value == "true":
+        return True, True
+    if raw_value == "false":
+        return False, True
+    return default, False
+
+
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Rome")
 CONTENT_SLOTS = [value.strip() for value in os.getenv(
     "CONTENT_SLOTS", "14:00,20:00"
 ).split(",") if value.strip()]
 DRAFT_LEAD_MINUTES = int(os.getenv("DRAFT_LEAD_MINUTES", "120"))
 PUBLISH_GRACE_SECONDS = int(os.getenv("PUBLISH_GRACE_SECONDS", "300"))
-APPROVAL_REQUIRED = os.getenv("APPROVAL_REQUIRED", "true").lower() == "true"
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+APPROVAL_REQUIRED, _APPROVAL_REQUIRED_VALID = _strict_boolean_env(
+    "APPROVAL_REQUIRED", True,
+)
+DRY_RUN, _DRY_RUN_VALID = _strict_boolean_env("DRY_RUN", True)
 DRAFT_SCORE_THRESHOLD = int(os.getenv("DRAFT_SCORE_THRESHOLD", "75"))
 SEMANTIC_DUPLICATE_THRESHOLD = float(os.getenv("SEMANTIC_DUPLICATE_THRESHOLD", "0.72"))
 MAX_LINKS_PER_WEEK = int(os.getenv("MAX_LINKS_PER_WEEK", "1"))
@@ -165,6 +179,12 @@ def _valid_telegram_chat_id(value):
 
 def validate_config():
     """Validate the approval-only production boundary at startup."""
+    current_approval_required, current_approval_required_valid = (
+        _strict_boolean_env("APPROVAL_REQUIRED", True)
+    )
+    current_dry_run, current_dry_run_valid = _strict_boolean_env(
+        "DRY_RUN", True,
+    )
     required_keys = [
         'TWITTER_API_KEY',
         'TWITTER_API_SECRET',
@@ -198,7 +218,19 @@ def validate_config():
             + ", ".join(invalid_telegram_keys)
         )
 
-    if APPROVAL_REQUIRED is not True:
+    if (
+        not _DRY_RUN_VALID
+        or not current_dry_run_valid
+        or current_dry_run is not DRY_RUN
+    ):
+        raise ValueError("DRY_RUN must be exactly true or false")
+
+    if (
+        not _APPROVAL_REQUIRED_VALID
+        or not current_approval_required_valid
+        or current_approval_required is not APPROVAL_REQUIRED
+        or APPROVAL_REQUIRED is not True
+    ):
         raise ValueError("APPROVAL_REQUIRED must be true for this release")
 
     print("✅ Configurazione validata con successo!")

@@ -599,10 +599,36 @@ def test_non_list_poll_response_uses_malformed_batch_backoff(fake_db):
     assert api.calls == [(None, 25)] * 6
 
 
-def test_run_forever_isolates_claim_failure_and_processes_next_update(fake_telegram):
+def test_run_forever_retries_first_unclaimed_update_before_later_batch_entries(
+    fake_telegram,
+):
+    class FailOnceClaimDatabase(ClaimFailingDatabase):
+        def __init__(self):
+            super().__init__(failed_update_id=70)
+            self.failed_once = False
+
+        def claim_telegram_update(self, update_id, chat_id):
+            self.claim_calls.append(update_id)
+            if update_id == self.failed_update_id and not self.failed_once:
+                self.failed_once = True
+                raise RuntimeError("temporary claim failure")
+            if update_id in self.telegram_updates:
+                return False
+            self.telegram_updates[update_id] = {
+                "chat_id": str(chat_id),
+                "state": "processing",
+                "result": {},
+            }
+            return True
+
     stop_event = RecordingStopEvent()
-    db = ClaimFailingDatabase(failed_update_id=70)
+    db = FailOnceClaimDatabase()
     api = ScriptedPollingApi([
+        [
+            {"update_id": 71, "message": {"chat": {"id": 42}}},
+            {"update_id": 69, "message": {"chat": {"id": 42}}},
+            {"update_id": 70, "message": {"chat": {"id": 42}}},
+        ],
         [
             {"update_id": 70, "message": {"chat": {"id": 42}}},
             {"update_id": 71, "message": {"chat": {"id": 42}}},
@@ -617,9 +643,31 @@ def test_run_forever_isolates_claim_failure_and_processes_next_update(fake_teleg
         dispatcher=lambda _update: "ok",
     )
     local_controller.run_forever(stop_event)
-    assert db.claim_calls == [70, 71]
+    assert db.claim_calls == [69, 70, 70, 71]
+    assert db.telegram_updates[69]["state"] == "processed"
+    assert db.telegram_updates[70]["state"] == "processed"
     assert db.telegram_updates[71]["state"] == "processed"
-    assert api.calls == [(None, 25), (72, 25)]
+    assert api.calls == [(None, 25), (70, 25), (72, 25)]
+    assert stop_event.waits == [1]
+
+
+def test_run_forever_claims_and_persists_malformed_update_before_advancing(
+    fake_db,
+):
+    stop_event = RecordingStopEvent()
+    api = ScriptedPollingApi([
+        [
+            {"update_id": 79, "inline_query": {}},
+            {"update_id": 80, "message": {"chat": {"id": 42}}},
+        ],
+        [],
+    ], stop_event=stop_event)
+
+    _polling_controller(api, fake_db).run_forever(stop_event)
+
+    assert fake_db.telegram_updates[79]["state"] == "malformed"
+    assert fake_db.telegram_updates[80]["state"] == "processed"
+    assert api.calls == [(None, 25), (81, 25)]
 
 
 def test_run_forever_rechecks_stop_before_each_batch_entry(fake_db):

@@ -12,6 +12,7 @@ from modules.twitter_client import (
     XPublicationPaused,
     XPublicationRejected,
     XPublicationUnknown,
+    is_valid_x_tweet_id,
 )
 
 
@@ -101,7 +102,7 @@ class Publisher:
 
     def _publication_is_paused(self):
         try:
-            return self.db.get_state("paused", "false") == "true"
+            return self.db.get_state("paused") != "false"
         except Exception:
             return True
 
@@ -246,6 +247,11 @@ class Publisher:
                 claim,
                 RuntimeError("invalid_x_transport_outcome"),
             )
+        if not is_valid_x_tweet_id(outcome.tweet_id):
+            return self._unknown_outcome(
+                claim,
+                ValueError("invalid_x_publication_id"),
+            )
         try:
             finalized = self._finalize_success(
                 claim, outcome.tweet_id, expected_media,
@@ -286,9 +292,11 @@ class Publisher:
         if not isinstance(data, dict):
             return ""
         tweet_id = data.get("id")
-        return str(tweet_id) if tweet_id else ""
+        return tweet_id if is_valid_x_tweet_id(tweet_id) else ""
 
     def _finalize_success(self, claim, tweet_id, expected_media):
+        if not is_valid_x_tweet_id(tweet_id):
+            raise ValueError("invalid_x_publication_id")
         return self.db.finalize_post_draft_publication(
             claim, tweet_id, expected_media,
         )

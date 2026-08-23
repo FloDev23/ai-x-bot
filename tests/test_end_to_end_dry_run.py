@@ -49,8 +49,10 @@ class FalseyProxy:
 def dependency_bundle(tmp_path, **overrides):
     media_root = tmp_path / "media"
     media_root.mkdir(mode=0o700, parents=True)
+    db = Database(str(tmp_path / "agent.db"))
+    db.set_state("paused", "false")
     dependencies = {
-        "db": Database(str(tmp_path / "agent.db")),
+        "db": db,
         "telegram_api": FakeTelegramApi(media_root),
         "x_client": FakeXClient(),
         "generator": FakeGroundedGenerator(),

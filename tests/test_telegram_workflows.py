@@ -957,6 +957,23 @@ def test_pause_resume_status_and_help_are_persistent_and_concise(tmp_path):
     assert all(len(message[1]) <= 4096 for message in telegram.messages)
 
 
+def test_status_reports_missing_or_noncanonical_pause_state_as_active(tmp_path):
+    db = Database(str(tmp_path / "fail-closed-status.db"))
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram)
+
+    assert controller.process_update(message_update(24, "/status")) == "processed"
+    assert "pausa: attiva" in telegram.messages[-1][1].lower()
+
+    db.set_state("paused", "FALSE")
+    assert controller.process_update(message_update(25, "/status")) == "processed"
+    assert "pausa: attiva" in telegram.messages[-1][1].lower()
+
+    db.set_state("paused", "false")
+    assert controller.process_update(message_update(26, "/status")) == "processed"
+    assert "pausa: disattiva" in telegram.messages[-1][1].lower()
+
+
 def test_posts_renders_complete_safe_draft_card_and_latest_published(tmp_path):
     db = Database(str(tmp_path / "posts.db"))
     source_id, draft_id = add_pending_draft(

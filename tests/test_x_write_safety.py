@@ -1,9 +1,30 @@
 import importlib
 import inspect
 
+import pytest
+
 import config
 import dotenv
 from modules.twitter_client import TwitterClient
+
+
+def _set_valid_runtime_environment(monkeypatch):
+    for name in (
+        "TWITTER_API_KEY",
+        "TWITTER_API_SECRET",
+        "TWITTER_ACCESS_TOKEN",
+        "TWITTER_ACCESS_TOKEN_SECRET",
+        "TWITTER_BEARER_TOKEN",
+        "GROQ_API_KEY",
+    ):
+        monkeypatch.setenv(name, "configured")
+    monkeypatch.setenv(
+        "TELEGRAM_BOT_TOKEN",
+        "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
+    )
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001234567890")
+    monkeypatch.setenv("APPROVAL_REQUIRED", "true")
+    monkeypatch.setenv("NEWS_TRUSTED_DOMAINS", "")
 
 
 def test_twitter_client_exposes_only_approved_post_write():
@@ -37,6 +58,81 @@ def test_rollout_defaults_are_safe(monkeypatch):
     assert reloaded.BOT_TIMEZONE == "Europe/Rome"
     assert reloaded.CONTENT_SLOTS == ["14:00", "20:00"]
     assert reloaded.MAX_LINKS_PER_WEEK == 1
+
+
+@pytest.mark.parametrize("raw_value", ["", "typo", "yes", "0", " true ", "TRUE"])
+def test_invalid_dry_run_value_falls_back_safe_and_validation_rejects(
+    monkeypatch,
+    raw_value,
+):
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda: False)
+    _set_valid_runtime_environment(monkeypatch)
+    monkeypatch.setenv("DRY_RUN", raw_value)
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.DRY_RUN is True
+    with pytest.raises(ValueError, match="DRY_RUN"):
+        reloaded.validate_config()
+
+    monkeypatch.setenv("DRY_RUN", "true")
+    importlib.reload(config)
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [("true", True), ("false", False)],
+)
+def test_dry_run_accepts_only_canonical_boolean_values(
+    monkeypatch,
+    raw_value,
+    expected,
+):
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda: False)
+    _set_valid_runtime_environment(monkeypatch)
+    monkeypatch.setenv("DRY_RUN", raw_value)
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.DRY_RUN is expected
+    reloaded.validate_config()
+
+    monkeypatch.setenv("DRY_RUN", "true")
+    importlib.reload(config)
+
+
+def test_invalid_approval_required_value_stays_enabled_but_is_rejected(
+    monkeypatch,
+):
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda: False)
+    _set_valid_runtime_environment(monkeypatch)
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.setenv("APPROVAL_REQUIRED", "TRUE")
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.APPROVAL_REQUIRED is True
+    with pytest.raises(ValueError, match="APPROVAL_REQUIRED"):
+        reloaded.validate_config()
+
+    monkeypatch.setenv("APPROVAL_REQUIRED", "true")
+    importlib.reload(config)
+
+
+def test_validation_rechecks_boolean_environment_after_import(monkeypatch):
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda: False)
+    _set_valid_runtime_environment(monkeypatch)
+    monkeypatch.setenv("DRY_RUN", "false")
+    reloaded = importlib.reload(config)
+    assert reloaded.DRY_RUN is False
+
+    monkeypatch.setenv("DRY_RUN", "typo-after-import")
+
+    with pytest.raises(ValueError, match="DRY_RUN"):
+        reloaded.validate_config()
+
+    monkeypatch.setenv("DRY_RUN", "true")
+    importlib.reload(config)
 
 
 def test_character_contains_no_invented_bug_example():

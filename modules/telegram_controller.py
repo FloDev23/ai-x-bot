@@ -266,7 +266,10 @@ class TelegramController:
         return self._handle_callback(chat_id, data)
 
     def _status(self, chat_id: str):
-        paused = self.db.get_state("paused", "false") == "true"
+        try:
+            paused = self.db.get_state("paused") != "false"
+        except Exception:
+            paused = True
         lines = [
             "Stato",
             f"dry-run: {'attivo' if self.dry_run else 'disattivo'}",
@@ -1325,38 +1328,44 @@ class TelegramController:
             return "failed"
 
     def process_update(self, update: Dict[str, Any], stop_event=None) -> str:
+        result, _acknowledged = self._process_update(update, stop_event)
+        return result
+
+    def _process_update(self, update: Dict[str, Any], stop_event=None):
+        """Return the public result and whether this update is durably claimed."""
         if self._stopped(stop_event) or not isinstance(update, dict):
-            return "stopped" if self._stopped(stop_event) else "malformed"
+            result = "stopped" if self._stopped(stop_event) else "malformed"
+            return result, False
 
         update_id = update.get("update_id")
         if not self._valid_update_id(update_id):
-            return "malformed"
+            return "malformed", False
 
         subtype, payload = self._supported_subtype(update)
         chat_id = self._chat_id(subtype, payload) if subtype is not None else None
         if self._stopped(stop_event):
-            return "stopped"
+            return "stopped", False
         try:
             claimed = self.db.claim_telegram_update(update_id, str(chat_id))
         except Exception:
-            return "failed"
+            return "failed", False
         if claimed is False:
-            return "duplicate"
+            return "duplicate", True
         if claimed is not True:
-            return "failed"
+            return "failed", False
         if self._stopped(stop_event):
-            return self._complete_local_state(update_id, "stopped")
+            return self._complete_local_state(update_id, "stopped"), True
         if subtype is None:
-            return self._complete_local_state(update_id, "malformed")
+            return self._complete_local_state(update_id, "malformed"), True
         if str(chat_id) != self.authorized_chat_id:
-            return self._complete_local_state(update_id, "unauthorized")
+            return self._complete_local_state(update_id, "unauthorized"), True
         if subtype == "callback_query" and (
             not isinstance(payload.get("id"), str)
             or _SAFE_CALLBACK_ID.fullmatch(payload["id"]) is None
         ):
-            return self._complete_local_state(update_id, "malformed")
+            return self._complete_local_state(update_id, "malformed"), True
         if self._stopped(stop_event):
-            return self._complete_local_state(update_id, "stopped")
+            return self._complete_local_state(update_id, "stopped"), True
 
         callback_id = payload["id"] if subtype == "callback_query" else None
         try:
@@ -1370,13 +1379,13 @@ class TelegramController:
                     )
                 except Exception:
                     pass
-            return self._complete_failed_update(update_id, exc)
+            return self._complete_failed_update(update_id, exc), True
 
         if callback_id is not None:
             try:
                 self.telegram_api.answer_callback(callback_id)
             except Exception as exc:
-                return self._complete_failed_update(update_id, exc)
+                return self._complete_failed_update(update_id, exc), True
 
         try:
             self.db.complete_telegram_update(
@@ -1384,10 +1393,10 @@ class TelegramController:
                 "processed",
                 {"result": result},
             )
-            return "processed"
+            return "processed", True
         except Exception as exc:
             self._notify_failure("telegram_update_state", exc)
-            return "failed"
+            return "failed", True
 
     def run_forever(self, stop_event) -> None:
         """Long-poll until stopped, preserving batch offsets and bounded waits."""
@@ -1424,24 +1433,36 @@ class TelegramController:
                     return
                 continue
 
-            update_ids = []
-            for update in updates:
+            ordered_updates = sorted(
+                (
+                    update for update in updates
+                    if isinstance(update, dict)
+                    and self._valid_update_id(update.get("update_id"))
+                ),
+                key=lambda update: update["update_id"],
+            )
+            last_acknowledged_id = None
+            retryable_failure = False
+            for update in ordered_updates:
                 if stop_event.is_set():
                     return
-                if not isinstance(update, dict):
-                    continue
                 update_id = update.get("update_id")
-                if not self._valid_update_id(update_id):
-                    continue
                 try:
-                    result = self.process_update(update, stop_event=stop_event)
+                    result, acknowledged = self._process_update(
+                        update, stop_event=stop_event,
+                    )
                 except Exception:
-                    result = "failed"
+                    result, acknowledged = "failed", False
                 if result == "stopped":
                     return
-                update_ids.append(update_id)
-            if update_ids:
-                offset = max(update_ids) + 1
+                if not acknowledged:
+                    retryable_failure = True
+                    break
+                last_acknowledged_id = update_id
+            if last_acknowledged_id is not None:
+                next_offset = last_acknowledged_id + 1
+                offset = next_offset if offset is None else max(offset, next_offset)
+            if ordered_updates and not retryable_failure:
                 failure_index = 0
             else:
                 delay = _TRANSPORT_BACKOFF_SECONDS[

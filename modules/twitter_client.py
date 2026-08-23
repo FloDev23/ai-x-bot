@@ -17,6 +17,19 @@ from typing import BinaryIO, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+_X_TWEET_ID_FORMAT = re.compile(r"[1-9][0-9]{0,19}")
+_X_TWEET_ID_MAX = (1 << 64) - 1
+
+
+def is_valid_x_tweet_id(value: object) -> bool:
+    """Accept only the canonical decimal string returned by X."""
+    return (
+        type(value) is str
+        and _X_TWEET_ID_FORMAT.fullmatch(value) is not None
+        and int(value) <= _X_TWEET_ID_MAX
+    )
+
+
 @dataclass(frozen=True)
 class FollowerProfilesRead:
     """One paginated follower traversal and whether it reached the end."""
@@ -204,7 +217,7 @@ class TwitterClient:
 
         data = getattr(response, "data", response)
         tweet_id = data.get("id") if isinstance(data, dict) else None
-        if not tweet_id:
+        if not is_valid_x_tweet_id(tweet_id):
             raise XPublicationUnknown("x_publication_response_missing_id")
         logger.info("x_tweet_published tweet_id=%s", tweet_id)
         return response

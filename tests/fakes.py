@@ -82,7 +82,7 @@ class FakeXClient:
 
     def post_tweet(self, text, **kwargs):
         self.posts.append((text, kwargs))
-        return SimpleNamespace(data={"id": "fake-tweet"})
+        return SimpleNamespace(data={"id": "9001"})
 
     def get_followers_profiles(self):
         return list(self.followers)

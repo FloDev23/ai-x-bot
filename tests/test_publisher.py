@@ -12,7 +12,7 @@ from requests import exceptions as requests_exceptions
 from modules.database import Database, PostDraftPublicationClaim
 from modules.media_processor import MediaProcessor
 from modules.publisher import Publisher
-from modules.twitter_client import TwitterClient
+from modules.twitter_client import TwitterClient, XPublicationUnknown
 
 
 SLOT = datetime.fromisoformat("2030-01-10T14:00:00+01:00")
@@ -22,6 +22,7 @@ class FakePublisherDatabase:
     def __init__(self):
         self.slot = SLOT
         self.paused = False
+        self.pause_state = "false"
         self.draft = {
             "id": 7,
             "publication_key": "draft:publisher",
@@ -121,7 +122,7 @@ class FakePublisherDatabase:
 
     def get_state(self, key, default=None):
         assert key == "paused"
-        return "true" if self.paused else default
+        return "true" if self.paused else self.pause_state
 
 
 class FakeXClient:
@@ -133,7 +134,7 @@ class FakeXClient:
         if self.raise_timeout:
             raise TimeoutError("X response timed out")
         self.posts.append(text)
-        return SimpleNamespace(data={"id": "tweet-123"})
+        return SimpleNamespace(data={"id": "1001"})
 
 
 @pytest.fixture
@@ -171,14 +172,33 @@ def test_pause_is_checked_immediately_before_write(publisher, fake_x, fake_db):
     assert fake_x.posts == []
 
 
+@pytest.mark.parametrize(
+    "stored_state",
+    [None, "", "TRUE", "False", " false ", "garbage", False, 0],
+)
+def test_only_exact_false_pause_state_opens_publication_gate(
+    publisher,
+    fake_x,
+    fake_db,
+    stored_state,
+):
+    fake_db.pause_state = stored_state
+
+    result = publisher.publish(fake_db.draft["id"], fake_db.slot)
+
+    assert result.status == "paused"
+    assert fake_db.draft["status"] == "approved"
+    assert fake_x.posts == []
+
+
 def test_second_publish_is_idempotent(publisher, fake_x, fake_db):
     first = publisher.publish(fake_db.draft["id"], fake_db.slot)
     second = publisher.publish(fake_db.draft["id"], fake_db.slot)
 
     assert first.status == "published"
-    assert first.tweet_id == "tweet-123"
+    assert first.tweet_id == "1001"
     assert second.status == "already_published"
-    assert second.tweet_id == "tweet-123"
+    assert second.tweet_id == "1001"
     assert fake_db.draft["status"] == "published"
     assert len(fake_x.posts) == 1
 
@@ -224,6 +244,7 @@ def test_approved_draft_expires_after_the_five_minute_grace(fake_db, fake_x):
 
 
 def _approved_sqlite_draft(db, *, slot, key, media_record=None):
+    db.set_state("paused", "false")
     source_id = db.add_content_source("evergreen_idea", "Verified source.")
     draft_id = db.create_post_draft(
         text="A useful, approved post.",
@@ -246,7 +267,7 @@ def _approved_sqlite_draft(db, *, slot, key, media_record=None):
 
 
 class RecordingXClient:
-    def __init__(self, *, tweet_id="tweet-sqlite"):
+    def __init__(self, *, tweet_id="1002"):
         self.tweet_id = tweet_id
         self.posts = []
         self.media_bytes = None
@@ -385,7 +406,7 @@ def test_two_sqlite_workers_make_at_most_one_x_call(tmp_path):
     assert clients.posts == ["A useful, approved post."]
     stored = setup.get_post_draft(draft_id)
     assert stored["status"] == "published"
-    assert stored["published_tweet_id"] == "tweet-sqlite"
+    assert stored["published_tweet_id"] == "1002"
 
 
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"publisher-jpeg"
@@ -539,7 +560,7 @@ def test_publisher_and_prospective_reservation_avoid_two_root_deadlock(
 
     class BlockingXClient(RecordingXClient):
         def __init__(self):
-            super().__init__(tweet_id="tweet-lock-order")
+            super().__init__(tweet_id="1003")
             self.write_started = threading.Event()
             self.allow_return = threading.Event()
 
@@ -803,27 +824,27 @@ def test_verified_reserved_media_is_uploaded_and_preserved_on_success(tmp_path):
     draft_id = _approved_sqlite_draft(
         db, slot=SLOT, key="publisher-media-success", media_record=media
     )
-    x_client = RecordingXClient(tweet_id="tweet-with-media")
+    x_client = RecordingXClient(tweet_id="1004")
 
     result = Publisher(db, x_client, dry_run=False).publish(draft_id, SLOT)
 
     assert result.status == "published"
-    assert result.tweet_id == "tweet-with-media"
+    assert result.tweet_id == "1004"
     assert x_client.media_bytes == JPEG_BYTES
     assert (tmp_path / "gym.jpg").read_bytes() == JPEG_BYTES
     stored_media = db.get_media_by_id(media["id"])
     assert stored_media["lifecycle_state"] == "used"
-    assert stored_media["used_in_tweet_id"] == "tweet-with-media"
+    assert stored_media["used_in_tweet_id"] == "1004"
     assert stored_media["file_deleted"] == 0
     stored_draft = db.get_post_draft(draft_id)
     assert stored_draft["status"] == "published"
-    assert stored_draft["published_tweet_id"] == "tweet-with-media"
+    assert stored_draft["published_tweet_id"] == "1004"
     with db._conn() as conn:
         posted = conn.execute(
             "SELECT tweet_id, text, category FROM posted_tweets"
         ).fetchall()
     assert [tuple(row) for row in posted] == [
-        ("tweet-with-media", "A useful, approved post.", "gym_strategy")
+        ("1004", "A useful, approved post.", "gym_strategy")
     ]
 
 
@@ -997,7 +1018,7 @@ class RecordingCreateTweetApi:
         self.calls.append(params)
         if self.error:
             raise self.error
-        return SimpleNamespace(data={"id": "tweet-after-upload"})
+        return SimpleNamespace(data={"id": "1005"})
 
 
 def _twitter_client(api, create_client):
@@ -1005,6 +1026,104 @@ def _twitter_client(api, create_client):
     client._api = api
     client._client = create_client
     return client
+
+
+@pytest.mark.parametrize(
+    "tweet_id",
+    [
+        True,
+        123,
+        {"id": "123"},
+        "",
+        "0",
+        "tweet-123",
+        "１２３",
+        "123\n",
+        "18446744073709551616",
+    ],
+)
+def test_twitter_client_rejects_noncanonical_tweet_ids(tweet_id):
+    class MalformedCreateTweetApi:
+        def create_tweet(self, **_params):
+            return SimpleNamespace(data={"id": tweet_id})
+
+    x_client = _twitter_client(object(), MalformedCreateTweetApi())
+
+    with pytest.raises(XPublicationUnknown, match="response"):
+        x_client.post_tweet("Approved text")
+
+
+@pytest.mark.parametrize(
+    "tweet_id",
+    ["1", "1234567890123456789", "18446744073709551615"],
+)
+def test_twitter_client_accepts_canonical_ascii_tweet_ids(tweet_id):
+    class ValidCreateTweetApi:
+        def create_tweet(self, **_params):
+            return SimpleNamespace(data={"id": tweet_id})
+
+    response = _twitter_client(object(), ValidCreateTweetApi()).post_tweet(
+        "Approved text"
+    )
+
+    assert response.data["id"] == tweet_id
+
+
+def test_publisher_revalidates_tweet_id_immediately_before_finalization(
+    fake_db,
+    fake_x,
+):
+    class CompromisedExtractionPublisher(Publisher):
+        @staticmethod
+        def _tweet_id(_response):
+            return True
+
+    result = CompromisedExtractionPublisher(
+        fake_db, fake_x, dry_run=False,
+    ).publish(fake_db.draft["id"], SLOT)
+
+    assert result.status == "publication_unknown"
+    assert fake_db.draft["status"] == "publication_unknown"
+    assert fake_db.draft["published_tweet_id"] is None
+
+
+def test_publisher_finalization_method_rejects_malformed_id_before_database():
+    class TrapDatabase:
+        def finalize_post_draft_publication(self, *_args, **_kwargs):
+            pytest.fail("malformed tweet id reached database finalization")
+
+    publisher = Publisher(TrapDatabase(), object(), dry_run=False)
+
+    with pytest.raises(ValueError, match="invalid_x_publication_id"):
+        publisher._finalize_success(object(), True, None)
+
+
+def test_malformed_tweet_id_keeps_media_and_audit_unpublished_without_retry(
+    tmp_path,
+):
+    db = Database(str(tmp_path / "malformed-tweet-id.db"))
+    media = _stored_media(db, tmp_path)
+    draft_id = _approved_sqlite_draft(
+        db,
+        slot=SLOT,
+        key="publisher-malformed-tweet-id",
+        media_record=media,
+    )
+    x_client = RecordingXClient(tweet_id={"unexpected": "shape"})
+    publisher = Publisher(db, x_client, dry_run=False)
+
+    first = publisher.publish(draft_id, SLOT)
+    second = publisher.publish(draft_id, SLOT)
+
+    assert first.status == "publication_unknown"
+    assert second.status == "not_publishable"
+    assert len(x_client.posts) == 1
+    assert db.get_post_draft(draft_id)["status"] == "publication_unknown"
+    stored_media = db.get_media_by_id(media["id"])
+    assert stored_media["lifecycle_state"] == "reserved"
+    assert stored_media["used_in_tweet_id"] is None
+    with db._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM posted_tweets").fetchone()[0] == 0
 
 
 def test_pause_after_media_upload_prevents_the_actual_tweet_write(tmp_path):
@@ -1133,7 +1252,7 @@ def test_database_failure_after_x_success_becomes_unknown_without_retry(tmp_path
     draft_id = _approved_sqlite_draft(
         db, slot=SLOT, key="publisher-db-after-x"
     )
-    x_client = RecordingXClient(tweet_id="tweet-db-failure")
+    x_client = RecordingXClient(tweet_id="1006")
     publisher = Publisher(db, x_client, dry_run=False)
 
     first = publisher.publish(draft_id, SLOT)
@@ -1162,7 +1281,7 @@ def test_real_sqlite_finalization_failure_rolls_back_and_never_retries(
                 SELECT RAISE(ABORT, 'simulated finalization failure');
             END
         """)
-    x_client = RecordingXClient(tweet_id="tweet-real-db-failure")
+    x_client = RecordingXClient(tweet_id="1007")
     publisher = Publisher(db, x_client, dry_run=False)
 
     first = publisher.publish(draft_id, SLOT)
@@ -1198,7 +1317,7 @@ def test_media_context_failure_after_x_success_is_not_called_a_rejection(
         raise OSError("media context exit failed after X")
 
     monkeypatch.setattr(publisher_module, "open_verified_media", fail_on_exit)
-    x_client = RecordingXClient(tweet_id="tweet-before-exit-failure")
+    x_client = RecordingXClient(tweet_id="1008")
     publisher = Publisher(db, x_client, dry_run=False)
 
     first = publisher.publish(draft_id, SLOT)
