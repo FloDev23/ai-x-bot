@@ -1,4 +1,5 @@
 """Fail-closed validation for factual claims in generated posts."""
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List
@@ -21,6 +22,24 @@ REQUIRED_SOURCE_TYPES = {
     "named_current_event": {"verified_news"},
 }
 SUPPORTED_CLAIM_TYPES = frozenset(REQUIRED_SOURCE_TYPES)
+SUPPORTED_SOURCE_TYPES = frozenset().union(*REQUIRED_SOURCE_TYPES.values())
+
+_NUMBER_RE = re.compile(
+    r"(?<![\w])"
+    r"(?P<sign>[+\-\u2212])?"
+    r"(?P<value>\d+(?:[.,]\d+)?)"
+    r"(?:[\s\u00a0\u202f]*(?P<scale>[KMB]|(?i:thousand|million|billion))\b)?"
+    r"[\s\u00a0\u202f]*(?P<percent>%|(?i:percent)\b)?",
+)
+_RANGE_SEPARATOR_RE = re.compile(r"[\s\u00a0\u202f]*[-\u2013\u2014][\s\u00a0\u202f]*")
+_NUMBER_SCALES = {
+    "k": "k",
+    "thousand": "k",
+    "m": "m",
+    "million": "m",
+    "b": "b",
+    "billion": "b",
+}
 
 INCIDENT_SUBTYPES = frozenset({
     "payment",
@@ -102,6 +121,70 @@ def _source_is_valid(source, allowed_types):
     return True
 
 
+def _canonical_number(sign, value, scale, percent):
+    if "," in value and "." not in value:
+        left, right = value.split(",", 1)
+        value = left + right if len(right) == 3 else left + "." + right
+    else:
+        value = value.replace(",", "")
+    if "." in value:
+        value = value.rstrip("0").rstrip(".")
+    suffix = _NUMBER_SCALES.get((scale or "").lower(), "")
+    prefix = "-" if sign in {"-", "\u2212"} else ""
+    return prefix + value + suffix + ("%" if percent else "")
+
+
+def _numeric_tokens(value):
+    if not isinstance(value, str):
+        return set()
+    matches = list(_NUMBER_RE.finditer(value))
+    tokens = set()
+    for index, match in enumerate(matches):
+        scale = match.group("scale")
+        percent = match.group("percent")
+        if index + 1 < len(matches):
+            following = matches[index + 1]
+            between = value[match.end():following.start()]
+            if _RANGE_SEPARATOR_RE.fullmatch(between):
+                scale = scale or following.group("scale")
+                percent = percent or following.group("percent")
+        tokens.add(_canonical_number(
+            match.group("sign"),
+            match.group("value"),
+            scale,
+            percent,
+        ))
+    return tokens
+
+
+def _metadata_numeric_tokens(value):
+    if isinstance(value, bool) or value is None:
+        return set()
+    if isinstance(value, str):
+        return _numeric_tokens(value)
+    if isinstance(value, (int, float)):
+        return _numeric_tokens(str(value))
+    if isinstance(value, dict):
+        return set().union(*(
+            _metadata_numeric_tokens(item) for item in value.values()
+        )) if value else set()
+    if isinstance(value, (list, tuple)):
+        return set().union(*(
+            _metadata_numeric_tokens(item) for item in value
+        )) if value else set()
+    return set()
+
+
+def _supported_numeric_tokens(sources):
+    supported = set()
+    for source in sources:
+        if not _source_is_valid(source, SUPPORTED_SOURCE_TYPES):
+            continue
+        supported.update(_numeric_tokens(source.get("text")))
+        supported.update(_metadata_numeric_tokens(source.get("metadata")))
+    return supported
+
+
 class FactGuard:
     def __init__(self, analyzer):
         self.analyzer = analyzer
@@ -157,10 +240,21 @@ class FactGuard:
                 reasons.append("unsupported_claim:" + claim_type)
                 continue
 
+            if claim_type == "number":
+                claim_numbers = _numeric_tokens(claim_text)
+                if claim_numbers - _supported_numeric_tokens(valid):
+                    reasons.append("unsupported_number")
+                    continue
+
             if subtype is not None and not any(
                 source.get("metadata", {}).get("disclosure_approved") is True
                 for source in valid
             ):
                 reasons.append("disclosure_not_approved:" + subtype)
+
+        if not reasons:
+            claimed_numbers = _numeric_tokens(text)
+            if claimed_numbers - _supported_numeric_tokens(sources):
+                reasons.append("unsupported_number")
 
         return FactCheckResult(not reasons, reasons)

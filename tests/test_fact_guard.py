@@ -52,11 +52,169 @@ def test_publishable_founder_note_supports_first_person_claim():
 
 
 def test_supported_product_number_passes():
-    source = {"id": 7, "source_type": "product_fact", "trust_state": "verified"}
+    source = {
+        "id": 7,
+        "source_type": "product_fact",
+        "trust_state": "verified",
+        "text": "The verified fee is 15%.",
+    }
     analyzer = ClaimAnalyzer([
         {"type": "number", "text": "15% fee", "supported_by": [7]},
     ])
     assert FactGuard(analyzer).check("The verified fee is 15%.", [source]).approved is True
+
+
+def test_number_claim_is_rejected_when_value_is_absent_from_source_content():
+    source = {
+        "id": 8,
+        "source_type": "verified_news",
+        "trust_state": "verified",
+        "text": "81 million members and more than 100 million facility users.",
+    }
+    analyzer = ClaimAnalyzer([
+        {
+            "type": "number",
+            "text": "Reserve 10-15% of every class",
+            "supported_by": [8],
+        },
+    ])
+
+    result = FactGuard(analyzer).check(
+        "Reserve 10-15% of every class.",
+        [source],
+    )
+
+    assert result.approved is False
+    assert result.reasons == ["unsupported_number"]
+
+
+def test_supported_number_abbreviations_match_source_content():
+    source = {
+        "id": 8,
+        "source_type": "verified_news",
+        "trust_state": "verified",
+        "text": (
+            "81 million Americans were members, more than 100 million used "
+            "facilities, and membership rose 5.2%."
+        ),
+    }
+    analyzer = ClaimAnalyzer([
+        {
+            "type": "number",
+            "text": "81M members, 100M+ users, up 5.2%",
+            "supported_by": [8],
+        },
+    ])
+
+    result = FactGuard(analyzer).check(
+        "81M members, 100M+ users, up 5.2%.",
+        [source],
+    )
+
+    assert result.approved is True
+
+
+def test_negative_number_cannot_be_authorized_by_positive_source_value():
+    source = {
+        "id": 8,
+        "source_type": "verified_news",
+        "trust_state": "verified",
+        "text": "Membership rose 5.2%.",
+    }
+    analyzer = ClaimAnalyzer([
+        {
+            "type": "number",
+            "text": "Membership fell -5.2%",
+            "supported_by": [8],
+        },
+    ])
+
+    result = FactGuard(analyzer).check("Membership fell -5.2%.", [source])
+
+    assert result.approved is False
+    assert result.reasons == ["unsupported_number"]
+
+
+def test_number_claim_uses_only_its_explicit_supporting_sources():
+    news = {
+        "id": 8,
+        "source_type": "verified_news",
+        "trust_state": "verified",
+        "text": "81 million Americans were members.",
+    }
+    product_fact = {
+        "id": 7,
+        "source_type": "product_fact",
+        "trust_state": "verified",
+        "text": "The verified fee is 15%.",
+    }
+    analyzer = ClaimAnalyzer([
+        {
+            "type": "number",
+            "text": "The report found 15%",
+            "supported_by": [8],
+        },
+    ])
+
+    result = FactGuard(analyzer).check(
+        "The report found 15%.",
+        [news, product_fact],
+    )
+
+    assert result.approved is False
+    assert result.reasons == ["unsupported_number"]
+
+
+def test_percent_words_and_compact_ranges_have_equivalent_numeric_support():
+    source = {
+        "id": 8,
+        "source_type": "verified_news",
+        "trust_state": "verified",
+        "text": "The range was between 10% and 15%, up 5.2 percent.",
+    }
+    analyzer = ClaimAnalyzer([
+        {
+            "type": "number",
+            "text": "The range was 10-15%, up 5.2%",
+            "supported_by": [8],
+        },
+    ])
+
+    result = FactGuard(analyzer).check(
+        "The range was 10-15%, up 5.2%.",
+        [source],
+    )
+
+    assert result.approved is True
+
+
+def test_unit_words_cannot_authorize_abbreviated_large_numbers():
+    cases = (
+        ("The class lasts 20 minutes.", "20M members"),
+        ("The room is 20 meters long.", "20M members"),
+        ("Athletes completed a 20 m sprint.", "20M members"),
+        ("The bar weighs 20 kg.", "20K members"),
+        ("The studio stores 20 bikes.", "20B visits"),
+    )
+    for source_text, claim_text in cases:
+        source = {
+            "id": 8,
+            "source_type": "verified_news",
+            "trust_state": "verified",
+            "text": source_text,
+        }
+        analyzer = ClaimAnalyzer([
+            {
+                "type": "number",
+                "text": claim_text,
+                "supported_by": [8],
+            },
+        ])
+
+        result = FactGuard(analyzer).check(claim_text + ".", [source])
+
+        assert result.approved is False
+        assert result.reasons == ["unsupported_number"]
 
 
 def test_analyzer_failure_blocks_publication():

@@ -357,6 +357,18 @@ def test_fact_failure_skips_slot_and_records_reason_codes(pipeline_parts):
     }
 
 
+def test_unsupported_number_reason_is_preserved_for_audit(pipeline_parts):
+    pipeline, database, _, _, guard, _ = pipeline_parts
+    guard.approved = False
+    guard.reasons = ["unsupported_number"]
+
+    assert pipeline.create_for_slot(database.next_slot) is None
+
+    assert database.evaluations[-1]["details"]["reason_codes"] == [
+        "unsupported_number"
+    ]
+
+
 @pytest.mark.parametrize(
     ("raw_reason", "safe_reason"),
     [

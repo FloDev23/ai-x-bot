@@ -66,8 +66,11 @@ def test_long_grounded_generation_uses_complete_rewrite(fake_ai):
 def test_long_grounded_generation_keeps_category_instruction_during_rewrite(fake_ai):
     prompts = []
 
-    def complete(_system_prompt, user_prompt, **_kwargs):
-        prompts.append(" ".join(user_prompt.split()))
+    def complete(system_prompt, user_prompt, **_kwargs):
+        prompts.append({
+            "system": " ".join(system_prompt.split()).lower(),
+            "user": " ".join(user_prompt.split()),
+        })
         if len(prompts) == 1:
             return "Long sentence. " * 30
         return "Useful standalone advice for operators."
@@ -83,7 +86,13 @@ def test_long_grounded_generation_keeps_category_instruction_during_rewrite(fake
     assert result["text"] == "Useful standalone advice for operators."
     assert len(prompts) == 2
     assert all(
-        "Do not mention FlexDropin or describe its features" in prompt
+        "Do not mention FlexDropin or describe its features" in prompt["user"]
+        for prompt in prompts
+    )
+    assert all(
+        "source_bundle is the only factual universe" in prompt["system"]
+        and "extra revenue stream" not in prompt["system"]
+        and "without extra staff cost" not in prompt["system"]
         for prompt in prompts
     )
 
@@ -129,6 +138,27 @@ def test_grounded_generation_targets_the_editorial_score_axes(fake_ai):
         "worth following",
     ):
         assert requirement in normalized_prompt
+
+
+def test_grounded_generation_excludes_unsourced_character_knowledge(fake_ai):
+    captured = {}
+
+    def complete(system_prompt, _user_prompt, **_kwargs):
+        captured["system"] = " ".join(system_prompt.split()).lower()
+        return "A source-bounded post."
+
+    fake_ai._complete = complete
+
+    fake_ai.generate_grounded_tweet(
+        "gym_strategy",
+        [{"id": 8, "source_type": "verified_news", "text": "Verified data."}],
+        include_link=False,
+    )
+
+    assert "fitness business expert" in captured["system"]
+    assert "extra revenue stream" not in captured["system"]
+    assert "without extra staff cost" not in captured["system"]
+    assert "source_bundle is the only factual universe" in captured["system"]
 
 
 def test_product_proof_prompt_requires_direct_product_fact_support(fake_ai):

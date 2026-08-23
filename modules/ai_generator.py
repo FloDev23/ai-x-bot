@@ -53,8 +53,11 @@ FOUNDER_PERSONA = character_module.build_persona(_CHARACTER)
 
 
 def _agent_prompt(agent_name: str) -> str:
-    """Persona + stile specifico di un agente, letto da character.json"""
-    return character_module.build_agent_persona(agent_name, _CHARACTER)
+    """Source-bounded persona for grounded editorial generation."""
+    return character_module.build_source_bounded_agent_persona(
+        agent_name,
+        _CHARACTER,
+    )
 
 
 def _category_agents(category: str) -> List[str]:
@@ -218,7 +221,13 @@ SOURCE_BUNDLE:
 {self._source_bundle(sources)}
 
 Reply only with the complete rewritten post."""
-        rewritten = self._complete(FOUNDER_PERSONA, prompt, max_tokens=400, temperature=0.4)
+        agent_name = _category_agents(category)[0]
+        rewritten = self._complete(
+            _agent_prompt(agent_name),
+            prompt,
+            max_tokens=400,
+            temperature=0.4,
+        )
         if not isinstance(rewritten, str):
             return None
         rewritten = rewritten.strip()

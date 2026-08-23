@@ -111,6 +111,38 @@ def build_agent_persona(agent_name: str, character: Optional[Dict] = None) -> st
     return (base + "\n" + extra).strip()
 
 
+def build_source_bounded_agent_persona(
+    agent_name: str,
+    character: Optional[Dict] = None,
+) -> str:
+    """Build a writing persona without injecting lore or global knowledge."""
+    c = character or load_character()
+    name = c.get("name", "the founder")
+    adjectives = ", ".join(c.get("adjectives", []))
+    agent = c.get("agents", {}).get(agent_name, {})
+    focus = agent.get("focus", "source-grounded editor")
+
+    parts = [
+        f"You are {name}, writing as a {focus}.",
+        (
+            "SOURCE_BUNDLE is the only factual universe. Do not use brand lore, "
+            "background knowledge, general assumptions, or agent expertise as "
+            "evidence for a claim."
+        ),
+    ]
+    if adjectives:
+        parts.append(f"Tone: {adjectives}.")
+    parts.append(_bullet_block(
+        "Style rules (always apply)",
+        c.get("style", {}).get("all", []),
+    ))
+    parts.append(_bullet_block(
+        "Style rules for posts",
+        c.get("style", {}).get("post", []),
+    ))
+    return "\n".join(part for part in parts if part).strip()
+
+
 def get_agent_names(character: Optional[Dict] = None) -> List[str]:
     c = character or load_character()
     return list(c.get("agents", {}).keys())

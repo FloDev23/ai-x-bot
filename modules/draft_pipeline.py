@@ -19,6 +19,7 @@ _SAFE_SIMPLE_FACT_REASONS = frozenset(
         "malformed_sources",
         "malformed_claim",
         "invalid_incident_subtype",
+        "unsupported_number",
     }
 )
 _DISCARD_REASON_CODES = frozenset(
