@@ -107,7 +107,7 @@ Completare e annotare tutta la checklist:
 - [ ] upload di una foto senza creazione automatica di una bozza;
 - [ ] upload di un video senza creazione automatica di una bozza;
 - [ ] ricezione della preview della bozza e del media abbinato;
-- [ ] prova di tutti i pulsanti bozza: approva, modifica, rigenera, rimanda e rifiuta;
+- [ ] prova di tutti i pulsanti bozza: `Approva`, `Rigenera`, `Modifica`, `Scegli media`, `Solo testo`, `Posticipa` e `Scarta`;
 - [ ] `/pause` impedisce la pubblicazione e `/resume` la riabilita;
 - [ ] reinvio dello stesso callback senza doppia mutazione;
 - [ ] digest growth con link/username e sole azioni manuali;

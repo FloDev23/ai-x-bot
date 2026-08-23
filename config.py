@@ -1,4 +1,5 @@
 import os
+import re
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -139,6 +140,29 @@ HUMAN_MODE_PROBABILITY = float(os.getenv('HUMAN_MODE_PROBABILITY', '0.15'))
 # ========== Debug Mode ==========
 DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 
+_TELEGRAM_BOT_TOKEN_FORMAT = re.compile(
+    r'^[1-9][0-9]{0,19}:[A-Za-z0-9_-]{16,128}$'
+)
+_TELEGRAM_CHAT_ID_FORMAT = re.compile(r'^-?[1-9][0-9]{0,19}$')
+
+
+def _valid_telegram_bot_token(value):
+    return (
+        isinstance(value, str)
+        and _TELEGRAM_BOT_TOKEN_FORMAT.fullmatch(value) is not None
+    )
+
+
+def _valid_telegram_chat_id(value):
+    if (
+        not isinstance(value, str)
+        or _TELEGRAM_CHAT_ID_FORMAT.fullmatch(value) is None
+    ):
+        return False
+    parsed = int(value)
+    return -(1 << 63) <= parsed <= (1 << 63) - 1
+
+
 def validate_config():
     """Validate the approval-only production boundary at startup."""
     required_keys = [
@@ -154,10 +178,25 @@ def validate_config():
     if NEWS_TRUSTED_DOMAINS:
         required_keys.append('NEWSAPI_KEY')
 
-    missing_keys = [key for key in required_keys if not os.getenv(key)]
+    missing_keys = [
+        key
+        for key in required_keys
+        if not isinstance(os.getenv(key), str) or not os.getenv(key).strip()
+    ]
 
     if missing_keys:
         raise ValueError(f"❌ Variabili d'ambiente mancanti: {', '.join(missing_keys)}")
+
+    invalid_telegram_keys = []
+    if not _valid_telegram_bot_token(os.getenv('TELEGRAM_BOT_TOKEN')):
+        invalid_telegram_keys.append('TELEGRAM_BOT_TOKEN')
+    if not _valid_telegram_chat_id(os.getenv('TELEGRAM_CHAT_ID')):
+        invalid_telegram_keys.append('TELEGRAM_CHAT_ID')
+    if invalid_telegram_keys:
+        raise ValueError(
+            "❌ Formato Telegram non valido: "
+            + ", ".join(invalid_telegram_keys)
+        )
 
     if APPROVAL_REQUIRED is not True:
         raise ValueError("APPROVAL_REQUIRED must be true for this release")

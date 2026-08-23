@@ -130,6 +130,10 @@ class FlexDropinGrowthAgent:
         else:
             raise TypeError("dependencies must be a mapping or None")
 
+        def resolve(name, factory):
+            value = supplied.get(name)
+            return factory() if value is None else value
+
         if supplied.get("approval_required", True) is not True:
             raise ValueError("approval_required must be true")
 
@@ -159,105 +163,134 @@ class FlexDropinGrowthAgent:
             "news_trusted_domains", NEWS_TRUSTED_DOMAINS
         )
 
-        self.db = supplied.get("db") or Database()
-        self.telegram_api = supplied.get("telegram_api")
+        self.db = resolve("db", Database)
         telegram_token = supplied.get("telegram_bot_token", TELEGRAM_BOT_TOKEN)
-        if self.telegram_api is None:
-            self.telegram_api = TelegramApi(
+        self.telegram_api = resolve(
+            "telegram_api",
+            lambda: TelegramApi(
                 telegram_token,
                 media_library_dir=self.media_library_dir,
-            )
+            ),
+        )
         notifier_token = telegram_token or ("injected" if injected else "")
-        self.notifier = supplied.get("notifier") or TelegramNotifier(
-            notifier_token,
-            self.authorized_chat_id,
-            database=self.db,
-            telegram_api=self.telegram_api,
+        self.notifier = resolve(
+            "notifier",
+            lambda: TelegramNotifier(
+                notifier_token,
+                self.authorized_chat_id,
+                database=self.db,
+                telegram_api=self.telegram_api,
+            ),
         )
 
-        self.news_fetcher = supplied.get("news_fetcher") or NewsFetcher()
-        self.ai_generator = supplied.get("generator") or AIGenerator()
-        self.twitter_client = supplied.get("x_client") or TwitterClient()
-        self.scorer = supplied.get("scorer") or TweetScorer(
-            self.ai_generator.client,
-            self.ai_generator.model,
+        self.news_fetcher = resolve("news_fetcher", NewsFetcher)
+        self.ai_generator = resolve("generator", AIGenerator)
+        self.twitter_client = resolve("x_client", TwitterClient)
+        self.scorer = resolve(
+            "scorer",
+            lambda: TweetScorer(
+                self.ai_generator.client,
+                self.ai_generator.model,
+            ),
         )
 
-        self.content_planner = supplied.get("planner") or ContentPlanner(
-            self.db,
-            timezone_name=self.timezone_name,
+        self.content_planner = resolve(
+            "planner",
+            lambda: ContentPlanner(
+                self.db,
+                timezone_name=self.timezone_name,
+            ),
         )
-        self.source_ingestor = supplied.get("source_ingestor") or SourceIngestor(
-            self.db,
-            self.news_fetcher,
-            trusted_domains=trusted_domains,
+        self.source_ingestor = resolve(
+            "source_ingestor",
+            lambda: SourceIngestor(
+                self.db,
+                self.news_fetcher,
+                trusted_domains=trusted_domains,
+            ),
         )
-        self.fact_guard = supplied.get("fact_guard") or FactGuard(
-            self.ai_generator
+        self.fact_guard = resolve(
+            "fact_guard",
+            lambda: FactGuard(self.ai_generator),
         )
-        self.draft_pipeline = supplied.get("draft_pipeline") or DraftPipeline(
-            self.db,
-            self.content_planner,
-            self.ai_generator,
-            self.fact_guard,
-            self.scorer,
-            score_threshold=DRAFT_SCORE_THRESHOLD,
-            duplicate_threshold=SEMANTIC_DUPLICATE_THRESHOLD,
-            now_fn=self.clock,
+        self.draft_pipeline = resolve(
+            "draft_pipeline",
+            lambda: DraftPipeline(
+                self.db,
+                self.content_planner,
+                self.ai_generator,
+                self.fact_guard,
+                self.scorer,
+                score_threshold=DRAFT_SCORE_THRESHOLD,
+                duplicate_threshold=SEMANTIC_DUPLICATE_THRESHOLD,
+                now_fn=self.clock,
+            ),
         )
-        self.media_processor = supplied.get("media_processor") or MediaProcessor(
-            self.db,
-            self.ai_generator,
+        self.media_processor = resolve(
+            "media_processor",
+            lambda: MediaProcessor(self.db, self.ai_generator),
         )
-        self.media_matcher = supplied.get("media_matcher") or MediaMatcher(
-            self.db,
-            self.ai_generator,
-            threshold=MEDIA_MATCH_THRESHOLD,
+        self.media_matcher = resolve(
+            "media_matcher",
+            lambda: MediaMatcher(
+                self.db,
+                self.ai_generator,
+                threshold=MEDIA_MATCH_THRESHOLD,
+            ),
         )
-        self.publisher = supplied.get("publisher") or Publisher(
-            self.db,
-            self.twitter_client,
-            dry_run=self.dry_run,
-            clock=self.clock,
-            grace_seconds=PUBLISH_GRACE_SECONDS,
-            timezone_name=self.timezone_name,
+        self.publisher = resolve(
+            "publisher",
+            lambda: Publisher(
+                self.db,
+                self.twitter_client,
+                dry_run=self.dry_run,
+                clock=self.clock,
+                grace_seconds=PUBLISH_GRACE_SECONDS,
+                timezone_name=self.timezone_name,
+            ),
         )
-        self.analytics = supplied.get("analytics") or PerformanceAnalyzer(
-            self.twitter_client,
-            self.db,
+        self.analytics = resolve(
+            "analytics",
+            lambda: PerformanceAnalyzer(self.twitter_client, self.db),
         )
         self.analyzer = self.analytics
-        self.growth_discovery = supplied.get(
-            "growth_discovery"
-        ) or GrowthDiscovery(self.twitter_client, self.db)
-        self.lead_finder = supplied.get("lead_finder") or LeadFinder(
-            self.twitter_client,
-            self.ai_generator.client,
-            self.ai_generator.model,
-            self.db,
+        self.growth_discovery = resolve(
+            "growth_discovery",
+            lambda: GrowthDiscovery(self.twitter_client, self.db),
+        )
+        self.lead_finder = resolve(
+            "lead_finder",
+            lambda: LeadFinder(
+                self.twitter_client,
+                self.ai_generator.client,
+                self.ai_generator.model,
+                self.db,
+            ),
         )
 
-        self.scheduler = supplied.get("scheduler") or BackgroundScheduler(
-            timezone=self.timezone
+        self.scheduler = resolve(
+            "scheduler",
+            lambda: BackgroundScheduler(timezone=self.timezone),
         )
-        self.telegram_controller = supplied.get(
-            "telegram_controller"
-        ) or TelegramController(
-            self.telegram_api,
-            self.db,
-            self.notifier,
-            self.authorized_chat_id,
-            draft_pipeline=self.draft_pipeline,
-            media_processor=self.media_processor,
-            media_matcher=self.media_matcher,
-            analytics=self.analytics,
-            scheduler_status=self.scheduler_status,
-            dry_run=self.dry_run,
-            now_fn=self.clock,
-            poll_timeout=supplied.get(
-                "telegram_poll_timeout", TELEGRAM_POLL_TIMEOUT
+        self.telegram_controller = resolve(
+            "telegram_controller",
+            lambda: TelegramController(
+                self.telegram_api,
+                self.db,
+                self.notifier,
+                self.authorized_chat_id,
+                draft_pipeline=self.draft_pipeline,
+                media_processor=self.media_processor,
+                media_matcher=self.media_matcher,
+                analytics=self.analytics,
+                scheduler_status=self.scheduler_status,
+                dry_run=self.dry_run,
+                now_fn=self.clock,
+                poll_timeout=supplied.get(
+                    "telegram_poll_timeout", TELEGRAM_POLL_TIMEOUT
+                ),
+                news_trusted_domains=trusted_domains,
             ),
-            news_trusted_domains=trusted_domains,
         )
 
         self.stop_event = threading.Event()
@@ -330,12 +363,12 @@ class FlexDropinGrowthAgent:
 
     def publish_cycle(self, intended_slot_time, now=None):
         try:
-            intended_slot = self._slot(intended_slot_time, now)
+            effective_now = self._now() if now is None else now
+            intended_slot = self._slot(intended_slot_time, effective_now)
             draft = self.db.get_active_draft_for_slot(intended_slot.isoformat())
             if not draft:
                 return PublishResult("not_found")
-            publish_time = intended_slot if now is None else now
-            return self.publisher.publish(draft["id"], now=publish_time)
+            return self.publisher.publish(draft["id"], now=effective_now)
         except Exception as error:
             self._notify_error("cycle", error)
             return PublishResult("publication_failed")
@@ -506,7 +539,7 @@ class FlexDropinGrowthAgent:
             result.append({
                 "id": job.id,
                 "name": job.name,
-                "next_run_time": (
+                "next_run": (
                     next_run.isoformat()
                     if hasattr(next_run, "isoformat")
                     else None
