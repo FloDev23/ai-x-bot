@@ -23,6 +23,14 @@ SOURCE_TYPES = {
     "founder_journey": {"founder_note"},
 }
 
+SOURCE_TYPE_PRIORITY = {
+    "gym_strategy": ("verified_news", "evergreen_idea", "founder_note"),
+    "fitness_business_insight": ("verified_news",),
+    "shareable_fitness": ("verified_news", "evergreen_idea"),
+    "product_proof": ("product_fact",),
+    "founder_journey": ("founder_note",),
+}
+
 @dataclass(frozen=True)
 class ContentPlan:
     category: str
@@ -92,9 +100,17 @@ class ContentPlanner:
     ) -> Dict[str, List[Dict]]:
         sources = self.database.get_eligible_sources() if sources is None else sources
         return {
-            category: [
-                source for source in sources
-                if source.get("source_type") in allowed_types
-            ]
-            for category, allowed_types in SOURCE_TYPES.items()
+            category: self._primary_source_for_category(category, sources)
+            for category in SOURCE_TYPES
         }
+
+    @staticmethod
+    def _primary_source_for_category(
+        category: str,
+        sources: List[Dict],
+    ) -> List[Dict]:
+        for source_type in SOURCE_TYPE_PRIORITY[category]:
+            for source in sources:
+                if source.get("source_type") == source_type:
+                    return [source]
+        return []

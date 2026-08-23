@@ -66,6 +66,41 @@ def test_gym_strategy_does_not_mix_in_product_proof_sources(fake_db):
     assert plan.source_ids == [7]
 
 
+def test_gym_strategy_prefers_one_recent_verified_news_source(fake_db):
+    fake_db.content_counts = {}
+    fake_db.sources = [
+        {"id": 8, "source_type": "verified_news"},
+        {"id": 5, "source_type": "founder_note"},
+        {"id": 4, "source_type": "evergreen_idea"},
+    ]
+    planner = ContentPlanner(fake_db)
+
+    plan = planner.plan(datetime(2026, 8, 11, 14, 0, tzinfo=ROME))
+
+    assert plan.category == "gym_strategy"
+    assert plan.source_ids == [8]
+
+
+def test_product_proof_uses_only_the_most_recent_fact(fake_db):
+    fake_db.content_counts = {
+        "gym_strategy": 10,
+        "fitness_business_insight": 10,
+        "shareable_fitness": 10,
+        "product_proof": 0,
+        "founder_journey": 10,
+    }
+    fake_db.sources = [
+        {"id": 7, "source_type": "product_fact"},
+        {"id": 6, "source_type": "product_fact"},
+    ]
+    planner = ContentPlanner(fake_db)
+
+    plan = planner.plan(datetime(2026, 8, 11, 14, 0, tzinfo=ROME))
+
+    assert plan.category == "product_proof"
+    assert plan.source_ids == [7]
+
+
 def test_product_proof_gets_link_only_below_weekly_cap(fake_db):
     fake_db.sources = [{"id": 8, "source_type": "product_fact"}]
     planner = ContentPlanner(fake_db)
