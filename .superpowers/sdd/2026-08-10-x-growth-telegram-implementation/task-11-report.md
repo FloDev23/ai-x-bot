@@ -241,3 +241,52 @@ Final verification:
   mutation was added. An additional review agent was requested but could not
   start because the task-thread limit was already occupied; the implementation
   received a local diff/spec self-review instead.
+
+## Fix round 3
+
+- Reviewed base SHA: `97b212c895724a49ded0d4416a3792181af4c489`.
+- Commit: `fix: rebuild orphaned follower snapshots`.
+
+Pre-round-1 process crashes could leave Task 11 `follower_snapshots` rows with
+non-null `captured_at` but no `follower_snapshot_runs` marker. A retry formerly
+treated those rows as final observations, admitted followers no longer present,
+and produced a committed summary whose new-follower count differed from the
+weekly report.
+
+When no completed marker exists, the existing `BEGIN IMMEDIATE` transaction now
+treats only same-day rows with non-null `captured_at` as nonfinal Task 11 state.
+It preserves their original `first_seen_at`, removes them, rebuilds the complete
+current follower set, and writes the completed marker in the same transaction.
+Task 10 pre-observations (`captured_at IS NULL`) remain in place, including their
+original first-observation time. A crash during repair rolls back the deletion,
+rebuilt rows and marker together; concurrent retries serialize to one completed
+transition, and a replay returns the same committed summary.
+
+TDD evidence:
+
+- The three round-3 tests were overlaid on an isolated archive of the required
+  base and produced `3 failed, 50 deselected`. The failures showed summary/report
+  mismatches of `0` versus `2` for a normal retry, `0` versus `1` under concurrent
+  repair, and `1` versus `3` after a hard-crash retry.
+- The identical selection on the working implementation produced
+  `3 passed, 50 deselected`.
+- The tests use real SQLite files and spawned processes. They verify orphan
+  removal, Task 10 row/`first_seen_at` preservation, transaction rollback,
+  one concurrent completed transition and replay idempotence.
+
+Final verification:
+
+- Task 11: `53 passed in 1.49s`.
+- Task 10/11, Telegram and X-safety focused suite:
+  `372 passed, 1 warning in 6.12s`.
+- Full suite: `613 passed, 1 warning in 9.54s`.
+- The sole pytest warning remains Tweepy's pre-existing `imghdr` deprecation.
+- `py_compile`, `pip check` and `git diff --check` passed; pip reported no
+  broken requirements and only its non-fatal unwritable-cache warning.
+- The production/test file set is exactly `modules/database.py` and
+  `tests/test_growth_analytics.py`; this report was also updated and
+  `progress.md` was not modified.
+- No live X, Telegram, Groq or News request was made, and no scheduler or X
+  mutation was added. An independent review agent could not start because the
+  task-thread limit was occupied; the diff received a local spec/edge-case
+  self-review instead, with no Critical or Important finding.

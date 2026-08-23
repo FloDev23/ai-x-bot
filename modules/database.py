@@ -3573,17 +3573,18 @@ class Database:
                     "follow_backs_by_source": {},
                 }
             repaired_first_seen = {}
-            if prior_run is not None and prior_run["completed"] != 1:
+            if prior_run is None or prior_run["completed"] != 1:
                 repaired_first_seen = {
                     row["user_id"]: row["first_seen_at"]
                     for row in conn.execute("""
                         SELECT user_id, first_seen_at FROM follower_snapshots
-                        WHERE observed_on = ?
+                        WHERE observed_on = ? AND captured_at IS NOT NULL
                     """, (observed_on,)).fetchall()
                     if type(row["user_id"]) is str and row["user_id"]
                 }
                 conn.execute(
-                    "DELETE FROM follower_snapshots WHERE observed_on = ?",
+                    "DELETE FROM follower_snapshots "
+                    "WHERE observed_on = ? AND captured_at IS NOT NULL",
                     (observed_on,),
                 )
 

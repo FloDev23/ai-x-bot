@@ -343,6 +343,149 @@ def test_hard_crash_rolls_back_rows_conversion_and_run_then_retry_matches_report
     ]
 
 
+def test_retry_rebuilds_unmarked_legacy_rows_without_admitting_orphans(tmp_path):
+    db_path = str(tmp_path / "unmarked-legacy.db")
+    database = Database(db_path)
+    observed_on = NOW.date().isoformat()
+    current = follower_profile("701", "current_owner")
+    orphan = follower_profile("702", "orphan_owner")
+    task10 = follower_profile("703", "task10_owner")
+    task10_first_seen = (NOW - timedelta(hours=2)).isoformat()
+    for profile in (current, orphan):
+        result = database.capture_follower_observation(
+            observed_on, NOW, profile, relevant=False,
+        )
+        assert result["is_new"] is True
+    assert database.save_follower_snapshot(
+        observed_on, task10, relevant=False, source="task10",
+    )
+    with database._conn() as conn:
+        conn.execute(
+            "UPDATE follower_snapshots SET first_seen_at = ? "
+            "WHERE user_id = ?",
+            (task10_first_seen, task10["id"]),
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM follower_snapshot_runs"
+        ).fetchone()[0] == 0
+
+    analyzer = PerformanceAnalyzer(FollowerX([current]), database)
+    summary = analyzer.capture_follower_snapshot(NOW + timedelta(hours=1))
+    replay = analyzer.capture_follower_snapshot(NOW + timedelta(hours=1))
+    report = analyzer.build_weekly_report(date(2026, 8, 10))
+
+    assert summary == replay
+    assert summary["followers_total"] == 1
+    assert summary["new_total"] == report["new_followers"] == 1
+    assert report["followers_total"] == 1
+    with database._conn() as conn:
+        rows = conn.execute("""
+            SELECT user_id, first_seen_at, captured_at
+            FROM follower_snapshots
+            WHERE observed_on = ?
+            ORDER BY user_id
+        """, (observed_on,)).fetchall()
+    assert [row["user_id"] for row in rows] == ["701", "703"]
+    assert rows[0]["first_seen_at"] == NOW.isoformat()
+    assert rows[1]["first_seen_at"] == task10_first_seen
+    assert rows[1]["captured_at"] is None
+
+
+def test_concurrent_unmarked_legacy_repair_has_one_completed_transition(tmp_path):
+    db_path = str(tmp_path / "unmarked-concurrent.db")
+    database = Database(db_path)
+    profile = follower_profile("700", "concurrentown")
+    result = database.capture_follower_observation(
+        NOW.date().isoformat(), NOW, profile, relevant=False,
+    )
+    assert result["is_new"] is True
+    with database._conn() as conn:
+        conn.execute("CREATE TABLE repair_audit (id INTEGER PRIMARY KEY)")
+        conn.execute("""
+            CREATE TRIGGER count_unmarked_completed_repair
+            AFTER INSERT ON follower_snapshot_runs
+            WHEN NEW.completed = 1
+            BEGIN INSERT INTO repair_audit (id) VALUES (NULL); END
+        """)
+    ctx = multiprocessing.get_context("spawn")
+    start_event = ctx.Event()
+    result_queue = ctx.Queue()
+    processes = [
+        ctx.Process(target=_capture_worker, args=(db_path, start_event, result_queue))
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    for process in processes:
+        process.join(timeout=20)
+        assert process.exitcode == 0
+    results = [result_queue.get(timeout=5) for _process in processes]
+
+    assert results[0] == results[1]
+    assert results[0]["new_total"] == 1
+    with Database(db_path)._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM repair_audit").fetchone()[0] == 1
+        marker = conn.execute(
+            "SELECT completed, followers_total FROM follower_snapshot_runs"
+        ).fetchone()
+    assert dict(marker) == {"completed": 1, "followers_total": 1}
+
+
+def test_hard_crash_during_unmarked_repair_restores_orphans_until_retry(tmp_path):
+    db_path = str(tmp_path / "unmarked-crash.db")
+    database = Database(db_path)
+    for profile in (
+        follower_profile("501", "first_owner"),
+        follower_profile("599", "legacy_orphan"),
+    ):
+        result = database.capture_follower_observation(
+            NOW.date().isoformat(), NOW, profile, relevant=False,
+        )
+        assert result["is_new"] is True
+    with database._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER task11_crash_on_second_follower
+            BEFORE INSERT ON follower_snapshots
+            WHEN NEW.user_id = '502'
+            BEGIN SELECT task11_hard_crash(); END
+        """)
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(target=_hard_crash_capture_worker, args=(db_path,))
+    process.start()
+    process.join(timeout=20)
+
+    assert process.exitcode == 73
+    restarted = Database(db_path)
+    with restarted._conn() as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM follower_snapshots ORDER BY user_id"
+        ).fetchall()
+        markers = conn.execute(
+            "SELECT observed_on FROM follower_snapshot_runs"
+        ).fetchall()
+        conn.execute("DROP TRIGGER task11_crash_on_second_follower")
+    assert [row["user_id"] for row in rows] == ["501", "599"]
+    assert markers == []
+    assert PerformanceAnalyzer(
+        FollowerX([]), restarted,
+    ).build_weekly_report(date(2026, 8, 10))["new_followers"] == 0
+
+    retry_analyzer = PerformanceAnalyzer(FollowerX([
+        follower_profile("501", "first_owner"),
+        follower_profile("502", "second_owner"),
+    ]), restarted)
+    summary = retry_analyzer.capture_follower_snapshot(NOW)
+    report = retry_analyzer.build_weekly_report(date(2026, 8, 10))
+    with restarted._conn() as conn:
+        repaired_rows = conn.execute(
+            "SELECT user_id FROM follower_snapshots ORDER BY user_id"
+        ).fetchall()
+
+    assert summary["new_total"] == report["new_followers"] == 2
+    assert [row["user_id"] for row in repaired_rows] == ["501", "502"]
+
+
 def test_legacy_run_migration_is_nonfinal_until_atomic_repair_and_replay(tmp_path):
     db_path = str(tmp_path / "legacy-run.db")
     legacy = follower_profile("710", "legacy_owner")
