@@ -1,247 +1,152 @@
-# 🚀 Setup Completo AI X Bot
+# Setup approval-only
 
-## Step 1: Prerequisiti
+Questa release usa Telegram come control plane obbligatorio. Non abilita pubblicazione unattended: `DRY_RUN=false` permette soltanto a `Publisher` di inviare una bozza già approvata in Telegram e dovuta per lo slot esatto.
 
-- Python 3.8 o superiore
-- Account X (Twitter)
-- Account Groq (gratuito)
-- Account NewsAPI (gratuito)
+## 1. Prerequisiti
 
-## Step 2: Ottenere le API Keys
+- Python 3.11 o versione compatibile;
+- credenziali X API per letture e pubblicazione;
+- chiave Groq;
+- bot Telegram e ID della sola chat autorizzata;
+- NewsAPI solo se si abilita una allowlist `NEWS_TRUSTED_DOMAINS`;
+- `ffmpeg` per l'analisi dei video caricati.
 
-### 🐦 X (Twitter) API Keys
-
-1. Vai su https://developer.twitter.com
-2. Clicca "Create Project"
-3. Rispondi alle domande iniziali
-4. Una volta nel dashboard, clicca "Keys and tokens"
-5. Genera/copia i seguenti valori:
-   - **API Key** → `TWITTER_API_KEY`
-   - **API Secret Key** → `TWITTER_API_SECRET`
-   - **Bearer Token** → `TWITTER_BEARER_TOKEN`
-   - **Access Token** (clicca "Generate") → `TWITTER_ACCESS_TOKEN`
-   - **Access Token Secret** (generato insieme) → `TWITTER_ACCESS_TOKEN_SECRET`
-
-### 🧠 Groq API Key (GRATIS)
-
-1. Vai su https://console.groq.com
-2. Clicca "Sign Up" (supporta Google/GitHub)
-3. Verifica email
-4. Clicca "Create API Key"
-5. Copia la chiave → `GROQ_API_KEY`
-
-**Limite gratuito:** 14,400 token/minuto (illimitato per testing)
-
-### 📰 NewsAPI Key (GRATIS)
-
-1. Vai su https://newsapi.org
-2. Clicca "Get API Key"
-3. Registrati e conferma email
-4. Copia la chiave API → `NEWSAPI_KEY`
-
-**Limite gratuito:** 100 richieste/giorno
-
-## Step 3: Installazione Locale
+## 2. Installazione
 
 ```bash
-# Clone il repository
 git clone https://github.com/FloDev23/ai-x-bot.git
 cd ai-x-bot
-
-# Crea environment virtuale
 python -m venv venv
-
-# Attiva environment
-# Su Windows:
-venv\Scripts\activate
-# Su macOS/Linux:
 source venv/bin/activate
-
-# Installa dipendenze
 pip install -r requirements.txt
-```
-
-## Step 4: Configurazione
-
-```bash
-# Copia il file di esempio
 cp .env.example .env
-
-# Modifica .env con i tuoi valori
-# Usa il tuo editor preferito (nano, vim, VS Code, etc.)
-nano .env
 ```
 
-**Esempio .env completato:**
+Non committare `.env`, `bot_data.db`, i log o la libreria media.
+
+## 3. Credenziali obbligatorie
+
+Compilare in `.env`:
+
+```dotenv
+TWITTER_API_KEY=
+TWITTER_API_SECRET=
+TWITTER_ACCESS_TOKEN=
+TWITTER_ACCESS_TOKEN_SECRET=
+TWITTER_BEARER_TOKEN=
+GROQ_API_KEY=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
-TWITTER_API_KEY=tua_api_key
-TWITTER_API_SECRET=tua_api_secret
-TWITTER_ACCESS_TOKEN=tuo_access_token
-TWITTER_ACCESS_TOKEN_SECRET=tuo_token_secret
-TWITTER_BEARER_TOKEN=tuo_bearer_token
 
-GROQ_API_KEY=tua_groq_key
+`TELEGRAM_CHAT_ID` è confrontato su ogni update; messaggi e callback provenienti da altre chat non modificano lo stato.
 
-NEWSAPI_KEY=tua_newsapi_key
+Per abilitare news verificate, inserire soltanto domini fidati e una chiave:
 
-SEARCH_TOPICS=AI,Machine Learning,Python,Crypto,Tech
-POST_INTERVAL=3600
+```dotenv
+NEWS_TRUSTED_DOMAINS=example.com,industry.example
+NEWSAPI_KEY=
 ```
 
-## Step 5: Test Configurazione
+Con `NEWS_TRUSTED_DOMAINS=` la fetch news è disabilitata e `NEWSAPI_KEY` non è richiesta.
+
+## 4. Switch iniziali esatti
+
+Usare questi valori durante tutto il dry-run:
+
+```dotenv
+BOT_TIMEZONE=Europe/Rome
+CONTENT_SLOTS=14:00,20:00
+DRAFT_LEAD_MINUTES=120
+PUBLISH_GRACE_SECONDS=300
+APPROVAL_REQUIRED=true
+DRY_RUN=true
+DRAFT_SCORE_THRESHOLD=75
+SEMANTIC_DUPLICATE_THRESHOLD=0.72
+MAX_LINKS_PER_WEEK=1
+ENABLE_LEAD_DISCOVERY=false
+MEDIA_MATCH_THRESHOLD=80
+TELEGRAM_POLL_TIMEOUT=25
+TELEGRAM_MAX_IMAGE_BYTES=10485760
+TELEGRAM_MAX_VIDEO_BYTES=52428800
+GROWTH_SCORE_THRESHOLD=75
+GROWTH_QUERY_BUDGET=3
+GROWTH_NEW_PROFILE_BUDGET=25
+GROWTH_PROFILE_CACHE_DAYS=7
+GROWTH_DIGEST_LIMIT=5
+GROWTH_SEED_ACCOUNTS=
+NEWS_TRUSTED_DOMAINS=
+```
+
+`validate_config()` rifiuta token/chat Telegram mancanti e `APPROVAL_REQUIRED=false`. Richiede `NEWSAPI_KEY` solo quando è configurato almeno un dominio fidato. Il query budget growth è comunque limitato a tre.
+
+## 5. Test locale senza rete
 
 ```bash
-# Valida che tutte le chiavi siano presenti
+venv/bin/python -m pytest tests/test_end_to_end_dry_run.py -v
+venv/bin/python -m pytest -v
+venv/bin/python -m compileall -q main.py config.py modules dashboard
+git diff --check
+```
+
+I test usano dependency injection esplicita e boundary fake: non contattano X, Telegram, Groq o NewsAPI.
+
+## 6. Dry-run sul VPS
+
+Avviare il servizio con `DRY_RUN=true`:
+
+```bash
 python -c "from config import validate_config; validate_config()"
-
-# Dovresti vedere: "✅ Configurazione validata con successo"
-```
-
-## Step 6: Avvio Bot
-
-```bash
-# Avvia il bot
 python main.py
-
-# Dovresti vedere:
-# 🤖 Inizializzazione AI X Bot...
-# ✅ Bot inizializzato con successo
-# 🚀 Avvio AI X Bot...
-# ▶️ Esecuzione iniziale...
-# ✅ Bot avviato e in esecuzione. Premi Ctrl+C per fermare.
 ```
 
-## 📊 Monitoraggio
+Completare e annotare tutta la checklist:
 
-Il bot crea un file `bot.log` che contiene:
-- Notizie trovate
-- Tweet generati
-- Errori e problemi
-- Engagement effettuato
+- [ ] autorizzazione Telegram: la chat corretta funziona e una chat diversa è ignorata;
+- [ ] inserimento e classificazione di una fonte testuale;
+- [ ] upload di una foto senza creazione automatica di una bozza;
+- [ ] upload di un video senza creazione automatica di una bozza;
+- [ ] ricezione della preview della bozza e del media abbinato;
+- [ ] prova di tutti i pulsanti bozza: approva, modifica, rigenera, rimanda e rifiuta;
+- [ ] `/pause` impedisce la pubblicazione e `/resume` la riabilita;
+- [ ] reinvio dello stesso callback senza doppia mutazione;
+- [ ] digest growth con link/username e sole azioni manuali;
+- [ ] snapshot follower e report `/stats` coerenti;
+- [ ] conteggio scritture X pari a zero, inclusi post ed engagement.
 
-```bash
-# Visualizza i log in tempo reale
-tail -f bot.log
+Controllare inoltre `/status`, `/posts`, `/errors` e `bot.log`. L'allowlist scheduler deve contenere soltanto i job documentati nel README; la discovery lead deve essere assente.
 
-# Su Windows:
-Get-Content bot.log -Wait
+Cambiare `DRY_RUN=false` soltanto dopo che l'intera checklist ha superato il test sul VPS. Non cambiare `APPROVAL_REQUIRED=true`.
+
+## 7. Esecuzione persistente
+
+Usare un service manager con working directory del repository, utente non privilegiato, restart controllato e accesso in scrittura a database/log/media. Esempio systemd:
+
+```ini
+[Unit]
+Description=FlexDropin approval-only X growth agent
+After=network-online.target
+
+[Service]
+Type=simple
+User=flexdropin-bot
+WorkingDirectory=/opt/ai-x-bot
+EnvironmentFile=/opt/ai-x-bot/.env
+ExecStart=/opt/ai-x-bot/venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-## 🔧 Troubleshooting
+Alla ricezione di `Ctrl+C` il processo segnala lo stesso `threading.Event` al polling Telegram, ferma lo scheduler e attende il thread entro un timeout limitato.
 
-### ❌ "Mancano variabili d'ambiente"
-**Soluzione:** Controlla che il file `.env` sia nella directory corretta con tutti i campi compilati
+## Troubleshooting
 
-### ❌ "Errore di autenticazione X"
-**Soluzione:**
-- Verifica che i token siano corretti (non abbiano spazi all'inizio/fine)
-- Accedi a https://developer.twitter.com e controlla che l'app sia "ACTIVE"
-- Rigenera i token se necessario
-
-### ❌ "Groq API error"
-**Soluzione:**
-- Verifica che la chiave Groq sia corretta
-- Controlla la connessione internet
-- Accedi a https://console.groq.com per verificare l'API key
-
-### ❌ "NewsAPI key invalid"
-**Soluzione:**
-- Genera una nuova chiave su https://newsapi.org
-- Verifica che sia la chiave API (non l'URL)
-
-## 🎛️ Customizzazione
-
-### Cambia i topic da seguire
-Modifica `.env`:
-```
-SEARCH_TOPICS=Calcio,Tennis,Politica,Economia
-```
-
-### Cambia frequenza di posting
-Modifica `.env`:
-```
-POST_INTERVAL=1800  # Ogni 30 minuti invece di 1 ora
-```
-
-### Cambia modello AI
-Modifica `config.py` (riga 13):
-```python
-GROQ_MODEL = 'llama-2-70b-chat'  # Più potente ma più lento
-```
-
-## 🌐 Deploy su Server (24/7)
-
-### Opzione 1: Railway (GRATUITO)
-
-1. Vai su https://railway.app
-2. Clicca "Create New Project"
-3. Seleziona "GitHub Repo"
-4. Collega il tuo repo GitHub (FloDev23/ai-x-bot)
-5. Clicca "Deploy"
-6. Aggiungi le variabili d'ambiente:
-   - Vai a "Variables"
-   - Aggiungi tutte le chiavi dal tuo `.env`
-7. Il bot partirà automaticamente 24/7
-
-### Opzione 2: Render (GRATIS)
-
-1. Vai su https://render.com
-2. Clicca "New +"
-3. Seleziona "Background Worker"
-4. Collega il tuo repository GitHub
-5. Configura:
-   - Name: `ai-x-bot`
-   - Runtime: `Python 3`
-   - Build Command: `pip install -r requirements.txt`
-   - Start Command: `python main.py`
-6. Aggiungi le variabili d'ambiente
-7. Deploy!
-
-### Opzione 3: Server Personale VPS
-
-```bash
-# Installa screen per sessioni persistenti
-sudo apt-get install screen
-
-# Avvia il bot in background
-screen -S ai-x-bot
-python main.py
-
-# Detach: Ctrl+A D
-# Reattach: screen -r ai-x-bot
-```
-
-## 💰 Monitoraggio Costi
-
-| Servizio | Costo |
-|----------|-------|
-| Groq API | FREE (14,400 token/min) |
-| NewsAPI | FREE (100 req/giorno) |
-| X API | FREE (basic tier) |
-| Hosting | FREE (Railway/Render) |
-| **TOTALE** | **$0 al mese** ✅ |
-
-## ✅ Checklist Finale
-
-- [ ] Ottenute tutte e 7 le chiavi API
-- [ ] Installate le dipendenze (`pip install -r requirements.txt`)
-- [ ] Configurato il file `.env`
-- [ ] Validata la configurazione
-- [ ] Testato il bot localmente
-- [ ] Deployato (opzionale)
-- [ ] Bot in esecuzione 24/7
-
-## 🆘 Supporto
-
-Se hai problemi:
-
-1. Controlla i log: `tail -f bot.log`
-2. Verifica le API keys nel file `.env`
-3. Leggi la documentazione ufficiale:
-   - https://developer.twitter.com/docs
-   - https://console.groq.com/docs
-   - https://newsapi.org/docs
-
----
-
-**Buon bot! 🚀**
+- `Variabili d'ambiente mancanti`: verificare tutte le credenziali obbligatorie; se sono configurati domini news, aggiungere `NEWSAPI_KEY`.
+- `APPROVAL_REQUIRED must be true`: ripristinare `APPROVAL_REQUIRED=true`.
+- Nessun draft: aggiungere una fonte ammissibile e controllare outcome/errori in SQLite e `/errors`.
+- Draft non pubblicato: verificare approvazione, `/pause`, slot esatto, grace window e `DRY_RUN`.
+- Media rifiutato: verificare MIME reale, dimensione, permessi della directory e disponibilità di `ffmpeg` per i video.
+- Polling Telegram fermo: verificare token, chat ID, timeout e log sanitizzati; non stampare mai token o URL bot completi.

@@ -1,309 +1,573 @@
 #!/usr/bin/env python3
-"""
-AI X Bot v3 - FlexDropin Growth Agent
-Da "bot che pubblica" a "agente di crescita": memoria a lungo termine,
-scoring pre-pubblicazione, auto-learning sulle performance e opportunity
-detector.
-
-Punti implementati (vedi analisi allegata):
-1. Memoria a lungo termine        -> modules/database.py
-2. Performance analytics          -> modules/analytics.py
-3. Score dei tweet                 -> modules/scoring.py
-4. Database delle idee             -> modules/database.py (tabella ideas)
-5. Human mode                      -> modules/ai_generator.py
-9. Anti-spam                       -> modules/database.py + content_scheduler.py
-10-11. Eventi e calendario stagionale -> modules/content_scheduler.py
-12. Persona founder                -> modules/ai_generator.py (FOUNDER_PERSONA)
-13. Multi-agente + Editor           -> modules/ai_generator.py
-17-18. Thread e A/B test           -> modules/ai_generator.py
-19. Opportunity detector / lead     -> modules/lead_finder.py
-
-NOTA COSTI (X API 2026): il bot è stato riprogettato per usare cicli a
-frequenza fissa (poche volte al giorno) invece di intervalli continui,
-per contenere il costo delle letture/post a pagamento. Vedi config.py.
-"""
+"""Approval-only orchestration for the FlexDropin X growth agent."""
 
 import logging
-import random
 import sys
+import threading
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Optional
+from zoneinfo import ZoneInfo
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-try:
-    from config import (
-        validate_config, DEBUG, FLEXDROPIN_PROMO,
-        OPPORTUNITY_CYCLE_TIMES, PERFORMANCE_CYCLE_TIME,
-        TWEET_SCORE_THRESHOLD, MAX_REGENERATION_ATTEMPTS,
-        MAX_FLEXDROPIN_MENTIONS_PER_DAY, MAX_LINKS_PER_WEEK,
-        HUMAN_MODE_PROBABILITY, SEARCH_TOPICS,
-        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, LEAD_NOTIFY_MIN_SCORE,
-    )
-    from modules.database import Database
-    from modules.notifier import TelegramNotifier
-    from modules.content_scheduler import (
-        get_seasonal_context, get_active_events, PROMO_CATEGORIES,
-    )
-    from modules.scoring import TweetScorer
-    from modules.ai_generator import AIGenerator
-    from modules.twitter_client import TwitterClient
-    from modules.lead_finder import LeadFinder
-    from modules.analytics import PerformanceAnalyzer
-    from modules.news_fetcher import NewsFetcher
-except ImportError as e:
-    print(f"❌ Errore di import: {e}")
-    print("Installa le dipendenze con: pip install -r requirements.txt")
-    sys.exit(1)
-
-# Setup logging
-logging.basicConfig(
-    level=logging.DEBUG if DEBUG else logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
+from config import (
+    BOT_TIMEZONE,
+    CONTENT_SLOTS,
+    DRAFT_LEAD_MINUTES,
+    DRAFT_SCORE_THRESHOLD,
+    DRY_RUN,
+    ENABLE_LEAD_DISCOVERY,
+    GROWTH_DIGEST_LIMIT,
+    LEAD_NOTIFY_MIN_SCORE,
+    MEDIA_LIBRARY_DIR,
+    MEDIA_MATCH_THRESHOLD,
+    NEWS_TRUSTED_DOMAINS,
+    OPPORTUNITY_CYCLE_TIMES,
+    PUBLISH_GRACE_SECONDS,
+    SEARCH_TOPICS,
+    SEMANTIC_DUPLICATE_THRESHOLD,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    validate_config,
 )
+from modules.ai_generator import AIGenerator
+from modules.analytics import PerformanceAnalyzer
+from modules.content_planner import ContentPlanner
+from modules.database import Database
+from modules.draft_pipeline import DraftPipeline
+from modules.fact_guard import FactGuard
+from modules.growth_discovery import GrowthDiscovery
+from modules.lead_finder import LeadFinder
+from modules.media_matcher import MediaMatcher
+from modules.media_processor import MediaProcessor
+from modules.news_fetcher import NewsFetcher
+from modules.notifier import TelegramNotifier
+from modules.publisher import PublishResult, Publisher
+from modules.scoring import TweetScorer
+from modules.source_ingestion import SourceIngestor
+from modules.telegram_api import TELEGRAM_POLL_TIMEOUT, TelegramApi
+from modules.telegram_controller import TelegramController
+from modules.twitter_client import TwitterClient
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()],
+)
 logger = logging.getLogger(__name__)
 
 
 class FlexDropinGrowthAgent:
-    """Growth Agent per FlexDropin: contenuti, engagement mirato, lead, analytics"""
+    """Wire safe application components and the explicit production schedule."""
 
-    def __init__(self):
-        logger.info("🤖 Inizializzazione FlexDropin Growth Agent v3...")
+    _DEPENDENCY_KEYS = frozenset({
+        "analytics",
+        "approval_required",
+        "authorized_chat_id",
+        "clock",
+        "content_slots",
+        "db",
+        "draft_lead_minutes",
+        "draft_pipeline",
+        "dry_run",
+        "fact_guard",
+        "generator",
+        "growth_discovery",
+        "lead_discovery_enabled",
+        "lead_cycle_times",
+        "lead_finder",
+        "media_library_dir",
+        "media_matcher",
+        "media_processor",
+        "news_fetcher",
+        "news_trusted_domains",
+        "notifier",
+        "planner",
+        "publisher",
+        "scheduler",
+        "scorer",
+        "source_ingestor",
+        "telegram_api",
+        "telegram_bot_token",
+        "telegram_controller",
+        "telegram_poll_timeout",
+        "timezone_name",
+        "x_client",
+    })
+    _REQUIRED_INJECTED_BOUNDARIES = frozenset({
+        "db",
+        "generator",
+        "lead_finder",
+        "news_fetcher",
+        "scheduler",
+        "scorer",
+        "telegram_api",
+        "x_client",
+    })
 
-        try:
+    def __init__(self, dependencies=None):
+        if dependencies is None:
             validate_config()
-
-            self.db = Database()
-            self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-            self.news_fetcher = NewsFetcher()
-            self.ai_generator = AIGenerator()
-            self.twitter_client = TwitterClient()
-            self.scorer = TweetScorer(self.ai_generator.client, self.ai_generator.model)
-            self.lead_finder = LeadFinder(
-                self.twitter_client, self.ai_generator.client, self.ai_generator.model, self.db
+            supplied = {}
+            injected = False
+        elif isinstance(dependencies, Mapping):
+            supplied = dict(dependencies)
+            unknown = sorted(set(supplied) - self._DEPENDENCY_KEYS)
+            if unknown:
+                raise ValueError("unknown dependencies: " + ", ".join(unknown))
+            missing = sorted(
+                name
+                for name in self._REQUIRED_INJECTED_BOUNDARIES
+                if supplied.get(name) is None
             )
-            self.analyzer = PerformanceAnalyzer(self.twitter_client, self.db)
+            if missing:
+                raise ValueError(
+                    "missing injected dependencies: " + ", ".join(missing)
+                )
+            injected = True
+        else:
+            raise TypeError("dependencies must be a mapping or None")
 
-            self.scheduler = BackgroundScheduler()
-            logger.info("✅ Growth Agent inizializzato con successo")
-            logger.info(f"💚 Promozione FlexDropin: {'ABILITATA' if FLEXDROPIN_PROMO else 'DISABILITATA'}")
+        if supplied.get("approval_required", True) is not True:
+            raise ValueError("approval_required must be true")
 
-        except Exception as e:
-            logger.error(f"❌ Errore durante l'inizializzazione: {e}")
-            raise
-
-    # ------------------------------------------------------------------
-    # Ciclo 1: contenuti giornalieri (palinsesto + multi-agente + scoring)
-    # ------------------------------------------------------------------
-    def daily_content_cycle(self):
-        logger.info(f"🔄 Inizio ciclo di contenuti - {datetime.now()}")
-        try:
-            # Punto 5: ogni tanto, invece del palinsesto, un post "umano"
-            if random.random() < HUMAN_MODE_PROBABILITY:
-                media = self._pick_media_for_post('human_mode', 'human_mode')
-                text = self.ai_generator.generate_human_mode_post()
-                if text:
-                    self._publish(text, category='human_mode', topic='human_mode',
-                                   has_link=False, score_total=None, agent_used='human_mode',
-                                   media=media)
-                return
-
-            recent_topics = self.db.get_recent_topics(days=3)
-            weights = self.db.get_all_category_weights()
-
-            # Punto 9: evita di ripetere una categoria già pubblicata nelle ultime ore
-            candidates = get_categories_for_today()
-            avoid = [c for c in candidates if self.db.category_posted_recently(c, hours=20)]
-            category = pick_category(weights, avoid_categories=avoid)
-
-            # Tetto giornaliero menzioni FlexDropin (punto 9)
-            if category in PROMO_CATEGORIES and \
-                    self.db.count_flexdropin_mentions_today() >= MAX_FLEXDROPIN_MENTIONS_PER_DAY:
-                non_promo = [c for c in candidates if c not in PROMO_CATEGORIES] or ['trend_fitness']
-                logger.info("⏭️ Tetto menzioni FlexDropin raggiunto per oggi, passo a categoria non promo")
-                category = random.choice(non_promo)
-
-            include_link = should_include_link(
-                category,
-                links_posted_last_7_days=self.db.count_links_last_days(7),
-                max_links_per_week=MAX_LINKS_PER_WEEK,
-                last_post_had_link=self.db.last_post_had_link(),
-            )
-
-            topic_hint = self._get_topic_hint(category)
-            event_context = get_active_events()
-            seasonal_context = get_seasonal_context()
-
-            # Scegliamo il media PRIMA di scrivere il testo, così se ne trova
-            # uno adatto il testo può essere scritto per accompagnarlo
-            # davvero, invece di limitarsi ad allegarlo dopo a un post scritto
-            # a prescindere.
-            media = self._pick_media_for_post(category, topic_hint)
-            media_description = media['ai_description'] if media else None
-
-            text, agent_used, scores = self._generate_and_score(
-                category, topic_hint, recent_topics, include_link,
-                event_context, seasonal_context, media_description=media_description,
-            )
-            if not text:
-                logger.warning("⚠️ Nessun tweet generato/approvato in questo ciclo, salto la pubblicazione")
-                return
-
-            self._publish(text, category=category, topic=topic_hint, has_link=include_link,
-                           score_total=scores.get('totale') if scores else None, agent_used=agent_used,
-                           media=media)
-
-        except Exception as e:
-            logger.error(f"❌ Errore nel ciclo di contenuti: {e}")
-            self.notifier.notify_error("daily_content_cycle", e)
-
-    def _get_topic_hint(self, category: str) -> str:
-        """Punto 15 (parziale): spunto da news reali per le categorie trend"""
-        if category != 'trend_fitness':
-            return ''
-        try:
-            topic = random.choice(SEARCH_TOPICS)
-            articles = self.news_fetcher.get_trending_news(topic, limit=1)
-            if articles:
-                return articles[0].get('title', topic)
-            return topic
-        except Exception:
-            return ''
-
-    def _generate_and_score(self, category, topic_hint, recent_topics, include_link,
-                             event_context, seasonal_context, media_description=None):
-        """Genera un tweet e lo rigenera se sotto soglia di qualità (punto 3)"""
-        attempts = 0
-        last_scores = None
-        candidate = None
-        while attempts <= MAX_REGENERATION_ATTEMPTS:
-            candidate = self.ai_generator.generate_tweet(
-                category=category, topic_hint=topic_hint, recent_topics=recent_topics,
-                include_link=include_link, event_context=event_context,
-                seasonal_context=seasonal_context, media_description=media_description,
-            )
-            if not candidate:
-                attempts += 1
-                continue
-
-            scores = self.scorer.passes_threshold(candidate['text'], threshold=TWEET_SCORE_THRESHOLD)
-            last_scores = scores
-            logger.info(f"📝 Tentativo {attempts + 1}: score {scores['totale']}/40 "
-                        f"({'✅ approvato' if scores['approved'] else '❌ sotto soglia'})")
-
-            if scores['approved']:
-                return candidate['text'], candidate['agent_used'], scores
-            attempts += 1
-
-        # Se dopo i tentativi non passa la soglia, pubblica comunque l'ultimo
-        # candidato generato piuttosto che saltare il post: evita di lasciare
-        # l'account silente, ma logga chiaramente il punteggio basso.
-        if candidate:
-            logger.warning("⚠️ Pubblico comunque l'ultimo candidato sotto soglia")
-            return candidate['text'], candidate['agent_used'], last_scores
-        return None, None, None
-
-    def _pick_media_for_post(self, category: str, topic_hint: str = '') -> Optional[dict]:
-        """
-        Sceglie il media più adatto AL CONTENUTO del post di oggi (non il
-        più vecchio): prende il pool di media non ancora usati e lascia che
-        l'AI ragioni sulle loro descrizioni per trovare il migliore
-        abbinamento con categoria/argomento di oggi. Se nessuno è adatto,
-        ritorna None e il post resta solo testo — non forziamo mai un
-        abbinamento a caso pur di allegare qualcosa.
-        """
-        candidates = self.db.get_unused_media_pool(limit=15)
-        if not candidates:
-            return None
-        media_id = self.ai_generator.select_best_media(category, topic_hint, candidates)
-        if not media_id:
-            return None
-        return self.db.get_media_by_id(media_id)
-
-    def _publish(self, text, category, topic, has_link, score_total, agent_used, media=None):
-        """Disabled legacy bypass; Task 12 will wire scheduled draft publishing."""
-        raise RuntimeError("legacy_direct_publication_disabled")
-
-    # ------------------------------------------------------------------
-    # Ciclo 3: opportunity detector / lead (punto 19)
-    # ------------------------------------------------------------------
-    def opportunity_cycle(self):
-        logger.info(f"🎯 Ciclo opportunity detector - {datetime.now()}")
-        try:
-            found = self.lead_finder.find_opportunities(
-                ai_generator=self.ai_generator, notifier=self.notifier,
-                notify_min_score=LEAD_NOTIFY_MIN_SCORE,
-            )
-            logger.info(f"✅ Ciclo opportunity completato: {len(found)} nuovi lead salvati nel CRM locale")
-        except Exception as e:
-            logger.error(f"❌ Errore nel ciclo opportunity: {e}")
-            self.notifier.notify_error("opportunity_cycle", e)
-
-    # ------------------------------------------------------------------
-    # Ciclo 5: performance analytics / auto-learning (punto 2)
-    # ------------------------------------------------------------------
-    def performance_cycle(self):
-        logger.info(f"📊 Ciclo performance analytics - {datetime.now()}")
-        try:
-            self.analyzer.refresh_own_tweet_metrics()
-            self.analyzer.recompute_category_weights()
-            ranking = self.analyzer.get_ranking()
-            if ranking:
-                logger.info("📈 Classifica categorie per CTR: " +
-                            ", ".join(f"{r['category']} ({r['ctr']}%)" for r in ranking))
-        except Exception as e:
-            logger.error(f"❌ Errore nel ciclo di performance: {e}")
-            self.notifier.notify_error("performance_cycle", e)
-
-    # ------------------------------------------------------------------
-    # Avvio
-    # ------------------------------------------------------------------
-    def start(self):
-        logger.info("🚀 Avvio FlexDropin Growth Agent...")
-
-        for t in OPPORTUNITY_CYCLE_TIMES:
-            hh, mm = t.strip().split(':')
-            self.scheduler.add_job(
-                self.opportunity_cycle, CronTrigger(hour=int(hh), minute=int(mm)),
-                id=f'opportunity_{t}', name=f'Opportunity Detector {t}'
-            )
-
-        hh, mm = PERFORMANCE_CYCLE_TIME.strip().split(':')
-        self.scheduler.add_job(
-            self.performance_cycle, CronTrigger(hour=int(hh), minute=int(mm)),
-            id='performance_cycle', name='Performance Analytics'
+        self.timezone_name = supplied.get("timezone_name", BOT_TIMEZONE)
+        self.timezone = ZoneInfo(self.timezone_name)
+        self.clock = supplied.get(
+            "clock", lambda: datetime.now(self.timezone)
+        )
+        self.content_slots = tuple(supplied.get("content_slots", CONTENT_SLOTS))
+        self.draft_lead_minutes = supplied.get(
+            "draft_lead_minutes", DRAFT_LEAD_MINUTES
+        )
+        self.dry_run = supplied.get("dry_run", DRY_RUN)
+        self.lead_discovery_enabled = supplied.get(
+            "lead_discovery_enabled", ENABLE_LEAD_DISCOVERY
+        )
+        self.lead_cycle_times = tuple(supplied.get(
+            "lead_cycle_times", OPPORTUNITY_CYCLE_TIMES
+        ))
+        self.authorized_chat_id = str(
+            supplied.get("authorized_chat_id", TELEGRAM_CHAT_ID)
+        )
+        self.media_library_dir = supplied.get(
+            "media_library_dir", MEDIA_LIBRARY_DIR
+        )
+        trusted_domains = supplied.get(
+            "news_trusted_domains", NEWS_TRUSTED_DOMAINS
         )
 
-        self.scheduler.start()
-        logger.info("✅ Growth Agent avviato e in esecuzione. Premi Ctrl+C per fermare.")
-        logger.info(f"📅 Opportunity: {OPPORTUNITY_CYCLE_TIMES}")
+        self.db = supplied.get("db") or Database()
+        self.telegram_api = supplied.get("telegram_api")
+        telegram_token = supplied.get("telegram_bot_token", TELEGRAM_BOT_TOKEN)
+        if self.telegram_api is None:
+            self.telegram_api = TelegramApi(
+                telegram_token,
+                media_library_dir=self.media_library_dir,
+            )
+        notifier_token = telegram_token or ("injected" if injected else "")
+        self.notifier = supplied.get("notifier") or TelegramNotifier(
+            notifier_token,
+            self.authorized_chat_id,
+            database=self.db,
+            telegram_api=self.telegram_api,
+        )
 
+        self.news_fetcher = supplied.get("news_fetcher") or NewsFetcher()
+        self.ai_generator = supplied.get("generator") or AIGenerator()
+        self.twitter_client = supplied.get("x_client") or TwitterClient()
+        self.scorer = supplied.get("scorer") or TweetScorer(
+            self.ai_generator.client,
+            self.ai_generator.model,
+        )
+
+        self.content_planner = supplied.get("planner") or ContentPlanner(
+            self.db,
+            timezone_name=self.timezone_name,
+        )
+        self.source_ingestor = supplied.get("source_ingestor") or SourceIngestor(
+            self.db,
+            self.news_fetcher,
+            trusted_domains=trusted_domains,
+        )
+        self.fact_guard = supplied.get("fact_guard") or FactGuard(
+            self.ai_generator
+        )
+        self.draft_pipeline = supplied.get("draft_pipeline") or DraftPipeline(
+            self.db,
+            self.content_planner,
+            self.ai_generator,
+            self.fact_guard,
+            self.scorer,
+            score_threshold=DRAFT_SCORE_THRESHOLD,
+            duplicate_threshold=SEMANTIC_DUPLICATE_THRESHOLD,
+            now_fn=self.clock,
+        )
+        self.media_processor = supplied.get("media_processor") or MediaProcessor(
+            self.db,
+            self.ai_generator,
+        )
+        self.media_matcher = supplied.get("media_matcher") or MediaMatcher(
+            self.db,
+            self.ai_generator,
+            threshold=MEDIA_MATCH_THRESHOLD,
+        )
+        self.publisher = supplied.get("publisher") or Publisher(
+            self.db,
+            self.twitter_client,
+            dry_run=self.dry_run,
+            clock=self.clock,
+            grace_seconds=PUBLISH_GRACE_SECONDS,
+            timezone_name=self.timezone_name,
+        )
+        self.analytics = supplied.get("analytics") or PerformanceAnalyzer(
+            self.twitter_client,
+            self.db,
+        )
+        self.analyzer = self.analytics
+        self.growth_discovery = supplied.get(
+            "growth_discovery"
+        ) or GrowthDiscovery(self.twitter_client, self.db)
+        self.lead_finder = supplied.get("lead_finder") or LeadFinder(
+            self.twitter_client,
+            self.ai_generator.client,
+            self.ai_generator.model,
+            self.db,
+        )
+
+        self.scheduler = supplied.get("scheduler") or BackgroundScheduler(
+            timezone=self.timezone
+        )
+        self.telegram_controller = supplied.get(
+            "telegram_controller"
+        ) or TelegramController(
+            self.telegram_api,
+            self.db,
+            self.notifier,
+            self.authorized_chat_id,
+            draft_pipeline=self.draft_pipeline,
+            media_processor=self.media_processor,
+            media_matcher=self.media_matcher,
+            analytics=self.analytics,
+            scheduler_status=self.scheduler_status,
+            dry_run=self.dry_run,
+            now_fn=self.clock,
+            poll_timeout=supplied.get(
+                "telegram_poll_timeout", TELEGRAM_POLL_TIMEOUT
+            ),
+            news_trusted_domains=trusted_domains,
+        )
+
+        self.stop_event = threading.Event()
+        self.telegram_thread = None
+        self._scheduler_started = False
+
+    @staticmethod
+    def _slot_parts(slot_time):
+        if not isinstance(slot_time, str):
+            raise ValueError("slot time must use HH:MM")
+        parts = slot_time.split(":")
+        if len(parts) != 2 or any(
+            len(part) != 2 or not part.isascii() or not part.isdigit()
+            for part in parts
+        ):
+            raise ValueError("slot time must use HH:MM")
+        hour, minute = (int(part) for part in parts)
+        if hour > 23 or minute > 59:
+            raise ValueError("slot time must use HH:MM")
+        return hour, minute
+
+    def _now(self):
+        value = self.clock()
+        if not isinstance(value, datetime):
+            raise ValueError("clock must return datetime")
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=self.timezone)
+        return value.astimezone(self.timezone)
+
+    def _slot(self, slot_time, now=None):
+        hour, minute = self._slot_parts(slot_time)
+        moment = self._now() if now is None else now
+        if not isinstance(moment, datetime):
+            raise ValueError("now must be datetime")
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=self.timezone)
+        local = moment.astimezone(self.timezone)
+        return local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    def _notify_error(self, operation, error):
+        logger.error("%s failed: %s", operation, type(error).__name__)
+        self.notifier.notify_error(operation, error)
+
+    def refresh_verified_news_cycle(self):
         try:
-            import time
-            while True:
-                time.sleep(1)
+            return self.source_ingestor.refresh_verified_news(
+                SEARCH_TOPICS,
+                per_topic=1,
+            )
+        except Exception as error:
+            self._notify_error("cycle", error)
+            return 0
+
+    def create_draft_cycle(self, intended_slot_time, now=None):
+        try:
+            intended_slot = self._slot(intended_slot_time, now)
+            draft = self.draft_pipeline.create_for_slot(intended_slot)
+            if not draft:
+                return None
+            self.media_matcher.attach_best(draft["id"])
+            current = self.db.get_post_draft(draft["id"]) or draft
+            self.telegram_controller._send_draft_card(
+                self.authorized_chat_id,
+                current,
+            )
+            return current
+        except Exception as error:
+            self._notify_error("cycle", error)
+            return None
+
+    def publish_cycle(self, intended_slot_time, now=None):
+        try:
+            intended_slot = self._slot(intended_slot_time, now)
+            draft = self.db.get_active_draft_for_slot(intended_slot.isoformat())
+            if not draft:
+                return PublishResult("not_found")
+            publish_time = intended_slot if now is None else now
+            return self.publisher.publish(draft["id"], now=publish_time)
+        except Exception as error:
+            self._notify_error("cycle", error)
+            return PublishResult("publication_failed")
+
+    def growth_discovery_cycle(self, now=None):
+        try:
+            candidates = self.growth_discovery.run(
+                self._now() if now is None else now
+            )
+            if not candidates:
+                return []
+            candidates = candidates[:GROWTH_DIGEST_LIMIT]
+            self.telegram_controller._send(
+                self.authorized_chat_id,
+                f"Growth: {len(candidates)} candidati. Azioni solo manuali.",
+            )
+            for candidate in candidates:
+                text, markup = self.telegram_controller._growth_card(candidate)
+                self.telegram_controller._send(
+                    self.authorized_chat_id,
+                    text,
+                    reply_markup=markup,
+                )
+            return candidates
+        except Exception as error:
+            self._notify_error("cycle", error)
+            return []
+
+    def follower_snapshot_cycle(self, now=None):
+        try:
+            return self.analytics.capture_follower_snapshot(
+                self._now() if now is None else now
+            )
+        except Exception as error:
+            self._notify_error("cycle", error)
+            return {}
+
+    def performance_metrics_cycle(self):
+        try:
+            return self.analytics.refresh_own_tweet_metrics()
+        except Exception as error:
+            self._notify_error("cycle", error)
+            return None
+
+    def weekly_growth_report_cycle(self, now=None):
+        try:
+            return self.telegram_controller.push_weekly_report(
+                self._now() if now is None else now
+            )
+        except Exception as error:
+            self._notify_error("cycle", error)
+            return "weekly_report_failed"
+
+    def opportunity_cycle(self):
+        """Read X for optional leads; never perform an engagement write."""
+        try:
+            return self.lead_finder.find_opportunities(
+                ai_generator=self.ai_generator,
+                notifier=self.notifier,
+                notify_min_score=LEAD_NOTIFY_MIN_SCORE,
+            )
+        except Exception as error:
+            self._notify_error("opportunity_cycle", error)
+            return []
+
+    def _add_cron_job(
+        self,
+        function,
+        *,
+        job_id,
+        name,
+        hour,
+        minute,
+        args=None,
+        day_of_week=None,
+    ):
+        trigger_options = {
+            "hour": hour,
+            "minute": minute,
+            "timezone": self.timezone,
+        }
+        if day_of_week is not None:
+            trigger_options["day_of_week"] = day_of_week
+        return self.scheduler.add_job(
+            function,
+            CronTrigger(**trigger_options),
+            id=job_id,
+            name=name,
+            args=args,
+            replace_existing=True,
+        )
+
+    def register_jobs(self):
+        """Register the complete allowlisted schedule, and nothing else."""
+        self._add_cron_job(
+            self.refresh_verified_news_cycle,
+            job_id="verified_news_refresh",
+            name="Verified news refresh",
+            hour=10,
+            minute=30,
+        )
+        for slot_time in self.content_slots:
+            slot_hour, slot_minute = self._slot_parts(slot_time)
+            draft_minute = (
+                slot_hour * 60 + slot_minute - self.draft_lead_minutes
+            ) % (24 * 60)
+            self._add_cron_job(
+                self.create_draft_cycle,
+                job_id=f"draft_{slot_time}",
+                name=f"Create draft for {slot_time}",
+                hour=draft_minute // 60,
+                minute=draft_minute % 60,
+                args=(slot_time,),
+            )
+            self._add_cron_job(
+                self.publish_cycle,
+                job_id=f"publish_{slot_time}",
+                name=f"Publish approved draft for {slot_time}",
+                hour=slot_hour,
+                minute=slot_minute,
+                args=(slot_time,),
+            )
+        self._add_cron_job(
+            self.growth_discovery_cycle,
+            job_id="growth_discovery",
+            name="Read-only growth discovery",
+            hour=11,
+            minute=0,
+        )
+        self._add_cron_job(
+            self.follower_snapshot_cycle,
+            job_id="follower_snapshot",
+            name="Follower snapshot",
+            hour=23,
+            minute=15,
+        )
+        self._add_cron_job(
+            self.performance_metrics_cycle,
+            job_id="performance_metrics",
+            name="Owned post performance metrics",
+            hour=23,
+            minute=30,
+        )
+        self._add_cron_job(
+            self.weekly_growth_report_cycle,
+            job_id="weekly_growth_report",
+            name="Weekly growth report",
+            day_of_week="mon",
+            hour=9,
+            minute=0,
+        )
+        if self.lead_discovery_enabled:
+            for cycle_time in self.lead_cycle_times:
+                hour, minute = self._slot_parts(cycle_time.strip())
+                self._add_cron_job(
+                    self.opportunity_cycle,
+                    job_id=f"lead_discovery_{cycle_time}",
+                    name=f"Optional lead discovery {cycle_time}",
+                    hour=hour,
+                    minute=minute,
+                )
+        return self.scheduler.get_jobs()
+
+    def scheduler_status(self):
+        result = []
+        for job in self.scheduler.get_jobs():
+            next_run = getattr(job, "next_run_time", None)
+            result.append({
+                "id": job.id,
+                "name": job.name,
+                "next_run_time": (
+                    next_run.isoformat()
+                    if hasattr(next_run, "isoformat")
+                    else None
+                ),
+            })
+        return result
+
+    def start(self, block=True):
+        """Start the scheduler and one stoppable Telegram polling thread."""
+        if self._scheduler_started:
+            raise RuntimeError("agent already started")
+        self.stop_event.clear()
+        self.register_jobs()
+        self.scheduler.start()
+        self._scheduler_started = True
+        self.telegram_thread = threading.Thread(
+            target=self.telegram_controller.run_forever,
+            args=(self.stop_event,),
+            name="flexdropin-telegram-polling",
+            daemon=True,
+        )
+        self.telegram_thread.start()
+        logger.info("Growth agent started with approval-only schedule")
+        if not block:
+            return
+        try:
+            while not self.stop_event.wait(1):
+                pass
         except KeyboardInterrupt:
-            logger.info("⏹️ Arresto del bot...")
-            self.scheduler.shutdown()
-            logger.info("✅ Bot arrestato")
+            logger.info("Stopping growth agent")
+        finally:
+            self.shutdown()
+
+    def shutdown(self):
+        """Signal polling first, then stop jobs and join the daemon thread."""
+        self.stop_event.set()
+        if self._scheduler_started:
+            self.scheduler.shutdown(wait=True)
+            self._scheduler_started = False
+        if self.telegram_thread and self.telegram_thread.is_alive():
+            poll_timeout = getattr(
+                self.telegram_controller,
+                "poll_timeout",
+                1,
+            )
+            self.telegram_thread.join(timeout=min(max(poll_timeout + 1, 1), 30))
+
+    def _publish(self, *_args, **_kwargs):
+        """Keep the retired entry point fail-closed for old callers."""
+        raise RuntimeError("legacy_direct_publication_disabled")
 
 
 def main():
-    """Main entry point"""
     try:
-        agent = FlexDropinGrowthAgent()
-        agent.start()
+        FlexDropinGrowthAgent().start()
     except KeyboardInterrupt:
-        logger.info("⏹️ Bot arrestato dall'utente")
-    except Exception as e:
-        logger.error(f"❌ Errore fatale: {e}")
+        logger.info("Growth agent stopped")
+    except Exception as error:
+        logger.error("Fatal startup error: %s", type(error).__name__)
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

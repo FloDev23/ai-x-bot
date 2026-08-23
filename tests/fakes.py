@@ -1,4 +1,6 @@
 from datetime import date
+from pathlib import Path
+from types import SimpleNamespace
 
 
 class FakeDatabase:
@@ -68,3 +70,216 @@ class FakeNewsFetcher:
     def get_trending_news(self, query, limit=1):
         self.queries.append((query, limit))
         return list(self.articles)
+
+
+class FakeXClient:
+    """No-network X boundary for orchestration tests."""
+
+    def __init__(self):
+        self.posts = []
+        self.engagement_writes = []
+        self.followers = []
+
+    def post_tweet(self, text, **kwargs):
+        self.posts.append((text, kwargs))
+        return SimpleNamespace(data={"id": "fake-tweet"})
+
+    def get_followers_profiles(self):
+        return list(self.followers)
+
+    def read_followers_profiles(self):
+        return SimpleNamespace(profiles=list(self.followers), complete=True)
+
+    def search_recent_authors(self, _query):
+        return []
+
+    def get_network_candidates(self, _seed_accounts):
+        return []
+
+    def get_latest_original_post(self, _user_id):
+        return None
+
+    def get_tweet_metrics(self, _tweet_ids):
+        return {}
+
+    def search_tweets(self, _query, limit=10):
+        del limit
+        return []
+
+
+class FakeGroundedGenerator:
+    """Deterministic content boundary with source-aware claim output."""
+
+    def __init__(self):
+        self.client = SimpleNamespace()
+        self.model = "fake-model"
+        self.text = (
+            "I decided to reduce posting frequency so every post earns attention."
+        )
+
+    def generate_grounded_tweet(self, _category, _sources, _include_link):
+        return {"text": self.text}
+
+    def rewrite_to_limit(self, _text, _sources, limit=280):
+        return self.text if len(self.text) <= limit else None
+
+    def analyze_claims(self, text, sources):
+        source_ids = [source["id"] for source in sources]
+        claims = []
+        if text.startswith("I "):
+            claims.append({
+                "type": "first_person",
+                "text": text,
+                "supported_by": source_ids,
+            })
+        return {"claims": claims}
+
+    def select_best_media(self, _category, _text, _candidates):
+        return None
+
+    def analyze_image(self, _stream, _filename):
+        return {
+            "category": "studio",
+            "description": "Future studio content",
+            "tags": ["studio"],
+        }
+
+
+class FakeEditorialScorer:
+    def score_draft(self, _text):
+        return {
+            "hook": 9,
+            "usefulness": 9,
+            "specificity": 9,
+            "originality": 9,
+            "audience_relevance": 9,
+            "follow_worthiness": 9,
+            "semantic_novelty": 9,
+            "total": 90,
+        }
+
+
+class FakeTelegramApi:
+    """Telegram boundary supporting cards, callbacks and one local photo."""
+
+    def __init__(self, media_library_dir):
+        self.media_library_dir = Path(media_library_dir)
+        self.messages = []
+        self.media_messages = []
+        self.callback_answers = []
+        self.downloads = []
+
+    def send_message(self, chat_id, text, **kwargs):
+        self.messages.append((str(chat_id), text, kwargs))
+        return {"message_id": len(self.messages)}
+
+    def send_media(self, chat_id, media, media_type, **kwargs):
+        content = media.read()
+        self.media_messages.append((str(chat_id), content, media_type, kwargs))
+        return {"message_id": len(self.media_messages)}
+
+    def answer_callback(self, callback_id, **kwargs):
+        self.callback_answers.append((callback_id, kwargs))
+        return True
+
+    def get_updates(self, offset=None, timeout=25):
+        del offset, timeout
+        return []
+
+    def get_file(self, file_id):
+        return {
+            "file_id": file_id,
+            "file_unique_id": "photo-unique",
+            "file_size": 6,
+            "file_path": "photos/fake.jpg",
+        }
+
+    def download_file(
+        self,
+        file_path,
+        destination,
+        *,
+        message_filename,
+        mime_type,
+        expected_size,
+    ):
+        destination = Path(destination)
+        self.downloads.append({
+            "file_path": file_path,
+            "destination": destination,
+            "message_filename": message_filename,
+            "mime_type": mime_type,
+            "expected_size": expected_size,
+        })
+        destination.write_bytes(b"\xff\xd8\xff\xe0\x00\x10")
+        return destination
+
+
+class FakeScheduler:
+    def __init__(self):
+        self.jobs = {}
+        self.started = False
+        self.shutdown_calls = []
+
+    def add_job(
+        self,
+        func,
+        trigger,
+        *,
+        id,
+        name,
+        args=None,
+        kwargs=None,
+        replace_existing=False,
+    ):
+        if id in self.jobs and not replace_existing:
+            raise ValueError("duplicate job")
+        job = SimpleNamespace(
+            func=func,
+            trigger=trigger,
+            id=id,
+            name=name,
+            args=tuple(args or ()),
+            kwargs=dict(kwargs or {}),
+            next_run_time=None,
+        )
+        self.jobs[id] = job
+        return job
+
+    def get_jobs(self):
+        return list(self.jobs.values())
+
+    def start(self):
+        self.started = True
+
+    def shutdown(self, wait=True):
+        self.shutdown_calls.append(bool(wait))
+        self.started = False
+
+
+def callback_update(update_id, data, chat_id=42):
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"callback-{update_id}",
+            "message": {"chat": {"id": chat_id}},
+            "data": data,
+        },
+    }
+
+
+def photo_update(update_id, caption="Future studio content", chat_id=42):
+    return {
+        "update_id": update_id,
+        "message": {
+            "chat": {"id": chat_id},
+            "caption": caption,
+            "photo": [{
+                "file_id": "photo-file",
+                "file_unique_id": "photo-unique",
+                "width": 1200,
+                "height": 800,
+                "file_size": 6,
+            }],
+        },
+    }

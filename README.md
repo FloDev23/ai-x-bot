@@ -1,218 +1,80 @@
-# 🤖 AI X Bot - Growth Agent v3 per FlexDropin
+# FlexDropin X Growth Agent
 
-Un bot automatico per X (Twitter) che genera e pubblica contenuti usando AI (Groq), fetcha notizie (NewsAPI) e gestisce l'engagement.
+Un servizio Python approval-only per preparare contenuti X, gestirli da Telegram e osservare la crescita follower. SQLite conserva fonti, bozze, approvazioni, media, candidati e metriche.
 
-## 🆕 Novità v3 (Growth Agent)
+Il processo non mette like, non segue/smette di seguire, non risponde e non invia DM. L'unica scrittura X è la pubblicazione di una specifica bozza che:
 
-Il bot è passato da "pubblica e basta" a vero agente di crescita:
+- deriva da fonti persistite e ammissibili;
+- supera fact-check, scoring e controllo duplicati;
+- è stata approvata esplicitamente dalla chat Telegram autorizzata;
+- è dovuta per lo slot esatto e non è in pausa;
+- passa attraverso `Publisher`, in modo idempotente.
 
-- **Memoria a lungo termine** (`modules/database.py`, SQLite) - non ripete argomenti recenti
-- **Palinsesto settimanale + calendario eventi/stagionale** (`modules/content_scheduler.py`)
-- **Scoring pre-pubblicazione 0-40** con rigenerazione automatica (`modules/scoring.py`)
-- **Multi-agente + Editor** (Business/Fitness/Founder/Copywriter/Community) (`modules/ai_generator.py`)
-- **Persona founder** ("build in public") invece di "social media manager"
-- **Human mode**, thread generator, varianti A/B
-- **Opportunity Detector / CRM lead** a costo controllato (`modules/lead_finder.py`)
-- **Engagement mirato** su una lista curata di account con scoring influencer (`modules/engagement.py`)
-- **Performance analytics / auto-learning** sulle categorie che funzionano meglio (`modules/analytics.py`)
-- **Regole anti-spam** esplicite e **gestione dei costi X API 2026** (pay-per-use: letture ~$0.005,
-  post ~$0.015, post con link ~$0.20) tramite cicli a orario fisso invece di intervalli continui
+`DRY_RUN=true` mantiene aperto tutto il flusso fino al confine X, ma non crea tweet. Caricare una foto o un video registra soltanto un media disponibile: non crea una bozza.
 
-Configura i nuovi orari/soglie in `.env` (vedi `.env.example`) e la lista `TARGET_ACCOUNTS`
-per abilitare l'engagement mirato sugli account che ti interessano davvero.
+## Avvio locale
 
-## 🆕 Novità v3.1: character file
+Richiede Python 3.11 o compatibile, credenziali X, una chiave Groq e un bot Telegram con chat ID autorizzato.
 
-- **Persona/contesto in `character.json` (pattern "character file" alla Eliza/ai16z)**
-  — bio, background, knowledge, stile e agenti non sono più stringhe Python
-  hardcoded in `ai_generator.py`, ma vivono in un unico file dichiarativo alla
-  radice del repo: `character.json`. Per cambiare tono, aggiungere conoscenza
-  di dominio o modificare un agente, modifichi quel file, non il codice.
-  - Caricato/parsato da `modules/character.py` (nessuna nuova dipendenza).
-  - Se il file manca o è corrotto, il bot ricade su una persona minima di
-    default e continua a funzionare (non va mai in crash per questo).
-
-⚠️ **Nota modello Groq**: `mixtral-8x7b-32768` è stato rimosso da Groq. Il default è
-ora `openai/gpt-oss-120b` (configurabile via `GROQ_MODEL` in `.env`).
-
-## 🌍 Mercato: X in inglese, per il mercato internazionale
-
-Su decisione di Floriano, questo bot X è dedicato al **mercato internazionale**
-(gestori di palestre/boutique studio fuori dall'Italia): tutti i contenuti
-generati (tweet, thread, commenti, lead scoring) sono ora in **inglese**.
-Il mercato italiano resta presidiato via Instagram e visite di persona,
-fuori da questo bot. Questo è coerente con l'architettura reale di FlexDropin,
-che gestisce IVA condizionale e UI IT/EN in base al paese della palestra.
-
-Se in futuro vorrai riportare anche l'italiano su X (es. per gestori IT che
-usano anche X), la persona/i prompt sono centralizzati in
-`modules/ai_generator.py` (`FOUNDER_PERSONA`, `AGENTS`) e si possono
-duplicare per lingua senza toccare il resto dell'architettura.
-
-## ✨ Caratteristiche
-
-- 📰 **Fetching Notizie** - Recupera articoli da NewsAPI
-- 🧠 **Generazione AI** - Crea tweet e commenti con Groq (LLM avanzato)
-- 🐦 **Posting Automatico** - Pubblica tweet su X automaticamente
-- 💬 **Engagement Automatico** - Commenta, mette like e segue utenti
-- ⏰ **Scheduler** - Esecuzione automatica a intervalli configurabili
-- 📊 **Logging** - Monitora tutte le azioni in `bot.log`
-
-## 🚀 Quick Start
-
-### 1. Prerequisiti
-- Python 3.8+
-- Account X (Twitter) con accesso API
-- Account Groq (gratuito)
-- Account NewsAPI (gratuito)
-
-### 2. Ottieni le API Keys
-Segui la guida in **SETUP.md** per ottenere tutte le chiavi.
-
-### 3. Installazione
 ```bash
-git clone https://github.com/FloDev23/ai-x-bot.git
-cd ai-x-bot
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 4. Configurazione
-```bash
 cp .env.example .env
-# Edita .env con le tue API keys
-```
-
-### 5. Avvia il Bot
-```bash
+python -c "from config import validate_config; validate_config()"
 python main.py
 ```
 
-## 📖 Documentazione
+Lasciare `APPROVAL_REQUIRED=true`, `DRY_RUN=true` ed `ENABLE_LEAD_DISCOVERY=false` durante il rollout iniziale. `APPROVAL_REQUIRED=false` viene rifiutato all'avvio. NewsAPI è facoltativa finché `NEWS_TRUSTED_DOMAINS` resta vuota.
 
-Vedi **SETUP.md** per:
-- Guida dettagliata setup API keys
-- Installazione e configurazione
-- Troubleshooting
-- Opzioni di deploy 24/7
+La configurazione completa e la procedura VPS sono in [SETUP.md](SETUP.md).
 
-## 🛠️ Configurazione
+## Scheduler sicuro
 
-Modifica `.env` per personalizzare:
+Tutti i trigger usano `Europe/Rome` (o `BOT_TIMEZONE`) e il processo registra solo:
 
-```env
-# Topic da seguire
-SEARCH_TOPICS=AI,Machine Learning,Crypto,Tech
+- refresh news verificate alle 10:30;
+- creazione bozze alle 12:00 e 18:00 per gli slot 14:00 e 20:00;
+- tentativi di pubblicazione approvata alle 14:00 e 20:00;
+- discovery growth read-only alle 11:00;
+- snapshot follower alle 23:15;
+- metriche dei post propri alle 23:30;
+- report growth Telegram il lunedì alle 09:00.
 
-# Intervallo tra post (secondi)
-POST_INTERVAL=3600
+La discovery lead è secondaria e viene aggiunta solo con `ENABLE_LEAD_DISCOVERY=true`. Non esistono job di engagement automatico, human-mode o build-in-public.
 
-# Numero massimo di articoli da processare
-MAX_SEARCH_RESULTS=5
+Telegram long polling gira in un thread daemon nominato. Scheduler e polling condividono un `threading.Event` per lo shutdown ordinato.
 
-# Soglia minima di engagement per likeare
-LIKE_ENGAGEMENT_THRESHOLD=50
-```
+## Flusso quotidiano
 
-## 📁 Struttura Progetto
+1. Inserire da Telegram una fonte testuale e classificarla.
+2. Il planner prepara al massimo due bozze al giorno dagli slot configurati.
+3. Fact guard, scorer e duplicate gate rifiutano contenuti non sicuri.
+4. Il bot invia la card Telegram con anteprima e controlli.
+5. Solo il callback `Approva` della chat autorizzata porta la bozza in stato `approved`.
+6. Allo slot esatto `Publisher` verifica stato, pausa, scadenza e idempotenza.
+7. In dry-run restituisce `dry_run` senza invocare X.
 
-```
-ai-x-bot/
-├── main.py                    # Entry point del bot
-├── config.py                  # Configurazione centralizzata
-├── character.json             # Persona/contesto (bio, knowledge, stile, agenti)
-├── requirements.txt           # Dipendenze Python
-├── .env.example               # Template .env
-├── SETUP.md                   # Guida completa setup
-├── README.md                  # Questo file
-└── modules/
-    ├── __init__.py
-    ├── news_fetcher.py        # Fetching notizie
-    ├── ai_generator.py        # Generazione AI (legge character.json)
-    ├── character.py           # Loader di character.json
-    ├── twitter_client.py      # Client X/Twitter
-    └── engagement.py          # Engagement manager
-```
+I comandi Telegram includono `/status`, `/posts`, `/growth`, `/stats`, `/ideas`, `/pause`, `/resume`, `/errors` e `/help`.
 
-## 🔄 Come Funziona
+## Verifica
 
-### Ciclo di Posting
-1. Fetcha notizie da NewsAPI su topic configurati
-2. Genera tweet con AI (Groq)
-3. Pubblica su X
+La suite non richiede rete e usa boundary fake per X, Telegram, Groq e news:
 
-### Ciclo di Engagement
-1. Cerca tweet sui topic
-2. Commenta tweet con engagement alto
-3. Mette like e segue utenti
-
-## 💰 Costi
-
-**100% GRATUITO!**
-
-| Servizio | Prezzo | Limite |
-|----------|--------|--------|
-| Groq API | FREE | 14,400 token/min |
-| NewsAPI | FREE | 100 req/giorno |
-| X API | FREE | Basic tier |
-| **TOTALE** | **$0** | ✅ |
-
-## 🌐 Deploy 24/7
-
-### Railway (Gratuito)
-1. Vai a https://railway.app
-2. Connetti il repo GitHub
-3. Aggiungi variabili d'ambiente
-4. Deploy!
-
-### Render (Gratuito)
-1. Vai a https://render.com
-2. Crea "Background Worker"
-3. Connetti repo GitHub
-4. Deploy!
-
-## 📊 Monitoraggio
-
-Visualizza i log in tempo reale:
 ```bash
-tail -f bot.log
+venv/bin/python -m pytest -v
+venv/bin/python -m compileall -q main.py config.py modules dashboard
+git diff --check
 ```
 
-## 🐛 Troubleshooting
+Il test end-to-end è in `tests/test_end_to_end_dry_run.py` e prova fonte → bozza → approvazione Telegram → publish dry-run con zero scritture X/engagement, oltre all'upload media senza creazione bozza.
 
-### "Variabili d'ambiente mancanti"
-✅ Controlla il file `.env` e il file `.env.example`
+## Componenti principali
 
-### "Errore di autenticazione X"
-✅ Verifica che i token siano corretti (senza spazi)
-
-### "Groq API error"
-✅ Controlla la connessione internet e la validità della chiave
-
-## 🤝 Contributi
-
-Contributi sono benvenuti! Feel free to:
-- Segnalare bug
-- Proporre nuove feature
-- Fare pull request
-
-## 📝 Licenza
-
-MIT License - vedi LICENSE file
-
-## 🚀 Prossimi Step
-
-- [ ] Aggiungere database per tracking tweet
-- [ ] Aggiungi supporto per immagini
-- [ ] Migliora AI prompts
-- [ ] Aggiungi analytics dashboard
-- [ ] Supporto per video
-
-## 📞 Supporto
-
-Hai domande? Apri un issue su GitHub!
-
----
-
-**Fatto con ❤️ da FloDev23**
+- `main.py`: dependency injection, job allowlist, cicli e shutdown.
+- `modules/draft_pipeline.py`: generazione source-backed e gate editoriali.
+- `modules/telegram_controller.py`: autorizzazione, callback idempotenti e media intake.
+- `modules/publisher.py`: unico confine di scrittura X.
+- `modules/growth_discovery.py`: discovery follower read-only.
+- `modules/analytics.py`: snapshot, metriche proprie e report settimanale.
+- `modules/database.py`: persistenza SQLite concorrente e restart-safe.

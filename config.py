@@ -140,7 +140,7 @@ HUMAN_MODE_PROBABILITY = float(os.getenv('HUMAN_MODE_PROBABILITY', '0.15'))
 DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 
 def validate_config():
-    """Valida la configurazione al startup"""
+    """Validate the approval-only production boundary at startup."""
     required_keys = [
         'TWITTER_API_KEY',
         'TWITTER_API_SECRET',
@@ -148,12 +148,18 @@ def validate_config():
         'TWITTER_ACCESS_TOKEN_SECRET',
         'TWITTER_BEARER_TOKEN',
         'GROQ_API_KEY',
-        'NEWSAPI_KEY'
+        'TELEGRAM_BOT_TOKEN',
+        'TELEGRAM_CHAT_ID',
     ]
-    
+    if NEWS_TRUSTED_DOMAINS:
+        required_keys.append('NEWSAPI_KEY')
+
     missing_keys = [key for key in required_keys if not os.getenv(key)]
-    
+
     if missing_keys:
         raise ValueError(f"❌ Variabili d'ambiente mancanti: {', '.join(missing_keys)}")
-    
+
+    if APPROVAL_REQUIRED is not True:
+        raise ValueError("APPROVAL_REQUIRED must be true for this release")
+
     print("✅ Configurazione validata con successo!")
