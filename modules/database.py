@@ -3550,10 +3550,15 @@ class Database:
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             prior_run = conn.execute("""
-                SELECT captured_at, summary_json FROM follower_snapshot_runs
+                SELECT followers_total, captured_at, completed, summary_json
+                FROM follower_snapshot_runs
                 WHERE observed_on = ?
             """, (observed_on,)).fetchone()
-            if prior_run is not None and prior_run["captured_at"] >= observed_iso:
+            if (
+                prior_run is not None
+                and prior_run["completed"] == 1
+                and prior_run["captured_at"] >= observed_iso
+            ):
                 try:
                     summary = json.loads(prior_run["summary_json"])
                 except (TypeError, ValueError):
@@ -3567,6 +3572,20 @@ class Database:
                     "source_counts": {},
                     "follow_backs_by_source": {},
                 }
+            repaired_first_seen = {}
+            if prior_run is not None and prior_run["completed"] != 1:
+                repaired_first_seen = {
+                    row["user_id"]: row["first_seen_at"]
+                    for row in conn.execute("""
+                        SELECT user_id, first_seen_at FROM follower_snapshots
+                        WHERE observed_on = ?
+                    """, (observed_on,)).fetchall()
+                    if type(row["user_id"]) is str and row["user_id"]
+                }
+                conn.execute(
+                    "DELETE FROM follower_snapshots WHERE observed_on = ?",
+                    (observed_on,),
+                )
 
             summary = {
                 "followers_total": followers_total,
@@ -3620,22 +3639,49 @@ class Database:
                 """, (
                     observed_on, user_id, profile["username"], 1 if relevant else 0,
                     snapshot_source, attribution_source,
-                    json.dumps(profile, allow_nan=False), observed_iso,
+                    json.dumps(profile, allow_nan=False),
+                    repaired_first_seen.get(user_id, observed_iso),
                     1 if is_new else 0, observed_iso,
                 ))
                 followed_back = False
                 if is_new:
-                    cursor = conn.execute("""
-                        UPDATE growth_candidates SET followed_back_at = ?
-                        WHERE user_id = ? AND decision = 'followed_manually'
-                          AND followed_back_at IS NULL
-                          AND julianday(decision_at) IS NOT NULL
-                          AND julianday((SELECT first_seen_at
-                              FROM follower_snapshots
-                              WHERE observed_on = ? AND user_id = ?))
-                              > julianday(decision_at)
-                    """, (observed_iso, user_id, observed_on, user_id))
-                    followed_back = cursor.rowcount == 1
+                    conversion = conn.execute("""
+                        SELECT candidates.id, candidates.decision,
+                               candidates.decision_at,
+                               candidates.followed_back_at,
+                               snapshots.first_seen_at
+                        FROM growth_candidates AS candidates
+                        JOIN follower_snapshots AS snapshots
+                          ON snapshots.user_id = candidates.user_id
+                         AND snapshots.observed_on = ?
+                        WHERE candidates.user_id = ?
+                    """, (observed_on, user_id)).fetchone()
+                    if conversion is not None:
+                        first_seen_at = parse_growth_datetime(
+                            conversion["first_seen_at"]
+                        )
+                        decision_at = parse_growth_datetime(
+                            conversion["decision_at"]
+                        )
+                        if (
+                            conversion["decision"] == "followed_manually"
+                            and conversion["followed_back_at"] is None
+                            and first_seen_at is not None
+                            and decision_at is not None
+                            and first_seen_at > decision_at
+                        ):
+                            cursor = conn.execute("""
+                                UPDATE growth_candidates
+                                SET followed_back_at = ?
+                                WHERE id = ? AND user_id = ?
+                                  AND decision = 'followed_manually'
+                                  AND decision_at = ?
+                                  AND followed_back_at IS NULL
+                            """, (
+                                observed_iso, conversion["id"], user_id,
+                                conversion["decision_at"],
+                            ))
+                            followed_back = cursor.rowcount == 1
                 if is_new:
                     summary["new_total"] += 1
                     if relevant:
@@ -3768,30 +3814,23 @@ class Database:
         with self._conn() as conn:
             latest_run = conn.execute("""
                 SELECT followers_total FROM follower_snapshot_runs
-                WHERE observed_on <= ?
+                WHERE observed_on <= ? AND completed = 1
                 ORDER BY observed_on DESC
                 LIMIT 1
             """, (end_on,)).fetchone()
-            latest = conn.execute("""
-                SELECT MAX(observed_on) AS observed_on
-                FROM follower_snapshots
-                WHERE observed_on <= ?
-            """, (end_on,)).fetchone()
-            latest_on = latest["observed_on"] if latest else None
             followers_total = (
                 latest_run["followers_total"] if latest_run else 0
             )
-            if latest_run is None and type(latest_on) is str:
-                row = conn.execute("""
-                    SELECT COUNT(*) AS count
-                    FROM follower_snapshots WHERE observed_on = ?
-                """, (latest_on,)).fetchone()
-                followers_total = row["count"] if row else 0
 
             new_rows = conn.execute("""
-                SELECT relevant, attribution_source
-                FROM follower_snapshots
-                WHERE observed_on >= ? AND observed_on <= ? AND is_new = 1
+                SELECT snapshots.relevant, snapshots.attribution_source
+                FROM follower_snapshots AS snapshots
+                JOIN follower_snapshot_runs AS runs
+                  ON runs.observed_on = snapshots.observed_on
+                 AND runs.completed = 1
+                WHERE snapshots.observed_on >= ?
+                  AND snapshots.observed_on <= ?
+                  AND snapshots.is_new = 1
             """, (start_on, end_on)).fetchall()
             new_followers = len(new_rows)
             new_relevant_followers = sum(

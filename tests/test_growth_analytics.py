@@ -158,6 +158,35 @@ def _capture_worker(db_path, start_event, result_queue):
         result_queue.put({"error": f"{type(error).__name__}: {error}"})
 
 
+def _seed_legacy_follower_run(db_path, profile, captured_at=NOW):
+    database = Database(db_path)
+    observed_on = captured_at.date().isoformat()
+    with database._conn() as conn:
+        conn.execute("DROP TABLE follower_snapshot_runs")
+        conn.execute("""
+            CREATE TABLE follower_snapshot_runs (
+                observed_on TEXT PRIMARY KEY,
+                followers_total INTEGER NOT NULL,
+                captured_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO follower_snapshot_runs VALUES (?, ?, ?)",
+            (observed_on, 999, captured_at.isoformat()),
+        )
+        conn.execute("""
+            INSERT INTO follower_snapshots (
+                observed_on, user_id, username, relevant, source,
+                attribution_source, profile_json, first_seen_at,
+                is_new, captured_at
+            ) VALUES (?, ?, ?, 1, 'legacy', 'legacy', ?, ?, 1, ?)
+        """, (
+            observed_on, profile["id"], profile["username"],
+            json.dumps(profile), captured_at.isoformat(), captured_at.isoformat(),
+        ))
+    return observed_on
+
+
 class _HardCrashDatabase(Database):
     @contextmanager
     def _conn(self):
@@ -314,6 +343,158 @@ def test_hard_crash_rolls_back_rows_conversion_and_run_then_retry_matches_report
     ]
 
 
+def test_legacy_run_migration_is_nonfinal_until_atomic_repair_and_replay(tmp_path):
+    db_path = str(tmp_path / "legacy-run.db")
+    legacy = follower_profile("710", "legacy_owner")
+    observed_on = _seed_legacy_follower_run(db_path, legacy)
+
+    migrated = Database(db_path)
+    before = PerformanceAnalyzer(FollowerX([]), migrated).build_weekly_report(
+        date.fromisoformat(observed_on),
+    )
+    with migrated._conn() as conn:
+        marker = conn.execute(
+            "SELECT * FROM follower_snapshot_runs WHERE observed_on = ?",
+            (observed_on,),
+        ).fetchone()
+    assert marker["completed"] == 0
+    assert marker["summary_json"] == "{}"
+    assert before["followers_total"] == 0
+    assert before["new_followers"] == 0
+
+    repaired = PerformanceAnalyzer(FollowerX([legacy]), migrated)
+    summary = repaired.capture_follower_snapshot(NOW)
+    restarted = PerformanceAnalyzer(FollowerX([legacy]), Database(db_path))
+    replay = restarted.capture_follower_snapshot(NOW)
+    report = restarted.build_weekly_report(date.fromisoformat(observed_on))
+
+    assert summary == replay == {
+        "followers_total": 1,
+        "new_total": 1,
+        "new_relevant": 0,
+        "source_counts": {"unattributed": 1},
+        "follow_backs_by_source": {},
+    }
+    assert report["followers_total"] == 1
+    assert report["new_followers"] == 1
+    with migrated._conn() as conn:
+        marker = conn.execute(
+            "SELECT completed, followers_total, summary_json "
+            "FROM follower_snapshot_runs WHERE observed_on = ?",
+            (observed_on,),
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT user_id FROM follower_snapshots WHERE observed_on = ?",
+            (observed_on,),
+        ).fetchall()
+    assert marker["completed"] == 1
+    assert marker["followers_total"] == 1
+    assert json.loads(marker["summary_json"]) == summary
+    assert [row["user_id"] for row in rows] == ["710"]
+
+
+def test_concurrent_legacy_repair_has_one_completed_transition(tmp_path):
+    db_path = str(tmp_path / "legacy-concurrent.db")
+    profile = follower_profile("700", "concurrentown")
+    _seed_legacy_follower_run(db_path, profile)
+    migrated = Database(db_path)
+    with migrated._conn() as conn:
+        conn.execute("CREATE TABLE repair_audit (id INTEGER PRIMARY KEY)")
+        conn.execute("""
+            CREATE TRIGGER count_completed_repair
+            AFTER UPDATE OF completed ON follower_snapshot_runs
+            WHEN OLD.completed = 0 AND NEW.completed = 1
+            BEGIN INSERT INTO repair_audit (id) VALUES (NULL); END
+        """)
+    ctx = multiprocessing.get_context("spawn")
+    start_event = ctx.Event()
+    result_queue = ctx.Queue()
+    processes = [
+        ctx.Process(target=_capture_worker, args=(db_path, start_event, result_queue))
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    for process in processes:
+        process.join(timeout=20)
+        assert process.exitcode == 0
+    results = [result_queue.get(timeout=5) for _process in processes]
+
+    assert results[0] == results[1]
+    assert results[0]["new_total"] == 1
+    with Database(db_path)._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM repair_audit").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT completed FROM follower_snapshot_runs"
+        ).fetchone()[0] == 1
+
+
+def test_hard_crash_during_legacy_repair_keeps_marker_nonfinal_and_report_empty(
+    tmp_path,
+):
+    db_path = str(tmp_path / "legacy-crash.db")
+    legacy = follower_profile("710", "legacy_owner")
+    observed_on = _seed_legacy_follower_run(db_path, legacy)
+    database = Database(db_path)
+    with database._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER task11_crash_on_second_follower
+            BEFORE INSERT ON follower_snapshots
+            WHEN NEW.user_id = '502'
+            BEGIN SELECT task11_hard_crash(); END
+        """)
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(target=_hard_crash_capture_worker, args=(db_path,))
+    process.start()
+    process.join(timeout=20)
+
+    assert process.exitcode == 73
+    restarted = Database(db_path)
+    report = PerformanceAnalyzer(FollowerX([]), restarted).build_weekly_report(
+        date.fromisoformat(observed_on),
+    )
+    with restarted._conn() as conn:
+        marker = conn.execute(
+            "SELECT completed, followers_total FROM follower_snapshot_runs"
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT user_id FROM follower_snapshots ORDER BY user_id"
+        ).fetchall()
+    assert dict(marker) == {"completed": 0, "followers_total": 999}
+    assert [row["user_id"] for row in rows] == ["710"]
+    assert report["followers_total"] == 0
+    assert report["new_followers"] == 0
+
+
+def test_legacy_repair_preserves_first_seen_before_manual_decision(tmp_path):
+    db_path = str(tmp_path / "legacy-first-seen.db")
+    profile = follower_profile("711", "legacy_first")
+    observed_on = _seed_legacy_follower_run(db_path, profile)
+    database = Database(db_path)
+    candidate_id = add_candidate(database, profile, source="network")
+    assert database.mark_candidate_decision(
+        candidate_id,
+        "followed_manually",
+        decided_at=NOW + timedelta(hours=1),
+    )
+
+    summary = PerformanceAnalyzer(
+        FollowerX([profile]), database,
+    ).capture_follower_snapshot(NOW + timedelta(hours=2))
+
+    candidate = database.get_growth_candidate(profile["id"])
+    assert candidate["followed_back_at"] is None
+    assert summary["follow_backs_by_source"] == {}
+    with database._conn() as conn:
+        snapshot = conn.execute(
+            "SELECT first_seen_at FROM follower_snapshots "
+            "WHERE observed_on = ? AND user_id = ?",
+            (observed_on, profile["id"]),
+        ).fetchone()
+    assert snapshot["first_seen_at"] == NOW.isoformat()
+
+
 @pytest.mark.parametrize(
     ("first_seen", "expected_conversion"),
     [
@@ -362,6 +543,80 @@ def test_task10_preobservation_uses_preserved_first_seen_for_strict_attribution(
             (profile["id"],),
         ).fetchone()
     assert snapshot["first_seen_at"] == stored_first_seen
+
+
+@pytest.mark.parametrize(
+    ("user_id", "first_seen_at", "decision_at", "expected_conversion"),
+    [
+        ("720", "2026-08-10T12:30:00+02:00", "2026-08-10T10:00:00+00:00", True),
+        ("721", "2026-08-10T12:00:00+02:00", "2026-08-10T10:00:00+00:00", False),
+        ("722", "2026-08-10T10:30:00", "2026-08-10T10:00:00+00:00", False),
+        ("723", "malformed", "2026-08-10T10:00:00+00:00", False),
+        ("724", "2026-08-10T10:30:00+00:00", "2026-08-10T10:00:00", False),
+        ("725", "2026-08-10T10:30:00+00:00", "malformed", False),
+        ("726", "2026-08-10T10:30:00+00:00", "2026-08-10T11:00:00+00:00", False),
+    ],
+)
+def test_followback_requires_strict_aware_iso_order_revalidated_in_transaction(
+    tmp_path, user_id, first_seen_at, decision_at, expected_conversion,
+):
+    profile = follower_profile(user_id, f"strict{user_id}")
+    database = Database(str(tmp_path / f"strict-{user_id}.db"))
+    candidate_id = add_candidate(database, profile, source="network")
+    assert database.mark_candidate_decision(
+        candidate_id, "followed_manually", decided_at=NOW - timedelta(hours=1),
+    )
+    assert database.save_follower_snapshot(
+        NOW.date().isoformat(), profile, relevant=True, source="task10",
+    )
+    with database._conn() as conn:
+        conn.execute(
+            "UPDATE follower_snapshots SET first_seen_at = ? WHERE user_id = ?",
+            (first_seen_at, profile["id"]),
+        )
+        conn.execute(
+            "UPDATE growth_candidates SET decision_at = ? WHERE id = ?",
+            (decision_at, candidate_id),
+        )
+
+    summary = PerformanceAnalyzer(FollowerX([profile]), database).capture_follower_snapshot(
+        NOW,
+    )
+
+    candidate = database.get_growth_candidate(profile["id"])
+    assert (candidate["followed_back_at"] is not None) is expected_conversion
+    assert summary["follow_backs_by_source"] == (
+        {"network": 1} if expected_conversion else {}
+    )
+
+
+def test_followback_reloads_timestamp_values_changed_inside_capture_transaction(
+    tmp_path,
+):
+    profile = follower_profile("799", "trigger_owner")
+    database = Database(str(tmp_path / "timestamp-trigger.db"))
+    candidate_id = add_candidate(database, profile, source="network")
+    assert database.mark_candidate_decision(
+        candidate_id, "followed_manually", decided_at=NOW - timedelta(hours=1),
+    )
+    with database._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER make_decision_timestamp_naive
+            AFTER INSERT ON follower_snapshots
+            WHEN NEW.user_id = '799'
+            BEGIN
+                UPDATE growth_candidates
+                SET decision_at = '2026-08-10T09:00:00'
+                WHERE user_id = NEW.user_id;
+            END
+        """)
+
+    summary = PerformanceAnalyzer(FollowerX([profile]), database).capture_follower_snapshot(
+        NOW,
+    )
+
+    assert database.get_growth_candidate(profile["id"])["followed_back_at"] is None
+    assert summary["follow_backs_by_source"] == {}
 
 
 def test_same_day_older_and_equal_captures_are_idempotent_and_monotonic(tmp_path):

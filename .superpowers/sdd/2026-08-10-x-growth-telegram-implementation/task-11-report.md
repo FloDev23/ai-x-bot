@@ -186,3 +186,58 @@ Verification:
 - Task 10/11, Telegram and X-safety suite → `357 passed, 1 warning`.
 - Full suite → `598 passed, 1 warning` (pre-existing Tweepy `imghdr` warning).
 - `py_compile` and `git diff --check` passed. `progress.md` remains unchanged.
+
+## Fix round 2
+
+- Reviewed base SHA: `c04e48ce85a1847cc7c801ba838746fa0859e3e4`.
+- Commit: `fix: repair legacy follower analytics`.
+
+Legacy `follower_snapshot_runs` rows that receive the additive migration
+defaults `completed=0` and `summary_json='{}'` are now explicitly nonfinal.
+Weekly reports read follower totals and new-follower rows only from runs with
+`completed=1`. A later complete capture repairs an incomplete day inside the
+existing `BEGIN IMMEDIATE` transaction: it rebuilds the day's snapshot rows,
+summary and marker, and only the committed transaction transitions the marker
+to `completed=1`. Concurrent repair has one transition, and a process hard
+crash rolls the deleted legacy rows, conversions and marker update back
+together.
+
+Repair preserves each legacy row's original `first_seen_at` before rebuilding
+the complete day. This prevents the repair time from replacing the actual
+first observation and creating a false manual-follow conversion. Conversion
+then reloads `first_seen_at`, `decision_at`, decision state and prior conversion
+state after the snapshot upsert in the same write transaction. Both timestamps
+must pass the shared Python parser as exact strings with timezone-aware ISO
+values, and conversion requires the normalized instant
+`first_seen_at > decision_at`. Naive, malformed, equal and earlier timestamps
+fail closed. The guarded update revalidates candidate identity, decision,
+exact stored decision timestamp and the still-null conversion state.
+
+TDD evidence:
+
+- The round-2 regression tests were overlaid on an isolated archive of the
+  required base and produced `6 failed, 5 passed, 38 deselected`; failures
+  covered legacy report admission/repair and naive timestamp attribution.
+- The same reviewer regression selection on the working implementation then
+  produced `11 passed, 38 deselected`.
+- Self-review added a repair-specific first-observation regression. Its RED
+  showed `followed_back_at='2026-08-10T12:00:00+00:00'` instead of `None`;
+  after preserving the legacy timestamp it produced `1 passed`.
+- The complete round-2 selection produced `12 passed, 38 deselected`.
+
+Final verification:
+
+- Task 11: `50 passed in 1.08s`.
+- Task 10/11, Telegram and X-safety focused suite:
+  `369 passed, 1 warning in 5.37s`.
+- Full suite: `610 passed, 1 warning in 8.13s`.
+- The sole warning remains Tweepy's pre-existing `imghdr` deprecation.
+- `py_compile` exited zero; `pip check` reported no broken requirements.
+- Staged and unstaged whitespace checks exited zero.
+- The production/test file set is exactly `modules/database.py` and
+  `tests/test_growth_analytics.py`; this report was also updated and
+  `progress.md` was not modified.
+- No live X, Telegram, Groq or News request was made, and no scheduler or X
+  mutation was added. An additional review agent was requested but could not
+  start because the task-thread limit was already occupied; the implementation
+  received a local diff/spec self-review instead.
