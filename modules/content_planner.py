@@ -23,6 +23,10 @@ SOURCE_TYPES = {
     "founder_journey": {"founder_note"},
 }
 
+SUPPORT_SOURCE_TYPES = {
+    "gym_strategy": {"product_fact"},
+}
+
 
 @dataclass(frozen=True)
 class ContentPlan:
@@ -64,7 +68,8 @@ class ContentPlanner:
             return None
 
         counts = self.database.get_content_mix_counts(days=30)
-        sources_by_category = self._eligible_sources_by_category()
+        sources = self.database.get_eligible_sources()
+        sources_by_category = self._eligible_sources_by_category(sources)
         eligible_categories = [
             category for category in PORTFOLIO if sources_by_category[category]
         ]
@@ -79,15 +84,26 @@ class ContentPlanner:
             category == "product_proof"
             and self.database.count_links_last_days(7) < 1
         )
+        selected_sources = list(sources_by_category[category])
+        support_types = SUPPORT_SOURCE_TYPES.get(category, set())
+        selected_ids = {source["id"] for source in selected_sources}
+        selected_sources.extend(
+            source for source in sources
+            if source.get("source_type") in support_types
+            and source["id"] not in selected_ids
+        )
         return ContentPlan(
             category=category,
-            source_ids=[source["id"] for source in sources_by_category[category]],
+            source_ids=[source["id"] for source in selected_sources],
             intended_slot=intended_slot,
             include_link=include_link,
         )
 
-    def _eligible_sources_by_category(self) -> Dict[str, List[Dict]]:
-        sources = self.database.get_eligible_sources()
+    def _eligible_sources_by_category(
+        self,
+        sources: Optional[List[Dict]] = None,
+    ) -> Dict[str, List[Dict]]:
+        sources = self.database.get_eligible_sources() if sources is None else sources
         return {
             category: [
                 source for source in sources
