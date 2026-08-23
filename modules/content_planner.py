@@ -23,11 +23,6 @@ SOURCE_TYPES = {
     "founder_journey": {"founder_note"},
 }
 
-SUPPORT_SOURCE_TYPES = {
-    "gym_strategy": {"product_fact"},
-}
-
-
 @dataclass(frozen=True)
 class ContentPlan:
     category: str
@@ -84,17 +79,9 @@ class ContentPlanner:
             category == "product_proof"
             and self.database.count_links_last_days(7) < 1
         )
-        selected_sources = list(sources_by_category[category])
-        support_types = SUPPORT_SOURCE_TYPES.get(category, set())
-        selected_ids = {source["id"] for source in selected_sources}
-        selected_sources.extend(
-            source for source in sources
-            if source.get("source_type") in support_types
-            and source["id"] not in selected_ids
-        )
         return ContentPlan(
             category=category,
-            source_ids=[source["id"] for source in selected_sources],
+            source_ids=[source["id"] for source in sources_by_category[category]],
             intended_slot=intended_slot,
             include_link=include_link,
         )

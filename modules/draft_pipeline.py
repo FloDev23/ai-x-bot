@@ -198,7 +198,12 @@ class DraftPipeline:
             return None
         if len(text) > 280:
             try:
-                text = self.generator.rewrite_to_limit(text, sources, 280)
+                text = self.generator.rewrite_to_limit(
+                    text,
+                    sources,
+                    280,
+                    category=category,
+                )
             except Exception:
                 self._record(
                     slot_iso,

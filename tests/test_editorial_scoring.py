@@ -63,6 +63,31 @@ def test_long_grounded_generation_uses_complete_rewrite(fake_ai):
     assert len(result["text"]) <= 280
 
 
+def test_long_grounded_generation_keeps_category_instruction_during_rewrite(fake_ai):
+    prompts = []
+
+    def complete(_system_prompt, user_prompt, **_kwargs):
+        prompts.append(" ".join(user_prompt.split()))
+        if len(prompts) == 1:
+            return "Long sentence. " * 30
+        return "Useful standalone advice for operators."
+
+    fake_ai._complete = complete
+
+    result = fake_ai.generate_grounded_tweet(
+        "gym_strategy",
+        [{"id": 1, "source_type": "evergreen_idea", "text": "Useful idea."}],
+        include_link=False,
+    )
+
+    assert result["text"] == "Useful standalone advice for operators."
+    assert len(prompts) == 2
+    assert all(
+        "Do not mention FlexDropin or describe its features" in prompt
+        for prompt in prompts
+    )
+
+
 def test_grounded_generation_fails_when_rewrite_fails(fake_ai):
     fake_ai.responses = ["Long sentence. " * 30, "Still incomplete"]
     assert fake_ai.generate_grounded_tweet("gym_strategy", [], include_link=False) is None
@@ -95,6 +120,7 @@ def test_grounded_generation_targets_the_editorial_score_axes(fake_ai):
     assert result["text"] == "A sharp, grounded post."
     assert "fitness business expert" in captured["system"]
     normalized_prompt = " ".join(captured["user"].split())
+    assert "Do not mention FlexDropin or describe its features" in normalized_prompt
     for requirement in (
         "strong non-clickbait opening",
         "concrete actionable takeaway",
@@ -103,6 +129,25 @@ def test_grounded_generation_targets_the_editorial_score_axes(fake_ai):
         "worth following",
     ):
         assert requirement in normalized_prompt
+
+
+def test_product_proof_prompt_requires_direct_product_fact_support(fake_ai):
+    captured = {}
+
+    def complete(_system_prompt, user_prompt, **_kwargs):
+        captured["user"] = user_prompt
+        return "A directly supported product post."
+
+    fake_ai._complete = complete
+
+    fake_ai.generate_grounded_tweet(
+        "product_proof",
+        [{"id": 8, "source_type": "product_fact", "text": "Verified fact."}],
+        include_link=False,
+    )
+
+    normalized_prompt = " ".join(captured["user"].split())
+    assert "directly supported by a product_fact" in normalized_prompt
 
 
 def test_claim_analysis_requires_strict_structured_json(fake_ai):

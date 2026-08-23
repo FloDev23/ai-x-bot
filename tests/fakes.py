@@ -120,7 +120,7 @@ class FakeGroundedGenerator:
     def generate_grounded_tweet(self, _category, _sources, _include_link):
         return {"text": self.text}
 
-    def rewrite_to_limit(self, _text, _sources, limit=280):
+    def rewrite_to_limit(self, _text, _sources, limit=280, category=None):
         return self.text if len(self.text) <= limit else None
 
     def analyze_claims(self, text, sources):

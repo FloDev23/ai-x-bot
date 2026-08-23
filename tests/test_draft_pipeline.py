@@ -277,8 +277,8 @@ class FakeGenerator:
             "raw_reasoning": "must never be persisted",
         }
 
-    def rewrite_to_limit(self, text, sources, limit):
-        self.rewrites.append((text, sources, limit))
+    def rewrite_to_limit(self, text, sources, limit, category=None):
+        self.rewrites.append((text, sources, limit, category))
         if self.raise_rewrite:
             raise RuntimeError("private model payload")
         return self.rewrite_result
@@ -500,6 +500,7 @@ def test_overlong_copy_is_completely_rewritten_before_fact_gate(pipeline_parts):
 
     assert draft["text"] == "A complete grounded rewrite."
     assert generator.rewrites[0][2] == 280
+    assert generator.rewrites[0][3] == "gym_strategy"
     assert guard.calls[0][0] == "A complete grounded rewrite."
     assert scorer.calls == ["A complete grounded rewrite."]
 

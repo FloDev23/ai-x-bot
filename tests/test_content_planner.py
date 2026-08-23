@@ -52,7 +52,7 @@ def test_planner_uses_largest_deficit_among_categories_with_sources(fake_db):
     assert plan.include_link is False
 
 
-def test_gym_strategy_includes_verified_product_facts_as_claim_support(fake_db):
+def test_gym_strategy_does_not_mix_in_product_proof_sources(fake_db):
     fake_db.content_counts = {}
     fake_db.sources = [
         {"id": 7, "source_type": "evergreen_idea"},
@@ -63,7 +63,7 @@ def test_gym_strategy_includes_verified_product_facts_as_claim_support(fake_db):
     plan = planner.plan(datetime(2026, 8, 11, 14, 0, tzinfo=ROME))
 
     assert plan.category == "gym_strategy"
-    assert plan.source_ids == [7, 8]
+    assert plan.source_ids == [7]
 
 
 def test_product_proof_gets_link_only_below_weekly_cap(fake_db):

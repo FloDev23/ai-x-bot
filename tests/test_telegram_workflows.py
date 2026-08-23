@@ -33,7 +33,7 @@ class CopyGenerator:
         self.rewritten = rewritten
         self.rewrite_calls = []
 
-    def rewrite_to_limit(self, text, sources, limit):
+    def rewrite_to_limit(self, text, sources, limit, category=None):
         self.rewrite_calls.append((text, sources, limit))
         return self.rewritten
 
