@@ -146,7 +146,8 @@ class FakeGroundedGenerator:
 
 
 class FakeEditorialScorer:
-    def score_draft(self, _text):
+    def score_draft(self, _text, sources=None, recent_texts=None):
+        del sources, recent_texts
         return {
             "hook": 9,
             "usefulness": 9,

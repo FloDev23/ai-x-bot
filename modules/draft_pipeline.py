@@ -255,8 +255,23 @@ class DraftPipeline:
             )
             return None
 
+        if exclude_draft_id is None:
+            recent_texts = self.db.get_recent_content_texts(
+                days=30,
+                now=self.now_fn(),
+            )
+        else:
+            recent_texts = self.db.get_recent_content_texts(
+                days=30,
+                exclude_draft_id=exclude_draft_id,
+                now=self.now_fn(),
+            )
         try:
-            score = self.scorer.score_draft(text)
+            score = self.scorer.score_draft(
+                text,
+                sources=sources,
+                recent_texts=recent_texts,
+            )
         except Exception:
             self._record(
                 slot_iso,
@@ -283,17 +298,6 @@ class DraftPipeline:
             )
             return None
 
-        if exclude_draft_id is None:
-            recent_texts = self.db.get_recent_content_texts(
-                days=30,
-                now=self.now_fn(),
-            )
-        else:
-            recent_texts = self.db.get_recent_content_texts(
-                days=30,
-                exclude_draft_id=exclude_draft_id,
-                now=self.now_fn(),
-            )
         for previous in recent_texts:
             if not isinstance(previous, str):
                 continue

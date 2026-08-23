@@ -97,8 +97,13 @@ def _source_instruction(sources: List[Dict]) -> str:
         return (
             "When SOURCE_BUNDLE contains verified_news, use at least one exact "
             "concrete fact from the most recent verified_news and attribute it "
-            "to its source_name. Do not extrapolate causal or commercial outcomes "
-            "that the source does not state."
+            "to its source_name. Privately compare three distinct grounded angles "
+            "and publish only the strongest one. Prefer a sharp contrast, trend, "
+            "or operator-relevant question supported by the data. Do not prescribe "
+            "prices, capacity, staffing, revenue, retention or operational changes "
+            "unless the source explicitly states them. Do not extrapolate causal "
+            "or commercial outcomes. Make usefulness come from what operators "
+            "should notice, measure or question, not an invented tactic."
         )
     return "Use only the source details needed for one focused idea."
 

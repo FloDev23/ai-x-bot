@@ -172,7 +172,8 @@ class _ApprovedGuard:
 
 
 class _PassingScorer:
-    def score_draft(self, _text):
+    def score_draft(self, _text, sources=None, recent_texts=None):
+        del sources, recent_texts
         return {"total": 90}
 
 

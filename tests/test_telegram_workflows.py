@@ -53,7 +53,8 @@ class Scorer:
         self.total = total
         self.calls = []
 
-    def score_draft(self, text):
+    def score_draft(self, text, sources=None, recent_texts=None):
+        del sources, recent_texts
         self.calls.append(text)
         return {"clarity": 18, "total": self.total}
 

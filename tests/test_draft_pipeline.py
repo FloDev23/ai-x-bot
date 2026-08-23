@@ -303,9 +303,11 @@ class FakeScorer:
         self.result = {"total": 88, "hook": 9}
         self.raise_score = False
         self.calls = []
+        self.contexts = []
 
-    def score_draft(self, text):
+    def score_draft(self, text, sources=None, recent_texts=None):
         self.calls.append(text)
+        self.contexts.append((sources, recent_texts))
         if self.raise_score:
             raise RuntimeError("secret scoring payload")
         return self.result
@@ -340,6 +342,18 @@ def test_low_score_skips_slot_and_records_only_scores(pipeline_parts):
     assert database.evaluations[-1]["details"] == {
         "scores": {"total": 74, "hook": 7}
     }
+
+
+def test_scorer_receives_verified_sources_and_recent_copy(pipeline_parts):
+    pipeline, database, _, _, _, scorer = pipeline_parts
+    database.recent_texts = ["A different recent gym-operator post."]
+
+    assert pipeline.create_for_slot(database.next_slot) is not None
+
+    assert scorer.contexts == [(
+        [database.sources[7]],
+        database.recent_texts,
+    )]
 
 
 def test_fact_failure_skips_slot_and_records_reason_codes(pipeline_parts):
