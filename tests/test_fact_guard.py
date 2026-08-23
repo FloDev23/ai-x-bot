@@ -114,6 +114,33 @@ def test_supported_number_abbreviations_match_source_content():
     assert result.approved is True
 
 
+def test_italian_number_words_support_english_post_abbreviations():
+    source = {
+        "id": 8,
+        "source_type": "verified_news",
+        "trust_state": "verified",
+        "text": (
+            "Nel 2025, 81 milioni di americani erano iscritti, oltre 100 "
+            "milioni usavano le strutture e gli iscritti sono cresciuti "
+            "del 5,2 percento."
+        ),
+    }
+    analyzer = ClaimAnalyzer([
+        {
+            "type": "number",
+            "text": "81M members, 100M+ users, up 5.2% in 2025",
+            "supported_by": [8],
+        },
+    ])
+
+    result = FactGuard(analyzer).check(
+        "81M members, 100M+ users, up 5.2% in 2025.",
+        [source],
+    )
+
+    assert result.approved is True
+
+
 def test_negative_number_cannot_be_authorized_by_positive_source_value():
     source = {
         "id": 8,

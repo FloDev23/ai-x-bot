@@ -28,17 +28,22 @@ _NUMBER_RE = re.compile(
     r"(?<![\w])"
     r"(?P<sign>[+\-\u2212])?"
     r"(?P<value>\d+(?:[.,]\d+)?)"
-    r"(?:[\s\u00a0\u202f]*(?P<scale>[KMB]|(?i:thousand|million|billion))\b)?"
-    r"[\s\u00a0\u202f]*(?P<percent>%|(?i:percent)\b)?",
+    r"(?:[\s\u00a0\u202f]*(?P<scale>[KMB]|(?i:thousand|million|billion|mila|milione|milioni|miliardo|miliardi))\b)?"
+    r"[\s\u00a0\u202f]*(?P<percent>%|(?i:percent|percento)\b)?",
 )
 _RANGE_SEPARATOR_RE = re.compile(r"[\s\u00a0\u202f]*[-\u2013\u2014][\s\u00a0\u202f]*")
 _NUMBER_SCALES = {
     "k": "k",
     "thousand": "k",
+    "mila": "k",
     "m": "m",
     "million": "m",
+    "milione": "m",
+    "milioni": "m",
     "b": "b",
     "billion": "b",
+    "miliardo": "b",
+    "miliardi": "b",
 }
 
 INCIDENT_SUBTYPES = frozenset({
