@@ -35,6 +35,7 @@ from modules.growth_candidate_schema import (
     is_json_safe_mapping,
     parse_growth_datetime,
 )
+from modules.source_validation import is_complete_verified_news
 
 logger = logging.getLogger(__name__)
 
@@ -912,9 +913,15 @@ class Database:
                     return []
                 if expires_at <= current:
                     return []
-            eligible.append(
-                self._decode_json_fields(row, {"metadata_json": "metadata"})
+            source = self._decode_json_fields(
+                row, {"metadata_json": "metadata"},
             )
+            if (
+                source.get("source_type") == "verified_news"
+                and not is_complete_verified_news(source)
+            ):
+                return []
+            eligible.append(source)
         return eligible
 
     def get_eligible_content_sources(
@@ -955,9 +962,15 @@ class Database:
         for row in rows:
             if row["expires_at"] and self._parse_datetime(row["expires_at"]) <= current:
                 continue
-            eligible.append(
-                self._decode_json_fields(row, {"metadata_json": "metadata"})
+            source = self._decode_json_fields(
+                row, {"metadata_json": "metadata"},
             )
+            if (
+                source.get("source_type") == "verified_news"
+                and not is_complete_verified_news(source)
+            ):
+                continue
+            eligible.append(source)
         return eligible
 
     def content_source_exists(self, url: str) -> bool:

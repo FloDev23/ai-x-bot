@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from datetime import timezone
 
 from modules.database import Database
+from modules.source_validation import is_complete_verified_news
 
 
 def test_schema_migration_preserves_existing_posts(tmp_path):
@@ -23,6 +24,65 @@ def test_expired_product_fact_is_not_eligible(tmp_path):
     )
     assert source_id > 0
     assert db.get_eligible_sources(source_type="product_fact") == []
+
+
+def test_incomplete_verified_news_is_not_eligible_for_planning(tmp_path):
+    db = Database(str(tmp_path / "news.db"))
+    base_metadata = {
+        "title": "Official report",
+        "summary": "Official industry statistic.",
+        "published_at": "2026-04-09",
+        "source_name": "Health & Fitness Association",
+    }
+    valid_id = db.add_content_source(
+        source_type="verified_news",
+        text="Official industry statistic.",
+        url="https://www.healthandfitness.org/report",
+        metadata=base_metadata,
+        trust_state="verified",
+        verified_by="floriano",
+    )
+    for invalid_name in (None, "", 7):
+        db.add_content_source(
+            source_type="verified_news",
+            text="Official industry statistic.",
+            url="https://www.healthandfitness.org/report-invalid",
+            metadata={**base_metadata, "source_name": invalid_name},
+            trust_state="verified",
+            verified_by="floriano",
+        )
+    invalid_ids = []
+    for invalid_url in (
+        "https://[",
+        "https://[]",
+        "https://example.com:bad/report",
+        "https://example.com:99999/report",
+        "https://user:pass@example.com/report",
+        "https://example .com/report",
+        "https://example.com../report",
+    ):
+        malformed = {
+            "source_type": "verified_news",
+            "trust_state": "verified",
+            "text": "Official industry statistic.",
+            "url": invalid_url,
+            "metadata": base_metadata,
+        }
+        assert is_complete_verified_news(malformed) is False
+        invalid_ids.append(db.add_content_source(
+            source_type="verified_news",
+            text=malformed["text"],
+            url=invalid_url,
+            metadata=base_metadata,
+            trust_state="verified",
+            verified_by="floriano",
+        ))
+
+    eligible = db.get_eligible_sources(source_type="verified_news")
+
+    assert [source["id"] for source in eligible] == [valid_id]
+    for invalid_id in invalid_ids:
+        assert db.get_eligible_content_sources([invalid_id]) == []
 
 
 def test_draft_transition_is_compare_and_swap(tmp_path):

@@ -150,6 +150,67 @@ def test_product_proof_prompt_requires_direct_product_fact_support(fake_ai):
     assert "directly supported by a product_fact" in normalized_prompt
 
 
+def test_verified_news_must_anchor_generation_and_rewrite(fake_ai):
+    prompts = []
+
+    def complete(_system_prompt, user_prompt, **_kwargs):
+        prompts.append(" ".join(user_prompt.split()))
+        if len(prompts) == 1:
+            return "Long news post. " * 30
+        return "A concise, attributed HFA insight."
+
+    fake_ai._complete = complete
+    sources = [{
+        "id": 8,
+        "source_type": "verified_news",
+        "trust_state": "verified",
+        "text": "Official industry statistic.",
+        "url": "https://www.healthandfitness.org/report",
+        "metadata": {
+            "title": "Official report",
+            "summary": "Official industry statistic.",
+            "published_at": "2026-04-09",
+            "source_name": "Health & Fitness Association",
+        },
+    }]
+
+    result = fake_ai.generate_grounded_tweet(
+        "gym_strategy",
+        sources,
+        include_link=False,
+    )
+
+    assert result["text"] == "A concise, attributed HFA insight."
+    assert len(prompts) == 2
+    for prompt in prompts:
+        assert "use at least one exact concrete fact" in prompt
+        assert "attribute it to its source_name" in prompt
+        assert "Do not extrapolate causal or commercial outcomes" in prompt
+
+
+def test_incomplete_verified_news_does_not_force_invented_attribution(fake_ai):
+    captured = {}
+
+    def complete(_system_prompt, user_prompt, **_kwargs):
+        captured["user"] = " ".join(user_prompt.split())
+        return "Standalone advice."
+
+    fake_ai._complete = complete
+    fake_ai.generate_grounded_tweet(
+        "gym_strategy",
+        [{
+            "id": 8,
+            "source_type": "verified_news",
+            "trust_state": "verified",
+            "text": "Official industry statistic.",
+            "metadata": {},
+        }],
+        include_link=False,
+    )
+
+    assert "attribute it to its source_name" not in captured["user"]
+
+
 def test_claim_analysis_requires_strict_structured_json(fake_ai):
     valid = {
         "claims": [{"type": "number", "text": "15% fee", "supported_by": [7]}],

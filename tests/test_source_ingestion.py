@@ -55,10 +55,29 @@ def test_ingestor_rejects_incomplete_or_lookalike_or_duplicate_urls(fake_db, fak
             "published_at": "2026-08-10T08:00:00Z",
             "source": "Industry Example",
         },
+        *[
+            {
+                "title": "Malformed authority",
+                "description": "Cannot be verified.",
+                "url": url,
+                "published_at": "2026-08-10T08:00:00Z",
+                "source": "Industry Example",
+            }
+            for url in (
+                "https://industry.example:bad/report",
+                "https://industry.example:99999/report",
+                "https://user:pass@industry.example/report",
+                "https://industry .example/report",
+                "https://industry.example../report",
+            )
+        ],
     ]
     ingestor = SourceIngestor(fake_db, fake_news, {"industry.example"})
 
-    assert ingestor.refresh_verified_news(["gym operations"], per_topic=3) == 0
+    assert ingestor._is_trusted_https_url(
+        "https://industry.example.:443/report"
+    ) is True
+    assert ingestor.refresh_verified_news(["gym operations"], per_topic=10) == 0
     assert len(fake_db.sources) == 1
 
 

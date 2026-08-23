@@ -1,8 +1,8 @@
 """Import only complete, domain-verified news into the source pool."""
 from typing import Iterable, Optional
-from urllib.parse import urlparse
 
 from config import NEWS_TRUSTED_DOMAINS
+from modules.source_validation import is_safe_https_url
 
 
 class SourceIngestor:
@@ -81,11 +81,4 @@ class SourceIngestor:
         return value.strip() if isinstance(value, str) and value.strip() else None
 
     def _is_trusted_https_url(self, url: str) -> bool:
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower().rstrip(".")
-        if parsed.scheme.lower() != "https" or not host:
-            return False
-        return any(
-            host == domain or host.endswith("." + domain)
-            for domain in self.trusted_domains
-        )
+        return is_safe_https_url(url, self.trusted_domains)
