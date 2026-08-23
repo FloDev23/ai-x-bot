@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 from modules.ai_generator import AIGenerator
+from modules.character import get_category_agents
 from modules.scoring import SCORE_AXES, TweetScorer, semantic_similarity
 
 
@@ -65,6 +66,43 @@ def test_long_grounded_generation_uses_complete_rewrite(fake_ai):
 def test_grounded_generation_fails_when_rewrite_fails(fake_ai):
     fake_ai.responses = ["Long sentence. " * 30, "Still incomplete"]
     assert fake_ai.generate_grounded_tweet("gym_strategy", [], include_link=False) is None
+
+
+def test_current_editorial_categories_use_specialist_agents():
+    assert get_category_agents("gym_strategy")[0] == "business_expert"
+    assert get_category_agents("fitness_business_insight")[0] == "business_expert"
+    assert get_category_agents("shareable_fitness")[0] == "fitness_expert"
+    assert get_category_agents("product_proof")[0] == "copywriter"
+    assert get_category_agents("founder_journey")[0] == "startup_founder"
+
+
+def test_grounded_generation_targets_the_editorial_score_axes(fake_ai):
+    captured = {}
+
+    def complete(system_prompt, user_prompt, **_kwargs):
+        captured["system"] = system_prompt
+        captured["user"] = user_prompt
+        return "A sharp, grounded post."
+
+    fake_ai._complete = complete
+
+    result = fake_ai.generate_grounded_tweet(
+        "gym_strategy",
+        [{"id": 1, "source_type": "evergreen_idea", "text": "Useful idea."}],
+        include_link=False,
+    )
+
+    assert result["text"] == "A sharp, grounded post."
+    assert "fitness business expert" in captured["system"]
+    normalized_prompt = " ".join(captured["user"].split())
+    for requirement in (
+        "strong non-clickbait opening",
+        "concrete actionable takeaway",
+        "specific to gym owners",
+        "non-obvious angle",
+        "worth following",
+    ):
+        assert requirement in normalized_prompt
 
 
 def test_claim_analysis_requires_strict_structured_json(fake_ai):

@@ -89,6 +89,11 @@
   },
 
   "categoryAgents": {
+    "gym_strategy": ["business_expert", "copywriter"],
+    "fitness_business_insight": ["business_expert", "copywriter"],
+    "shareable_fitness": ["fitness_expert", "copywriter"],
+    "product_proof": ["copywriter", "startup_founder"],
+    "founder_journey": ["startup_founder", "copywriter"],
     "business_palestra": ["business_expert", "startup_founder"],
     "trend_fitness": ["fitness_expert", "copywriter"],
     "behind_the_scenes": ["startup_founder", "community_manager"],
