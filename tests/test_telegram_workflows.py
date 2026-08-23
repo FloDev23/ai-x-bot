@@ -1897,11 +1897,37 @@ def test_plain_text_source_flow_survives_restart_and_consumes_once(tmp_path):
     assert [source["text"] for source in sources] == [
         "Founder learned: <keep this literal> & improve."
     ]
+    assert sources[0]["trust_state"] == "verified"
+    assert sources[0]["verified_by"] == "floriano"
+    assert sources[0]["metadata"] == {"publishable": True}
     assert Database(path).get_state("telegram_session:42") is None
     assert restarted.process_update(
         callback_update(53, "input:source:founder_note")
     ) == "processed"
     assert len(Database(path).get_eligible_sources("founder_note")) == 1
+
+
+@pytest.mark.parametrize("source_type", ["product_fact", "evergreen_idea"])
+def test_manual_non_founder_source_does_not_gain_publishable_flag(
+    tmp_path,
+    source_type,
+):
+    path = str(tmp_path / f"{source_type}-session.db")
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(Database(path), telegram)
+
+    assert controller.process_update(message_update(54, "/ideas")) == "processed"
+    assert controller.process_update(
+        message_update(55, "A manually verified source."),
+    ) == "processed"
+    assert controller.process_update(
+        callback_update(56, f"input:source:{source_type}"),
+    ) == "processed"
+
+    sources = Database(path).get_eligible_sources(source_type)
+    assert len(sources) == 1
+    assert sources[0]["metadata"] == {}
+    assert Database(path).get_state("telegram_session:42") is None
 
 
 def test_manual_news_collects_complete_allowlisted_metadata_across_restarts(tmp_path):

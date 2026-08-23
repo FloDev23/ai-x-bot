@@ -1133,6 +1133,11 @@ class TelegramController:
             expected_state_value=raw,
             source_type=source_type,
             text=text,
+            metadata=(
+                {"publishable": True}
+                if source_type == "founder_note"
+                else None
+            ),
             trust_state="verified",
             verified_by="floriano",
         )
