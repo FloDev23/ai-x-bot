@@ -160,6 +160,28 @@ def test_claim_analysis_requires_strict_structured_json(fake_ai):
     assert fake_ai.analyze_claims("Text.", []) is None
 
 
+def test_claim_analysis_scopes_product_claim_to_flexdropin(fake_ai):
+    captured = {}
+
+    def complete(_system_prompt, user_prompt, **_kwargs):
+        captured["user"] = " ".join(user_prompt.split())
+        return '{"claims": []}'
+
+    fake_ai._complete = complete
+
+    result = fake_ai.analyze_claims(
+        "Offer a simple drop-in option with clear rules.",
+        [{"id": 4, "source_type": "evergreen_idea"}],
+    )
+
+    assert result == {"claims": []}
+    assert (
+        "product_claim means only an assertion about FlexDropin"
+        in captured["user"]
+    )
+    assert "Recommendations and imperatives are not factual claims" in captured["user"]
+
+
 def test_claim_analysis_rejects_structured_values_as_source_ids(fake_ai):
     malformed = {
         "claims": [{"type": "number", "text": "15% fee", "supported_by": [{"id": 7}]}],

@@ -218,6 +218,10 @@ medical, testimonial, named_entity and named_current_event. Named companies and
 products are named_entity; breaking events are named_current_event. Payment,
 privacy, security and customer-impacting incidents must be type incident and
 include subtype payment, privacy, security or customer_impacting.
+product_claim means only an assertion about FlexDropin's app, service,
+features, capabilities or product benefits. Do not use product_claim for a
+gym's own classes, offers or operating choices. Recommendations and imperatives
+are not factual claims unless they also assert a verifiable fact.
 
 Return JSON only: {{"claims": [{{"type": "...", "text": "...",
 "supported_by": [1]}}]}}. Include every factual claim. Use an empty claims list
