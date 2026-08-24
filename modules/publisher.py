@@ -147,9 +147,11 @@ class Publisher:
             return PublishResult("paused")
         if self.dry_run:
             try:
-                simulated = self.db.mark_publication_plan_simulated(
+                simulated = self.db.simulate_due_publication_plan(
                     plan_id,
                     plan.get("revision"),
+                    current,
+                    self.plan_grace_minutes,
                 )
             except Exception:
                 simulated = False

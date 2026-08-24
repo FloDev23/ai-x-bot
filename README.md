@@ -7,7 +7,7 @@ Il processo non mette like, non segue/smette di seguire, non risponde e non invi
 - deriva da fonti persistite e ammissibili;
 - supera fact-check, scoring e controllo duplicati;
 - è stata approvata esplicitamente dalla chat Telegram autorizzata;
-- è dovuta per lo slot esatto e non è in pausa;
+- è assegnata a un piano giornaliero persistente, è dovuta e non è in pausa;
 - passa attraverso `Publisher`, in modo idempotente.
 
 `DRY_RUN=true` mantiene aperto tutto il flusso fino al confine X, ma non crea tweet. Caricare una foto o un video registra soltanto un media disponibile: non crea una bozza.
@@ -31,11 +31,15 @@ La configurazione completa e la procedura VPS sono in [SETUP.md](SETUP.md).
 
 ## Scheduler sicuro
 
-Tutti i trigger usano `Europe/Rome` (o `BOT_TIMEZONE`) e il processo registra solo:
+Lo scheduler gira in `Europe/Rome`; le due ore di pubblicazione vengono invece
+calcolate come orari reali `America/New_York`, quindi seguono automaticamente
+l'ora legale statunitense. Il processo registra soltanto:
 
 - refresh indipendente del blog FlexDropin e delle news allowlisted alle 10:30;
-- creazione bozze alle 12:00 e 18:00 per gli slot 14:00 e 20:00;
-- tentativi di pubblicazione approvata alle 14:00 e 20:00;
+- rifornimento della coda approvabile ogni 30 minuti;
+- retry delle traduzioni italiane ogni 30 minuti;
+- creazione/riconciliazione dei piani USA ogni 15 minuti;
+- controllo dei piani dovuti ogni 5 minuti;
 - discovery growth read-only alle 11:00;
 - snapshot follower alle 23:15;
 - metriche dei post propri alle 23:30;
@@ -47,13 +51,21 @@ Telegram long polling gira in un thread daemon nominato. Scheduler e polling con
 
 ## Flusso quotidiano
 
-1. Inserire da Telegram una fonte testuale e classificarla.
-2. Il planner prepara al massimo due bozze al giorno dagli slot configurati.
+1. Il refresh automatico aggiorna il blog FlexDropin e le eventuali news fidate.
+2. Ogni 30 minuti il bot prova a mantenere una riserva di 7 post: massimo 3
+   bozze in revisione e 4 nuove bozze per giorno `Europe/Rome`.
 3. Fact guard, scorer e duplicate gate rifiutano contenuti non sicuri.
-4. Il bot invia la card Telegram con anteprima e controlli.
-5. Solo il callback `Approva` della chat autorizzata porta la bozza in stato `approved`.
-6. Allo slot esatto `Publisher` verifica stato, pausa, scadenza e idempotenza.
-7. In dry-run restituisce `dry_run` senza invocare X.
+4. Telegram mostra sempre il tweet inglese completo e sotto la traduzione
+   italiana completa, marcata come testo di sola revisione.
+5. Solo il callback `Approva` della chat autorizzata inserisce la bozza nella
+   riserva pubblicabile. Una traduzione mancante o stale blocca l'approvazione.
+6. Ogni giorno vengono creati esattamente due piani: uno tra 08:30–11:30 ET e
+   uno tra 16:30–20:30 ET, distanti almeno 6 ore. Dopo 30 post maturi il bot
+   apprende le fasce migliori; il peso del giorno della settimana parte da 90.
+7. Al momento dovuto `Publisher` ricontrolla piano, revisione, fonti, pausa,
+   media e idempotenza, quindi invia a X esclusivamente il testo inglese.
+8. Con `DRY_RUN=true` il piano diventa `simulated`, la bozza resta approvata e
+   non viene eseguita alcuna chiamata di scrittura X.
 
 I comandi Telegram includono `/status`, `/posts`, `/growth`, `/stats`, `/ideas`, `/pause`, `/resume`, `/errors` e `/help`. Il refresh riuscito o senza novità è silenzioso; `/errors` mostra solo codici di errore sistemici sanitizzati.
 
@@ -73,9 +85,16 @@ venv/bin/python -m compileall -q main.py config.py modules dashboard
 git diff --check
 ```
 
-Il test end-to-end è in `tests/test_end_to_end_dry_run.py` e prova fonte → bozza → approvazione Telegram → publish dry-run con zero scritture X/engagement, oltre all'upload media senza creazione bozza.
+Il test end-to-end è in `tests/test_end_to_end_dry_run.py` e prova fonte →
+coda bilingue → approvazione Telegram → riserva da 7 → due piani ET → due
+simulazioni, incluso un riavvio senza duplicati e zero scritture X/engagement.
 
-Prima di ogni riavvio sul VPS, `deploy.sh` esegue un preflight in sola lettura che richiede `APPROVAL_REQUIRED=true`, `DRY_RUN=true`, configurazione valida e `PRAGMA integrity_check=ok`. Una singola pubblicazione reale non richiede di modificare `.env`: usa `scripts/publish_once.py`, una fingerprint immutabile della bozza approvata e un override `DRY_RUN=false` limitato a quel solo processo. La procedura completa è in [SETUP.md](SETUP.md#9-prima-pubblicazione-reale-controllata).
+Prima di ogni riavvio sul VPS, `deploy.sh` esegue un preflight in sola lettura
+che richiede `APPROVAL_REQUIRED=true`, `DRY_RUN=true`, configurazione valida e
+`PRAGMA integrity_check=ok`. Il passaggio alla pubblicazione automatica reale è
+una fase separata: richiede due giornate USA simulate, una riserva di 7 post,
+`/errors` pulito e una nuova autorizzazione esplicita prima di cambiare
+`DRY_RUN`. La procedura completa è in [SETUP.md](SETUP.md).
 
 ## Componenti principali
 

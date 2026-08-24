@@ -312,6 +312,7 @@ class PublicationPlanner:
         source_expiry_safety_margin: timedelta,
         max_links_per_week: int,
         dry_run: bool,
+        plan_grace_minutes: int = 90,
     ):
         if type(audience_timezone) is not str or not audience_timezone:
             raise ValueError("audience_timezone must be an IANA timezone")
@@ -333,6 +334,11 @@ class PublicationPlanner:
             raise ValueError("max_links_per_week must be non-negative")
         if type(dry_run) is not bool:
             raise ValueError("dry_run must be exact bool")
+        if (
+            type(plan_grace_minutes) is not int
+            or not 1 <= plan_grace_minutes <= 1440
+        ):
+            raise ValueError("invalid publication plan grace")
         self.db = db
         self.timing_policy = timing_policy
         self.timing_sample_provider = timing_sample_provider
@@ -341,6 +347,7 @@ class PublicationPlanner:
         self.source_expiry_safety_margin = source_expiry_safety_margin
         self.max_links_per_week = max_links_per_week
         self.dry_run = dry_run
+        self.plan_grace_minutes = plan_grace_minutes
 
     def _now(self, supplied=None) -> Optional[datetime]:
         value = self.now_fn() if supplied is None else supplied
@@ -627,7 +634,12 @@ class PublicationPlanner:
             scheduled = self._parse_aware(plan.get("scheduled_for"))
             if scheduled is None or scheduled > current:
                 continue
-            if self.db.mark_publication_plan_simulated(plan["id"], plan["revision"]):
+            if self.db.simulate_due_publication_plan(
+                plan["id"],
+                plan["revision"],
+                current,
+                self.plan_grace_minutes,
+            ):
                 refreshed = self.db.list_publication_positions(
                     statuses=["simulated"]
                 )

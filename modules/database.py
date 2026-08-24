@@ -2779,6 +2779,88 @@ class Database:
             and row["published_tweet_id"] is None
         )
 
+    def _due_publication_plan_eligible_in_conn(
+        self,
+        conn,
+        plan: sqlite3.Row,
+        draft: sqlite3.Row,
+        current: datetime,
+        grace_minutes: int,
+    ) -> bool:
+        scheduled = self._strict_aware_datetime(
+            plan["scheduled_for"] if plan is not None else None
+        )
+        pause = conn.execute(
+            "SELECT value FROM bot_state WHERE key = 'paused'"
+        ).fetchone()
+        if (
+            plan is None
+            or plan["status"] != "planned"
+            or scheduled is None
+            or current < scheduled
+            or current > scheduled + timedelta(minutes=grace_minutes)
+            or pause is None
+            or pause["value"] != "false"
+            or draft is None
+            or draft["status"] != "approved"
+            or draft["revision"] != plan["draft_revision"]
+            or draft["translation_status"] != "ready"
+            or type(draft["translation_it"]) is not str
+            or not draft["translation_it"].strip()
+            or draft["blocked_reason"] is not None
+        ):
+            return False
+        source_ids = self._decode_source_ids(draft["source_ids_json"])
+        return bool(
+            source_ids is not None
+            and self._eligible_content_sources_in_conn(conn, source_ids, current)
+            and self._queue_media_binding_valid_in_conn(conn, draft)
+        )
+
+    def simulate_due_publication_plan(
+        self,
+        plan_id: int,
+        expected_revision: int,
+        now: datetime,
+        grace_minutes: int,
+    ) -> bool:
+        current = self._strict_aware_datetime(now)
+        if (
+            not self._exact_positive_identifier(plan_id)
+            or not self._exact_nonnegative_revision(expected_revision)
+            or current is None
+            or type(grace_minutes) is not int
+            or not 1 <= grace_minutes <= 1440
+        ):
+            return False
+        initial = self.get_publication_plan(plan_id)
+        if initial is None or not self._exact_positive_identifier(
+            initial.get("draft_id")
+        ):
+            return False
+        draft_id = initial["draft_id"]
+        with self._post_draft_mutation_lock(draft_id) as conn:
+            plan = conn.execute(
+                "SELECT * FROM publication_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+            draft = self._queue_draft_row_in_conn(conn, draft_id)
+            if (
+                plan is None
+                or plan["revision"] != expected_revision
+                or plan["draft_id"] != draft_id
+                or not self._due_publication_plan_eligible_in_conn(
+                    conn, plan, draft, current, grace_minutes,
+                )
+            ):
+                return False
+            cursor = conn.execute("""
+                UPDATE publication_plans
+                SET status = 'simulated', claim_token = NULL,
+                    updated_at = ?, revision = revision + 1
+                WHERE id = ? AND revision = ? AND status = 'planned'
+            """, (self._now_iso(), plan_id, expected_revision))
+            return cursor.rowcount == 1
+
     def claim_due_publication_plan(
         self,
         plan_id: int,
@@ -2808,37 +2890,14 @@ class Database:
                 "SELECT * FROM publication_plans WHERE id = ?", (plan_id,)
             ).fetchone()
             draft = self._queue_draft_row_in_conn(conn, draft_id)
-            scheduled = self._strict_aware_datetime(
-                plan["scheduled_for"] if plan is not None else None
-            )
-            pause = conn.execute(
-                "SELECT value FROM bot_state WHERE key = 'paused'"
-            ).fetchone()
             if (
                 plan is None
-                or plan["status"] != "planned"
                 or plan["revision"] != expected_plan_revision
                 or plan["draft_id"] != draft_id
-                or scheduled is None
-                or current < scheduled
-                or current > scheduled + timedelta(minutes=grace_minutes)
-                or pause is None
-                or pause["value"] != "false"
-                or draft is None
-                or draft["status"] != "approved"
-                or draft["revision"] != plan["draft_revision"]
-                or draft["translation_status"] != "ready"
-                or type(draft["translation_it"]) is not str
-                or not draft["translation_it"].strip()
-                or draft["blocked_reason"] is not None
+                or not self._due_publication_plan_eligible_in_conn(
+                    conn, plan, draft, current, grace_minutes,
+                )
             ):
-                return None
-            source_ids = self._decode_source_ids(draft["source_ids_json"])
-            if source_ids is None or not self._eligible_content_sources_in_conn(
-                conn, source_ids, current
-            ):
-                return None
-            if not self._queue_media_binding_valid_in_conn(conn, draft):
                 return None
             token = secrets.token_urlsafe(24)
             updated_at = self._now_iso()

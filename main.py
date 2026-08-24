@@ -341,6 +341,7 @@ class FlexDropinGrowthAgent:
                 source_expiry_safety_margin=timedelta(hours=2),
                 max_links_per_week=MAX_LINKS_PER_WEEK,
                 dry_run=self.dry_run,
+                plan_grace_minutes=PUBLICATION_PLAN_GRACE_MINUTES,
             ),
         )
         self.growth_discovery = resolve(

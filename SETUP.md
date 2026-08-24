@@ -1,6 +1,9 @@
 # Setup approval-only
 
-Questa release usa Telegram come control plane obbligatorio. Non abilita pubblicazione unattended: `DRY_RUN=false` permette soltanto a `Publisher` di inviare una bozza già approvata in Telegram e dovuta per lo slot esatto.
+Questa release usa Telegram come control plane obbligatorio. `DRY_RUN=false`
+permette soltanto a `Publisher` di inviare una bozza inglese già approvata in
+Telegram e assegnata a uno dei due piani giornalieri USA. La traduzione italiana
+è esclusivamente un aiuto privato alla revisione e non raggiunge mai X.
 
 ## 1. Prerequisiti
 
@@ -60,9 +63,17 @@ Usare questi valori durante tutto il dry-run:
 
 ```dotenv
 BOT_TIMEZONE=Europe/Rome
-CONTENT_SLOTS=14:00,20:00
-DRAFT_LEAD_MINUTES=120
-PUBLISH_GRACE_SECONDS=300
+POSTS_PER_DAY=2
+APPROVED_QUEUE_TARGET=7
+PENDING_REVIEW_LIMIT=3
+DRAFT_GENERATION_DAILY_CAP=4
+AUDIENCE_TIMEZONE=America/New_York
+MORNING_WINDOW=08:30-11:30
+EVENING_WINDOW=16:30-20:30
+MIN_POST_GAP_HOURS=6
+ADAPTIVE_TIMING_MIN_POSTS=30
+ADAPTIVE_WEEKDAY_MIN_POSTS=90
+PUBLICATION_PLAN_GRACE_MINUTES=90
 APPROVAL_REQUIRED=true
 DRY_RUN=true
 DRAFT_SCORE_THRESHOLD=70
@@ -106,7 +117,8 @@ Un guasto di un canale non annulla l'altro. Successo e assenza di novità non ge
 
 ## 7. Dry-run sul VPS
 
-Avviare il servizio con `DRY_RUN=true`:
+Avviare il servizio con `DRY_RUN=true`. Il bot rifornisce la coda ogni 30
+minuti, pianifica ogni 15 minuti e simula i piani dovuti ogni 5 minuti:
 
 ```bash
 python -c "from config import validate_config; validate_config()"
@@ -120,16 +132,23 @@ Completare e annotare tutta la checklist:
 - [ ] upload di una foto senza creazione automatica di una bozza;
 - [ ] upload di un video senza creazione automatica di una bozza;
 - [ ] ricezione della preview della bozza e del media abbinato;
+- [ ] ogni card mostra l'inglese completo e la traduzione italiana completa;
 - [ ] prova di tutti i pulsanti bozza: `Approva`, `Rigenera`, `Modifica`, `Scegli media`, `Solo testo`, `Posticipa` e `Scarta`;
 - [ ] `/pause` impedisce la pubblicazione e `/resume` la riabilita;
 - [ ] reinvio dello stesso callback senza doppia mutazione;
 - [ ] digest growth con link/username e sole azioni manuali;
 - [ ] snapshot follower e report `/stats` coerenti;
+- [ ] riserva `approved/planned` pari a 7 e non più di 3 card in revisione;
+- [ ] due giornate `America/New_York` con 2 piani `simulated` al giorno, uno
+      nella finestra mattutina e uno nella finestra serale, separati di 6 ore;
+- [ ] `/errors` privo di errori sistemici irrisolti;
 - [ ] conteggio scritture X pari a zero, inclusi post ed engagement.
 
 Controllare inoltre `/status`, `/posts`, `/errors` e `bot.log`. L'allowlist scheduler deve contenere soltanto i job documentati nel README; la discovery lead deve essere assente.
 
-Usare `DRY_RUN=false` soltanto come override del singolo processo one-shot descritto sotto, dopo che l'intera checklist ha superato il test sul VPS. Non modificare questi valori nel `.env` persistente e non cambiare `APPROVAL_REQUIRED=true`.
+Non cambiare `DRY_RUN` durante questa checklist. Il passaggio live descritto
+sotto richiede una nuova autorizzazione esplicita; `APPROVAL_REQUIRED=true`
+resta obbligatorio anche dopo l'attivazione.
 
 Prima di un deploy o riavvio, con il database già presente, eseguire il controllo fail-closed:
 
@@ -165,42 +184,29 @@ WantedBy=multi-user.target
 
 Alla ricezione di `Ctrl+C` il processo segnala lo stesso `threading.Event` al polling Telegram, ferma lo scheduler e attende il thread entro un timeout limitato.
 
-## 9. Prima pubblicazione reale controllata
+## 9. Attivazione automatica reale, separata dal dry-run
 
-La configurazione persistente deve rimanere:
+Prima dell'autorizzazione finale la configurazione persistente deve rimanere:
 
 ```dotenv
 APPROVAL_REQUIRED=true
 DRY_RUN=true
 ```
 
-1. Attendere il refresh automatico delle 10:30 oppure avviare il ciclo di refresh previsto dall'applicazione. Verificare `/errors` e che il feed `https://flexdropin.com/api/editorial-feed` risponda con la versione attesa.
-2. Far creare una bozza per uno slot configurato. Deve avere score almeno 70 ed essere ancora entro la grace window quando verrà pubblicata.
-3. Leggere testo e media su Telegram e premere `Approva` dalla chat autorizzata.
-4. Sul VPS acquisire la fingerprint senza cambiare stato:
-
-```bash
-venv/bin/python scripts/publish_once.py inspect --draft-id <DRAFT_ID>
-```
-
-5. Confrontare ID, revisione, slot, score, presenza media e fingerprint con la bozza appena approvata. Ottenere una seconda autorizzazione umana esplicita per quella fingerprint.
-6. Fermare il servizio per evitare concorrenti, pubblicare una sola volta con override limitato al processo e riavviare sempre il servizio:
-
-```bash
-restart_bot() { sudo systemctl restart flexdropin-bot; }
-trap restart_bot EXIT INT TERM
-sudo systemctl stop flexdropin-bot
-DRY_RUN=false venv/bin/python scripts/publish_once.py publish \
-  --draft-id <DRAFT_ID> \
-  --fingerprint <FINGERPRINT> \
-  --confirm PUBLISH_ONE_APPROVED_FLEXDROPIN_DRAFT
-restart_bot
-trap - EXIT INT TERM
-```
-
-Il comando rilegge la stessa bozza e revision, ricontrolla approvazione, pausa, slot, grace window, media e idempotenza. `published` è successo; `rejected` o `snapshot_changed` non scrivono; `publication_unknown` richiede riconciliazione manuale su X e non deve essere ritentato. Al termine rieseguire il preflight in dry-run e verificare che `flexdropin-bot` sia attivo.
-
-Non modificare `.env` a `DRY_RUN=false`, non lanciare il comando una seconda volta e non usare il percorso normale dello scheduler per il primo post reale.
+1. Completare due intere giornate USA in dry-run con 2 piani simulati per
+   giornata, riserva da 7, card bilingui complete, `/errors` pulito e zero write X.
+2. Controllare su Telegram le bozze approvate, gli orari ET/Roma e gli eventuali
+   media. Usare `/pause` se esiste qualunque dubbio.
+3. Eseguire backup SQLite e preflight; annotare HEAD e conteggi dei piani.
+4. Ottenere una nuova autorizzazione esplicita a modificare il solo valore
+   `DRY_RUN=false`. Non cambiare `APPROVAL_REQUIRED=true`.
+5. Fermare il servizio, modificare `.env`, ripetere `validate_config()` e
+   `PRAGMA integrity_check`, quindi riavviare il servizio.
+6. Sorvegliare il primo piano dovuto. `published` deve produrre un solo tweet;
+   `unknown`/`publication_unknown` richiede riconciliazione manuale su X e non
+   va mai ritentato. In caso di errore usare subito `/pause`.
+7. Dopo il primo giorno live verificare esattamente due pubblicazioni, testo X
+   solo inglese, media corretto, nessun engagement automatico e `/errors` pulito.
 
 ## Troubleshooting
 
@@ -208,6 +214,7 @@ Non modificare `.env` a `DRY_RUN=false`, non lanciare il comando una seconda vol
 - `APPROVAL_REQUIRED must be true`: ripristinare `APPROVAL_REQUIRED=true`.
 - Nessun draft: aggiungere una fonte ammissibile e controllare outcome/errori in SQLite e `/errors`.
 - Fonti automatiche assenti: verificare `/api/editorial-feed`, il job `source_refresh` delle 10:30 e `/errors`; `NEWSAPI_KEY` serve soltanto se l'allowlist esterna non è vuota.
-- Draft non pubblicato: verificare approvazione, `/pause`, slot esatto, grace window e `DRY_RUN`.
+- Draft non pubblicato: verificare traduzione pronta, approvazione, `/pause`,
+  assegnazione al piano ET, grace window di 90 minuti e `DRY_RUN`.
 - Media rifiutato: verificare MIME reale, dimensione, permessi della directory e disponibilità di `ffmpeg` per i video.
 - Polling Telegram fermo: verificare token, chat ID, timeout e log sanitizzati; non stampare mai token o URL bot completi.

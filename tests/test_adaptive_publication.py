@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -12,6 +13,25 @@ from modules.twitter_client import XPublicationRejected
 
 
 NOW = datetime(2026, 8, 24, 10, 0, tzinfo=timezone.utc)
+
+
+def _publication_plan_claim_process(
+    db_path,
+    plan_id,
+    revision,
+    due_iso,
+    barrier,
+    outcomes,
+):
+    database = Database(db_path)
+    barrier.wait(timeout=10)
+    claimed = database.claim_due_publication_plan(
+        plan_id,
+        revision,
+        datetime.fromisoformat(due_iso),
+        90,
+    )
+    outcomes.put(claimed is not None)
 
 
 def _policy():
@@ -520,6 +540,7 @@ def test_concurrent_reconcile_cannot_exceed_one_weekly_link_plan(tmp_path):
 
 def test_dry_run_simulation_keeps_approved_drafts_and_media_reservations(tmp_path):
     db = Database(str(tmp_path / "simulation.db"))
+    db.set_state("paused", "false")
     media_root = tmp_path / "simulation-media"
     media_root.mkdir(mode=0o700)
     staged = media_root / "staged.jpg"
@@ -547,9 +568,11 @@ def test_dry_run_simulation_keeps_approved_drafts_and_media_reservations(tmp_pat
     )
     planner = _planner(db)
     plans = planner.reconcile(NOW)
-    due = max(datetime.fromisoformat(plan["scheduled_for"]) for plan in plans)
+    due_times = sorted(datetime.fromisoformat(plan["scheduled_for"]) for plan in plans)
 
-    simulated = planner.simulate_due(due + timedelta(minutes=1))
+    simulated = []
+    for due in due_times:
+        simulated.extend(planner.simulate_due(due + timedelta(minutes=1)))
 
     assert len(simulated) == 2
     assert {db.get_post_draft(first_id)["status"], db.get_post_draft(second_id)["status"]} == {
@@ -568,6 +591,7 @@ def test_second_dry_run_day_prefers_unsimulated_drafts_without_consuming_queue(
     tmp_path,
 ):
     db = Database(str(tmp_path / "two-simulation-days.db"))
+    db.set_state("paused", "false")
     draft_ids = [
         _approved_queue_draft(
             db,
@@ -582,8 +606,13 @@ def test_second_dry_run_day_prefers_unsimulated_drafts_without_consuming_queue(
     first_planner = _planner(db, now=NOW)
     first_plans = first_planner.reconcile(NOW)
     first_ids = {plan["draft_id"] for plan in first_plans}
-    first_due = max(datetime.fromisoformat(plan["scheduled_for"]) for plan in first_plans)
-    assert len(first_planner.simulate_due(first_due + timedelta(minutes=1))) == 2
+    first_due_times = sorted(
+        datetime.fromisoformat(plan["scheduled_for"]) for plan in first_plans
+    )
+    first_simulated = []
+    for due in first_due_times:
+        first_simulated.extend(first_planner.simulate_due(due + timedelta(minutes=1)))
+    assert len(first_simulated) == 2
 
     next_day = NOW + timedelta(days=1)
     second_planner = _planner(db, now=next_day)
@@ -715,8 +744,9 @@ def test_publish_plan_sends_only_english_and_finalizes_plan_atomically(tmp_path)
 
     assert result.status == "published"
     assert result.tweet_id == "123456"
+    italian = db.get_queue_draft(draft_id)["translation_it"]
     assert x_client.calls == [{"text": "ENGLISH_PLAN_SENTINEL"}]
-    assert "ITALIAN" not in repr(x_client.calls)
+    assert italian not in repr(x_client.calls)
     assert db.get_publication_plan(plan["id"])["status"] == "published"
     stored = db.get_post_draft(draft_id)
     assert stored["status"] == "published"
@@ -726,6 +756,44 @@ def test_publish_plan_sends_only_english_and_finalizes_plan_atomically(tmp_path)
             "SELECT text FROM posted_tweets WHERE tweet_id = '123456'"
         ).fetchone()[0]
     assert posted == "ENGLISH_PLAN_SENTINEL"
+    assert italian not in posted
+
+
+def test_spawned_plan_claimers_commit_exactly_one_winner(tmp_path):
+    db, draft_id, plan = _planned_publication_fixture(tmp_path)
+    due = datetime.fromisoformat(plan["scheduled_for"])
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(4)
+    outcomes = context.Queue()
+    processes = [
+        context.Process(
+            target=_publication_plan_claim_process,
+            args=(
+                db.db_path,
+                plan["id"],
+                plan["revision"],
+                due.isoformat(),
+                barrier,
+                outcomes,
+            ),
+        )
+        for _ in range(4)
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=15)
+
+    assert not any(process.is_alive() for process in processes)
+    assert all(process.exitcode == 0 for process in processes)
+    assert sorted(outcomes.get(timeout=2) for _ in processes) == [
+        False, False, False, True,
+    ]
+    assert Database(db.db_path).get_publication_plan(plan["id"])["status"] == (
+        "publishing"
+    )
+    assert Database(db.db_path).get_post_draft(draft_id)["status"] == "publishing"
 
 
 def test_publish_plan_timeout_is_unknown_and_never_retried(tmp_path):
@@ -765,6 +833,27 @@ def test_publish_plan_dry_run_marks_plan_simulated_without_x(tmp_path):
     assert x_client.calls == []
     assert db.get_publication_plan(plan["id"])["status"] == "simulated"
     assert db.get_post_draft(draft_id)["status"] == "approved"
+
+
+def test_dry_run_revalidates_revoked_source_before_marking_simulated(tmp_path):
+    db, draft_id, plan = _planned_publication_fixture(tmp_path)
+    due = datetime.fromisoformat(plan["scheduled_for"])
+    source_id = db.get_queue_draft(draft_id)["source_ids"][0]
+    with db._conn() as conn:
+        conn.execute(
+            "UPDATE content_sources SET trust_state = 'revoked' WHERE id = ?",
+            (source_id,),
+        )
+    x_client = _PlanXClient()
+
+    result = Publisher(
+        db, x_client, dry_run=True, plan_grace_minutes=90,
+    ).publish_plan(plan["id"], now=due)
+
+    assert result.status == "already_claimed"
+    assert db.get_publication_plan(plan["id"])["status"] == "planned"
+    assert db.get_post_draft(draft_id)["status"] == "approved"
+    assert x_client.calls == []
 
 
 def test_publish_plan_definite_rejection_restores_same_plan_within_grace(tmp_path):

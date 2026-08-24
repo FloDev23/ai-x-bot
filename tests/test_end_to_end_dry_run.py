@@ -266,9 +266,13 @@ def test_bilingual_queue_plans_and_simulates_two_us_posts_restart_safely(tmp_pat
     plans = agent.publication_planning_cycle(now=NOW)
     assert len(plans) == 2
     assert all(plan["status"] == "planned" for plan in plans)
-    due = max(datetime.fromisoformat(plan["scheduled_for"]) for plan in plans)
+    due_times = sorted(
+        datetime.fromisoformat(plan["scheduled_for"]) for plan in plans
+    )
 
-    simulated = agent.adaptive_publish_cycle(now=due)
+    simulated = []
+    for due in due_times:
+        simulated.extend(agent.adaptive_publish_cycle(now=due))
 
     assert len(simulated) == 2
     assert all(plan["status"] == "simulated" for plan in simulated)
@@ -279,6 +283,7 @@ def test_bilingual_queue_plans_and_simulates_two_us_posts_restart_safely(tmp_pat
     )
 
     message_count = len(dependencies["telegram_api"].messages)
+    due = due_times[-1]
     restart_dependencies = dependency_bundle(
         tmp_path / "restart-boundaries",
         db=Database(agent.db.db_path),
