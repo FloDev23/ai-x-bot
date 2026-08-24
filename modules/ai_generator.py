@@ -329,7 +329,7 @@ Reply only with the complete rewritten post."""
         rewritten = self._complete(
             _agent_prompt(agent_name),
             prompt,
-            max_tokens=400,
+            max_tokens=800,
             temperature=0.4,
             raise_on_error=True,
         )

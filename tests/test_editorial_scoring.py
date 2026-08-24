@@ -393,7 +393,10 @@ def test_owned_blog_generation_and_rewrite_forbid_unsourced_product_claims(
     article_url = "https://flexdropin.com/blog/gym-drop-ins-test-demand"
 
     def complete(_system_prompt, user_prompt, **_kwargs):
-        prompts.append(" ".join(user_prompt.split()))
+        prompts.append({
+            "user": " ".join(user_prompt.split()),
+            "max_tokens": _kwargs.get("max_tokens"),
+        })
         if len(prompts) == 1:
             return ("Long blog post. " * 30) + article_url
         return (
@@ -451,15 +454,17 @@ def test_owned_blog_generation_and_rewrite_forbid_unsourced_product_claims(
         "Ask which class rule removes the most booking friction. " + article_url
     )
     assert len(prompts) == 2
+    assert prompts[0]["max_tokens"] == 800
+    assert prompts[1]["max_tokens"] == 800
     assert (
         "include exactly https://flexdropin.com/blog/"
         "gym-drop-ins-test-demand once"
-    ) in prompts[0].lower()
-    assert "keep all other copy at most 227 characters" in prompts[0].lower()
-    assert "preserve exactly https://flexdropin.com/blog/" in prompts[1].lower()
-    assert "keep all other copy at most 227 characters" in prompts[1].lower()
+    ) in prompts[0]["user"].lower()
+    assert "keep all other copy at most 227 characters" in prompts[0]["user"].lower()
+    assert "preserve exactly https://flexdropin.com/blog/" in prompts[1]["user"].lower()
+    assert "keep all other copy at most 227 characters" in prompts[1]["user"].lower()
     for prompt in prompts:
-        normalized = prompt.lower()
+        normalized = prompt["user"].lower()
         assert "owned_blog_article" in normalized
         assert "never assert a flexdropin product capability" in normalized
         assert "do not introduce any number absent from the title or summary" in normalized
