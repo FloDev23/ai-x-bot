@@ -51,6 +51,14 @@ class _PreparedDraft:
     intended_slot: str
 
 
+@dataclass(frozen=True)
+class _CandidateEvaluation:
+    prepared: Optional[_PreparedDraft]
+    outcome: str
+    details: Dict
+    abort: bool
+
+
 def _aware_datetime(value) -> Optional[datetime]:
     if isinstance(value, str):
         try:
@@ -176,6 +184,146 @@ class DraftPipeline:
             return None
         return slot_iso, safe_source_ids, sources
 
+    def _recent_texts(self, exclude_draft_id: Optional[int] = None):
+        if exclude_draft_id is None:
+            return self.db.get_recent_content_texts(
+                days=30,
+                now=self.now_fn(),
+            )
+        return self.db.get_recent_content_texts(
+            days=30,
+            exclude_draft_id=exclude_draft_id,
+            now=self.now_fn(),
+        )
+
+    def _evaluate_copy(
+        self,
+        *,
+        text,
+        category: str,
+        safe_source_ids,
+        sources,
+        slot_iso: str,
+        recent_texts,
+    ) -> _CandidateEvaluation:
+        if not isinstance(text, str):
+            text = ""
+        text = text.strip()
+        if not text:
+            return _CandidateEvaluation(
+                None,
+                "generation_failed",
+                {"source_ids": safe_source_ids},
+                False,
+            )
+        if len(text) > 280:
+            try:
+                text = self.generator.rewrite_to_limit(
+                    text,
+                    sources,
+                    280,
+                    category=category,
+                )
+            except Exception:
+                return _CandidateEvaluation(
+                    None,
+                    "rewrite_failed",
+                    {
+                        "reason_codes": ["rewrite_unavailable"],
+                        "source_ids": safe_source_ids,
+                    },
+                    True,
+                )
+            if not isinstance(text, str):
+                text = ""
+            text = text.strip()
+            if not text or len(text) > 280:
+                return _CandidateEvaluation(
+                    None,
+                    "rewrite_failed",
+                    {"source_ids": safe_source_ids},
+                    False,
+                )
+
+        try:
+            fact_result = self.fact_guard.check(text, sources)
+        except Exception:
+            return _CandidateEvaluation(
+                None,
+                "rejected_fact",
+                {
+                    "reason_codes": ["fact_check_unavailable"],
+                    "source_ids": safe_source_ids,
+                },
+                True,
+            )
+        if getattr(fact_result, "approved", False) is not True:
+            reason_codes = _safe_reason_codes(
+                getattr(fact_result, "reasons", [])
+            )
+            return _CandidateEvaluation(
+                None,
+                "rejected_fact",
+                {
+                    "reason_codes": reason_codes,
+                    "source_ids": safe_source_ids,
+                },
+                "claim_analysis_unavailable" in reason_codes,
+            )
+
+        try:
+            score = self.scorer.score_draft(
+                text,
+                sources=sources,
+                recent_texts=recent_texts,
+            )
+        except Exception:
+            return _CandidateEvaluation(
+                None,
+                "rejected_score",
+                {
+                    "reason_codes": ["scoring_unavailable"],
+                    "source_ids": safe_source_ids,
+                },
+                True,
+            )
+        safe_score = _safe_scores(score)
+        total = safe_score.get("total")
+        if total is None or not 0 <= total <= 100:
+            return _CandidateEvaluation(
+                None,
+                "rejected_score",
+                {"scores": safe_score},
+                True,
+            )
+
+        for previous in recent_texts:
+            if not isinstance(previous, str):
+                continue
+            if semantic_similarity(text, previous) >= self.duplicate_threshold:
+                return _CandidateEvaluation(
+                    None,
+                    "rejected_duplicate",
+                    {"source_ids": safe_source_ids},
+                    False,
+                )
+
+        return _CandidateEvaluation(
+            _PreparedDraft(
+                text=text,
+                category=category,
+                source_ids=safe_source_ids,
+                score_data=safe_score,
+                intended_slot=slot_iso,
+            ),
+            "eligible",
+            {
+                "scores": safe_score,
+                "source_ids": safe_source_ids,
+            },
+            False,
+        )
+
     def _validate_copy(
         self,
         *,
@@ -186,137 +334,27 @@ class DraftPipeline:
         slot_iso: str,
         exclude_draft_id: Optional[int] = None,
     ) -> Optional[_PreparedDraft]:
-        if not isinstance(text, str):
-            text = ""
-        text = text.strip()
-        if not text:
-            self._record(
-                slot_iso,
-                category,
-                "generation_failed",
-                {"source_ids": safe_source_ids},
-            )
-            return None
-        if len(text) > 280:
-            try:
-                text = self.generator.rewrite_to_limit(
-                    text,
-                    sources,
-                    280,
-                    category=category,
-                )
-            except Exception:
-                self._record(
-                    slot_iso,
-                    category,
-                    "rewrite_failed",
-                    {
-                        "reason_codes": ["rewrite_unavailable"],
-                        "source_ids": safe_source_ids,
-                    },
-                )
-                return None
-            if not isinstance(text, str):
-                text = ""
-            text = text.strip()
-            if not text or len(text) > 280:
-                self._record(
-                    slot_iso,
-                    category,
-                    "rewrite_failed",
-                    {"source_ids": safe_source_ids},
-                )
-                return None
-
-        try:
-            fact_result = self.fact_guard.check(text, sources)
-        except Exception:
-            self._record(
-                slot_iso,
-                category,
-                "rejected_fact",
-                {
-                    "reason_codes": ["fact_check_unavailable"],
-                    "source_ids": safe_source_ids,
-                },
-            )
-            return None
-        if getattr(fact_result, "approved", False) is not True:
-            self._record(
-                slot_iso,
-                category,
-                "rejected_fact",
-                {
-                    "reason_codes": _safe_reason_codes(
-                        getattr(fact_result, "reasons", [])
-                    ),
-                    "source_ids": safe_source_ids,
-                },
-            )
-            return None
-
-        if exclude_draft_id is None:
-            recent_texts = self.db.get_recent_content_texts(
-                days=30,
-                now=self.now_fn(),
-            )
-        else:
-            recent_texts = self.db.get_recent_content_texts(
-                days=30,
-                exclude_draft_id=exclude_draft_id,
-                now=self.now_fn(),
-            )
-        try:
-            score = self.scorer.score_draft(
-                text,
-                sources=sources,
-                recent_texts=recent_texts,
-            )
-        except Exception:
-            self._record(
-                slot_iso,
-                category,
-                "rejected_score",
-                {
-                    "reason_codes": ["scoring_unavailable"],
-                    "source_ids": safe_source_ids,
-                },
-            )
-            return None
-        safe_score = _safe_scores(score)
-        total = safe_score.get("total")
-        if (
-            total is None
-            or not 0 <= total <= 100
-            or total < self.score_threshold
-        ):
-            self._record(
-                slot_iso,
-                category,
-                "rejected_score",
-                {"scores": safe_score},
-            )
-            return None
-
-        for previous in recent_texts:
-            if not isinstance(previous, str):
-                continue
-            if semantic_similarity(text, previous) >= self.duplicate_threshold:
-                self._record(
-                    slot_iso,
-                    category,
-                    "rejected_duplicate",
-                    {"source_ids": safe_source_ids},
-                )
-                return None
-
-        return _PreparedDraft(
+        evaluation = self._evaluate_copy(
             text=text,
             category=category,
-            source_ids=safe_source_ids,
-            score_data=safe_score,
-            intended_slot=slot_iso,
+            safe_source_ids=safe_source_ids,
+            sources=sources,
+            slot_iso=slot_iso,
+            recent_texts=self._recent_texts(exclude_draft_id),
         )
+        prepared = evaluation.prepared
+        if prepared is not None:
+            if prepared.score_data["total"] >= self.score_threshold:
+                return prepared
+            self._record(
+                slot_iso,
+                category,
+                "rejected_score",
+                {"scores": prepared.score_data},
+            )
+            return None
+        self._record(slot_iso, category, evaluation.outcome, evaluation.details)
+        return None
 
     def _prepare(
         self,
@@ -334,41 +372,96 @@ class DraftPipeline:
         if context is None:
             return None
         slot_iso, safe_source_ids, sources = context
+        recent_texts = self._recent_texts()
+        evaluations = []
 
-        try:
-            candidate = self.generator.generate_grounded_tweet(
-                category,
-                sources,
-                include_link,
+        for candidate_index in range(3):
+            attempt = candidate_index + 1
+            try:
+                candidate = self.generator.generate_grounded_tweet(
+                    category,
+                    sources,
+                    include_link,
+                    candidate_index=candidate_index,
+                )
+            except Exception:
+                evaluation = _CandidateEvaluation(
+                    None,
+                    "generation_failed",
+                    {
+                        "reason_codes": ["generation_unavailable"],
+                        "source_ids": safe_source_ids,
+                    },
+                    True,
+                )
+            else:
+                if candidate is None:
+                    evaluation = _CandidateEvaluation(
+                        None,
+                        "generation_failed",
+                        {
+                            "reason_codes": ["generation_unavailable"],
+                            "source_ids": safe_source_ids,
+                        },
+                        True,
+                    )
+                else:
+                    text = (
+                        candidate.get("text")
+                        if isinstance(candidate, dict)
+                        else None
+                    )
+                    evaluation = self._evaluate_copy(
+                        text=text,
+                        category=category,
+                        safe_source_ids=safe_source_ids,
+                        sources=sources,
+                        slot_iso=slot_iso,
+                        recent_texts=recent_texts,
+                    )
+
+            evaluations.append((attempt, evaluation))
+            if evaluation.abort:
+                details = {
+                    "attempt": attempt,
+                    "source_ids": safe_source_ids,
+                    **evaluation.details,
+                }
+                self._record(slot_iso, category, evaluation.outcome, details)
+                return None
+
+        eligible = [
+            (attempt, evaluation.prepared)
+            for attempt, evaluation in evaluations
+            if evaluation.prepared is not None
+        ]
+        if eligible:
+            best_attempt, best = max(
+                eligible,
+                key=lambda item: item[1].score_data["total"],
             )
-        except Exception:
+            if best.score_data["total"] >= self.score_threshold:
+                return best
             self._record(
                 slot_iso,
                 category,
-                "generation_failed",
+                "rejected_score",
                 {
-                    "reason_codes": ["generation_unavailable"],
+                    "attempt": best_attempt,
                     "source_ids": safe_source_ids,
+                    "scores": best.score_data,
                 },
             )
             return None
-        if not isinstance(candidate, dict) or not isinstance(
-            candidate.get("text"), str
-        ):
-            self._record(
-                slot_iso,
-                category,
-                "generation_failed",
-                {"source_ids": safe_source_ids},
-            )
-            return None
-        return self._validate_copy(
-            text=candidate["text"],
-            category=category,
-            safe_source_ids=safe_source_ids,
-            sources=sources,
-            slot_iso=slot_iso,
-        )
+
+        attempt, evaluation = evaluations[-1]
+        details = {
+            "attempt": attempt,
+            "source_ids": safe_source_ids,
+            **evaluation.details,
+        }
+        self._record(slot_iso, category, evaluation.outcome, details)
+        return None
 
     def _persist(self, prepared: _PreparedDraft) -> Optional[Dict]:
         draft, outcome = self.db.create_or_get_post_draft(
