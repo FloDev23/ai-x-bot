@@ -49,8 +49,15 @@ class Publisher:
         self.clock = clock or (lambda: datetime.now(self.timezone))
         self.grace_seconds = grace_seconds
 
-    def publish(self, draft_id, now=None):
+    def publish(self, draft_id, now=None, expected_revision=None):
         draft = self.db.get_post_draft(draft_id)
+        if expected_revision is not None and (
+            type(expected_revision) is not int
+            or expected_revision <= 0
+            or draft is None
+            or draft.get("revision") != expected_revision
+        ):
+            return PublishResult("snapshot_changed")
         if not draft:
             return PublishResult("not_found")
         if draft.get("published_tweet_id"):

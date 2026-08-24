@@ -162,6 +162,24 @@ def test_unapproved_draft_never_calls_x(publisher, fake_x, fake_db):
     assert fake_x.posts == []
 
 
+@pytest.mark.parametrize("expected_revision", [True, 0, -1, 2, "1"])
+def test_expected_revision_mismatch_fails_before_x(
+    publisher,
+    fake_x,
+    fake_db,
+    expected_revision,
+):
+    result = publisher.publish(
+        fake_db.draft["id"],
+        fake_db.slot,
+        expected_revision=expected_revision,
+    )
+
+    assert result.status == "snapshot_changed"
+    assert fake_db.draft["status"] == "approved"
+    assert fake_x.posts == []
+
+
 def test_pause_is_checked_immediately_before_write(publisher, fake_x, fake_db):
     fake_db.paused = True
 
