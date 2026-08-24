@@ -328,6 +328,33 @@ def test_reconcile_prefers_valid_expiring_source_then_category_diversity(tmp_pat
         assert "traduzione" not in encoded.lower()
 
 
+def test_reconcile_ignores_old_legacy_naive_link_rows_at_atomic_boundary(tmp_path):
+    db = Database(str(tmp_path / "legacy-naive-link-quota.db"))
+    linked_id = _approved_queue_draft(
+        db,
+        text="Read https://flexdropin.com/blog/operator-guide",
+        category="proof",
+        score=90,
+    )
+    with db._conn() as conn:
+        conn.execute(
+            "INSERT INTO posted_tweets "
+            "(tweet_id,text,category,has_link,created_at) VALUES (?,?,?,?,?)",
+            (
+                "3001",
+                "Old linked post",
+                "proof",
+                1,
+                "2026-08-01T12:00:00",
+            ),
+        )
+
+    plans = _planner(db).reconcile(NOW)
+
+    assert plans[0]["draft_id"] == linked_id
+    assert plans[0]["status"] == "planned"
+
+
 def test_reconcile_blocks_source_expiring_before_safety_margin(tmp_path):
     db = Database(str(tmp_path / "expiry-block.db"))
     blocked_id = _approved_queue_draft(

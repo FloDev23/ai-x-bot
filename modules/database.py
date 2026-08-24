@@ -2646,10 +2646,12 @@ class Database:
                         SELECT created_at FROM posted_tweets WHERE has_link = 1
                     """).fetchall()
                     for row in posted_links:
-                        created = self._strict_aware_datetime(row["created_at"])
-                        if created is None:
+                        try:
+                            created = self._parse_datetime(row["created_at"])
+                        except (TypeError, ValueError):
                             link_count += 1
-                        elif since <= created <= scheduled:
+                            continue
+                        if since <= created <= scheduled:
                             link_count += 1
                     planned_links = conn.execute("""
                         SELECT p.scheduled_for, d.text
