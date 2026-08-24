@@ -183,6 +183,9 @@ class FakeGroundedGenerator:
             "tags": ["studio"],
         }
 
+    def translate_review_copy(self, english_text):
+        return f"Traduzione italiana fedele: {english_text}"
+
 
 class FakeEditorialScorer:
     def score_draft(self, _text, sources=None, recent_texts=None):
@@ -271,6 +274,9 @@ class FakeScheduler:
         args=None,
         kwargs=None,
         replace_existing=False,
+        coalesce=False,
+        max_instances=1,
+        misfire_grace_time=None,
     ):
         if id in self.jobs and not replace_existing:
             raise ValueError("duplicate job")
@@ -281,6 +287,9 @@ class FakeScheduler:
             name=name,
             args=tuple(args or ()),
             kwargs=dict(kwargs or {}),
+            coalesce=coalesce,
+            max_instances=max_instances,
+            misfire_grace_time=misfire_grace_time,
             next_run_time=None,
         )
         self.jobs[id] = job

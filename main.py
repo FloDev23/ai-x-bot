@@ -2,19 +2,26 @@
 """Approval-only orchestration for the FlexDropin X growth agent."""
 
 import logging
+import secrets
 import sys
 import threading
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from config import (
+    ADAPTIVE_TIMING_MIN_POSTS,
+    ADAPTIVE_WEEKDAY_MIN_POSTS,
+    APPROVED_QUEUE_TARGET,
+    AUDIENCE_TIMEZONE,
     BOT_TIMEZONE,
     CONTENT_SLOTS,
     DRAFT_LEAD_MINUTES,
+    DRAFT_GENERATION_DAILY_CAP,
     DRAFT_SCORE_THRESHOLD,
     DRY_RUN,
     ENABLE_LEAD_DISCOVERY,
@@ -23,15 +30,21 @@ from config import (
     MEDIA_LIBRARY_DIR,
     MEDIA_MATCH_THRESHOLD,
     MAX_LINKS_PER_WEEK,
+    MIN_POST_GAP_HOURS,
+    MORNING_WINDOW,
     NEWS_TRUSTED_DOMAINS,
     OPPORTUNITY_CYCLE_TIMES,
     PUBLISH_GRACE_SECONDS,
+    PUBLICATION_PLAN_GRACE_MINUTES,
+    PENDING_REVIEW_LIMIT,
     SEARCH_TOPICS,
     SEMANTIC_DUPLICATE_THRESHOLD,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
+    EVENING_WINDOW,
     validate_config,
 )
+from modules.adaptive_timing import AdaptiveTimingPolicy
 from modules.ai_generator import AIGenerator
 from modules.analytics import PerformanceAnalyzer
 from modules.content_planner import ContentPlanner
@@ -46,6 +59,12 @@ from modules.media_processor import MediaProcessor
 from modules.news_fetcher import NewsFetcher
 from modules.notifier import TelegramNotifier
 from modules.publisher import PublishResult, Publisher
+from modules.publication_queue import (
+    PublicationPlanner,
+    QueueReplenisher,
+    QueueReplenishResult,
+)
+from modules.review_translation import ReviewTranslator
 from modules.scoring import TweetScorer
 from modules.source_ingestion import SourceIngestor
 from modules.source_refresh import (
@@ -70,6 +89,7 @@ class FlexDropinGrowthAgent:
     """Wire safe application components and the explicit production schedule."""
 
     _DEPENDENCY_KEYS = frozenset({
+        "adaptive_timing",
         "analytics",
         "approval_required",
         "authorized_chat_id",
@@ -94,6 +114,9 @@ class FlexDropinGrowthAgent:
         "notifier",
         "planner",
         "publisher",
+        "publication_planner",
+        "queue_replenisher",
+        "review_translator",
         "scheduler",
         "scorer",
         "source_ingestor",
@@ -199,6 +222,21 @@ class FlexDropinGrowthAgent:
             self._build_editorial_feed_client,
         )
         self.ai_generator = resolve("generator", AIGenerator)
+        self.review_translator = resolve(
+            "review_translator",
+            lambda: ReviewTranslator(self.ai_generator),
+        )
+        self.adaptive_timing = resolve(
+            "adaptive_timing",
+            lambda: AdaptiveTimingPolicy(
+                audience_timezone=AUDIENCE_TIMEZONE,
+                morning_window=MORNING_WINDOW,
+                evening_window=EVENING_WINDOW,
+                minimum_gap_hours=MIN_POST_GAP_HOURS,
+                timing_min_posts=ADAPTIVE_TIMING_MIN_POSTS,
+                weekday_min_posts=ADAPTIVE_WEEKDAY_MIN_POSTS,
+            ),
+        )
         self.twitter_client = resolve("x_client", TwitterClient)
         self.scorer = resolve(
             "scorer",
@@ -261,6 +299,19 @@ class FlexDropinGrowthAgent:
                 threshold=MEDIA_MATCH_THRESHOLD,
             ),
         )
+        self.queue_replenisher = resolve(
+            "queue_replenisher",
+            lambda: QueueReplenisher(
+                db=self.db,
+                pipeline=self.draft_pipeline,
+                translator=self.review_translator,
+                media_matcher=self.media_matcher,
+                operator_timezone="Europe/Rome",
+                approved_queue_target=APPROVED_QUEUE_TARGET,
+                pending_review_limit=PENDING_REVIEW_LIMIT,
+                daily_generation_cap=DRAFT_GENERATION_DAILY_CAP,
+            ),
+        )
         self.publisher = resolve(
             "publisher",
             lambda: Publisher(
@@ -270,6 +321,7 @@ class FlexDropinGrowthAgent:
                 clock=self.clock,
                 grace_seconds=PUBLISH_GRACE_SECONDS,
                 timezone_name=self.timezone_name,
+                plan_grace_minutes=PUBLICATION_PLAN_GRACE_MINUTES,
             ),
         )
         self.analytics = resolve(
@@ -277,6 +329,20 @@ class FlexDropinGrowthAgent:
             lambda: PerformanceAnalyzer(self.twitter_client, self.db),
         )
         self.analyzer = self.analytics
+        self.publication_planner = resolve(
+            "publication_planner",
+            lambda: PublicationPlanner(
+                db=self.db,
+                timing_policy=self.adaptive_timing,
+                timing_sample_provider=self.analytics.timing_samples,
+                now_fn=self.clock,
+                audience_timezone=AUDIENCE_TIMEZONE,
+                installation_id_provider=lambda: secrets.token_hex(16),
+                source_expiry_safety_margin=timedelta(hours=2),
+                max_links_per_week=MAX_LINKS_PER_WEEK,
+                dry_run=self.dry_run,
+            ),
+        )
         self.growth_discovery = resolve(
             "growth_discovery",
             lambda: GrowthDiscovery(self.twitter_client, self.db),
@@ -307,6 +373,7 @@ class FlexDropinGrowthAgent:
                 media_matcher=self.media_matcher,
                 analytics=self.analytics,
                 scheduler_status=self.scheduler_status,
+                queue_service=self.queue_replenisher,
                 dry_run=self.dry_run,
                 now_fn=self.clock,
                 poll_timeout=supplied.get(
@@ -441,6 +508,85 @@ class FlexDropinGrowthAgent:
             self._notify_error("cycle", error)
             return PublishResult("publication_failed")
 
+    def queue_replenishment_cycle(self, now=None):
+        if self.stop_event.is_set():
+            return QueueReplenishResult("failed", None, False)
+        try:
+            current = self._now() if now is None else now
+            result = self.queue_replenisher.run(current)
+            if not isinstance(result, QueueReplenishResult):
+                raise ValueError("invalid queue replenishment result")
+            if (
+                not self.stop_event.is_set()
+                and result.announce
+                and result.draft_id is not None
+            ):
+                draft = self.db.get_queue_draft(result.draft_id)
+                if draft is not None:
+                    self.telegram_controller._send_draft_card(
+                        self.authorized_chat_id,
+                        draft,
+                    )
+            return result
+        except Exception as error:
+            self._notify_error("queue_replenishment_cycle", error)
+            return QueueReplenishResult("failed", None, False)
+
+    def translation_retry_cycle(self, now=None):
+        if self.stop_event.is_set():
+            return []
+        try:
+            current = self._now() if now is None else now
+            ready_ids = self.queue_replenisher.retry_pending_translations(
+                current,
+                limit=3,
+            )
+            if type(ready_ids) is not list:
+                raise ValueError("invalid translation retry result")
+            announced = []
+            for draft_id in ready_ids:
+                if self.stop_event.is_set():
+                    break
+                if type(draft_id) is not int or draft_id <= 0:
+                    continue
+                draft = self.db.get_queue_draft(draft_id)
+                if draft is None or draft.get("translation_status") != "ready":
+                    continue
+                self.telegram_controller._send_draft_card(
+                    self.authorized_chat_id,
+                    draft,
+                )
+                announced.append(draft_id)
+            return announced
+        except Exception as error:
+            self._notify_error("translation_retry_cycle", error)
+            return []
+
+    def publication_planning_cycle(self, now=None):
+        if self.stop_event.is_set():
+            return []
+        try:
+            current = self._now() if now is None else now
+            plans = self.publication_planner.reconcile(current)
+            return plans if type(plans) is list else []
+        except Exception as error:
+            self._notify_error("publication_planning_cycle", error)
+            return []
+
+    def adaptive_publish_cycle(self, now=None):
+        if self.stop_event.is_set():
+            return []
+        try:
+            current = self._now() if now is None else now
+            results = self.publication_planner.publish_due(
+                current,
+                publisher=self.publisher,
+            )
+            return results if type(results) is list else []
+        except Exception as error:
+            self._notify_error("adaptive_publish_cycle", error)
+            return []
+
     def growth_discovery_cycle(self, now=None):
         try:
             candidates = self.growth_discovery.run(
@@ -529,6 +675,20 @@ class FlexDropinGrowthAgent:
             replace_existing=True,
         )
 
+    def _add_interval_job(self, function, *, job_id, name, minutes):
+        if type(minutes) is not int or minutes <= 0:
+            raise ValueError("interval minutes must be a positive integer")
+        return self.scheduler.add_job(
+            function,
+            IntervalTrigger(minutes=minutes, timezone=self.timezone),
+            id=job_id,
+            name=name,
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=max(60, minutes * 60),
+        )
+
     def register_jobs(self):
         """Register the complete allowlisted schedule, and nothing else."""
         self._add_cron_job(
@@ -538,27 +698,30 @@ class FlexDropinGrowthAgent:
             hour=10,
             minute=30,
         )
-        for slot_time in self.content_slots:
-            slot_hour, slot_minute = self._slot_parts(slot_time)
-            draft_minute = (
-                slot_hour * 60 + slot_minute - self.draft_lead_minutes
-            ) % (24 * 60)
-            self._add_cron_job(
-                self.create_draft_cycle,
-                job_id=f"draft_{slot_time}",
-                name=f"Create draft for {slot_time}",
-                hour=draft_minute // 60,
-                minute=draft_minute % 60,
-                args=(slot_time,),
-            )
-            self._add_cron_job(
-                self.publish_cycle,
-                job_id=f"publish_{slot_time}",
-                name=f"Publish approved draft for {slot_time}",
-                hour=slot_hour,
-                minute=slot_minute,
-                args=(slot_time,),
-            )
+        self._add_interval_job(
+            self.queue_replenishment_cycle,
+            job_id="queue_replenishment",
+            name="Approved queue replenishment",
+            minutes=30,
+        )
+        self._add_interval_job(
+            self.translation_retry_cycle,
+            job_id="translation_retry",
+            name="Italian review translation retry",
+            minutes=30,
+        )
+        self._add_interval_job(
+            self.publication_planning_cycle,
+            job_id="publication_planning",
+            name="Adaptive US publication planning",
+            minutes=15,
+        )
+        self._add_interval_job(
+            self.adaptive_publish_cycle,
+            job_id="adaptive_publish",
+            name="Publish due approved plan",
+            minutes=5,
+        )
         self._add_cron_job(
             self.growth_discovery_cycle,
             job_id="growth_discovery",

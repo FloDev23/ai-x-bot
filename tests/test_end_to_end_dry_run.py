@@ -210,6 +210,93 @@ def test_source_to_approval_to_dry_run_without_external_writes(agent_and_fakes):
     assert fakes["x_client"].engagement_writes == []
 
 
+def test_bilingual_queue_plans_and_simulates_two_us_posts_restart_safely(tmp_path):
+    dependencies = dependency_bundle(tmp_path)
+    agent = FlexDropinGrowthAgent(dependencies)
+    source_id = agent.db.add_content_source(
+        "founder_note",
+        "I decided to protect attention by publishing only useful operator notes.",
+        metadata={"publishable": True},
+        verified_by="floriano",
+    )
+
+    replenished = agent.queue_replenishment_cycle(now=NOW)
+
+    assert replenished.outcome == "created"
+    assert replenished.announce is True
+    first = agent.db.get_queue_draft(replenished.draft_id)
+    assert first["translation_status"] == "ready"
+    rendered = "\n".join(
+        text for _chat_id, text, _kwargs in dependencies["telegram_api"].messages
+    )
+    assert "Tweet da pubblicare" in rendered
+    assert first["text"] in rendered
+    assert "Traduzione italiana — solo per revisione" in rendered
+    assert first["translation_it"] in rendered
+    assert agent.telegram_controller.process_update(
+        callback_update(3301, f"draft:approve:{first['id']}"),
+    ) == "processed"
+
+    for index in range(6):
+        draft_id = agent.db.create_post_draft(
+            f"Approved reserve note {index}",
+            "proof" if index % 2 else "gym_strategy",
+            [source_id],
+            {"total": 90 - index},
+            NOW.replace(day=20, hour=12, minute=index).isoformat(),
+            f"adaptive-reserve:{index}",
+        )
+        queued = agent.db.ensure_editorial_queue(draft_id)
+        assert agent.db.save_review_translation(
+            draft_id,
+            queued["revision"],
+            f"Nota approvata della riserva {index}",
+        )
+        ready = agent.db.get_queue_draft(draft_id)
+        assert agent.db.approve_queued_draft_atomic(
+            draft_id,
+            ready["revision"],
+            ready["queue_revision"],
+            "floriano",
+            NOW.isoformat(),
+        )
+
+    counts = agent.db.get_queue_counts(NOW.date(), "Europe/Rome")
+    assert counts["approved_or_planned"] == 7
+    plans = agent.publication_planning_cycle(now=NOW)
+    assert len(plans) == 2
+    assert all(plan["status"] == "planned" for plan in plans)
+    due = max(datetime.fromisoformat(plan["scheduled_for"]) for plan in plans)
+
+    simulated = agent.adaptive_publish_cycle(now=due)
+
+    assert len(simulated) == 2
+    assert all(plan["status"] == "simulated" for plan in simulated)
+    assert dependencies["x_client"].posts == []
+    assert all(
+        draft["status"] == "approved"
+        for draft in agent.db.list_post_drafts(["approved"])
+    )
+
+    message_count = len(dependencies["telegram_api"].messages)
+    restart_dependencies = dependency_bundle(
+        tmp_path / "restart-boundaries",
+        db=Database(agent.db.db_path),
+        telegram_api=dependencies["telegram_api"],
+        clock=lambda: due,
+    )
+    restarted = FlexDropinGrowthAgent(restart_dependencies)
+    assert restarted.queue_replenishment_cycle(now=due).outcome == "queue_full"
+    restarted_plans = restarted.publication_planning_cycle(now=NOW)
+    assert [plan["id"] for plan in restarted_plans] == [
+        plan["id"] for plan in plans
+    ]
+    assert all(plan["status"] == "simulated" for plan in restarted_plans)
+    assert restarted.adaptive_publish_cycle(now=due) == []
+    assert len(dependencies["telegram_api"].messages) == message_count
+    assert restart_dependencies["x_client"].posts == []
+
+
 def test_automatic_sources_create_one_grounded_card_without_x_write(tmp_path):
     feed = FakeEditorialFeedClient()
     feed.records = _official_feed_records()
@@ -582,10 +669,10 @@ def test_register_jobs_uses_rome_timezone_and_only_safe_jobs(agent_and_fakes):
 
     assert {job.id for job in jobs} == {
         "source_refresh",
-        "draft_14:00",
-        "draft_20:00",
-        "publish_14:00",
-        "publish_20:00",
+        "queue_replenishment",
+        "translation_retry",
+        "publication_planning",
+        "adaptive_publish",
         "growth_discovery",
         "follower_snapshot",
         "performance_metrics",
@@ -598,19 +685,28 @@ def test_register_jobs_uses_rome_timezone_and_only_safe_jobs(agent_and_fakes):
             str(job.trigger.fields[5]),
             str(job.trigger.fields[6]),
         )
-        for job in jobs
+        for job in jobs if hasattr(job.trigger, "fields")
     }
     assert schedule == {
         "source_refresh": ("*", "10", "30"),
-        "draft_14:00": ("*", "12", "0"),
-        "draft_20:00": ("*", "18", "0"),
-        "publish_14:00": ("*", "14", "0"),
-        "publish_20:00": ("*", "20", "0"),
         "growth_discovery": ("*", "11", "0"),
         "follower_snapshot": ("*", "23", "15"),
         "performance_metrics": ("*", "23", "30"),
         "weekly_growth_report": ("mon", "9", "0"),
     }
+    intervals = {
+        job.id: int(job.trigger.interval.total_seconds() // 60)
+        for job in jobs if hasattr(job.trigger, "interval")
+    }
+    assert intervals == {
+        "queue_replenishment": 30,
+        "translation_retry": 30,
+        "publication_planning": 15,
+        "adaptive_publish": 5,
+    }
+    assert all(job.coalesce is True for job in jobs if job.id in intervals)
+    assert all(job.max_instances == 1 for job in jobs if job.id in intervals)
+    assert not any(job.id.startswith(("draft_", "publish_")) for job in jobs)
     assert not any(job.id.startswith(
         ("engagement_", "follow_", "unfollow_", "human_", "build_")
     ) for job in jobs)
@@ -621,6 +717,74 @@ def test_register_jobs_uses_rome_timezone_and_only_safe_jobs(agent_and_fakes):
     assert source_job.trigger.fields[5].expressions[0].first == 10
     assert source_job.trigger.fields[6].expressions[0].first == 30
     assert not any(job.id == "verified_news_refresh" for job in jobs)
+
+
+def test_adaptive_cycles_use_one_clock_read_and_stop_event(tmp_path):
+    from modules.publication_queue import QueueReplenishResult
+
+    class CountingClock:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            return NOW
+
+    class QueueService:
+        def __init__(self):
+            self.run_calls = []
+            self.retry_calls = []
+
+        def run(self, now):
+            self.run_calls.append(now)
+            return QueueReplenishResult("queue_full", None, False)
+
+        def retry_pending_translations(self, now, limit=3):
+            self.retry_calls.append((now, limit))
+            return []
+
+    class PlanService:
+        def __init__(self):
+            self.reconcile_calls = []
+            self.publish_calls = []
+
+        def reconcile(self, now):
+            self.reconcile_calls.append(now)
+            return []
+
+        def publish_due(self, now, *, publisher):
+            self.publish_calls.append((now, publisher))
+            return []
+
+    clock = CountingClock()
+    queue = QueueService()
+    plans = PlanService()
+    dependencies = dependency_bundle(
+        tmp_path,
+        clock=clock,
+        adaptive_timing=object(),
+        review_translator=object(),
+        queue_replenisher=queue,
+        publication_planner=plans,
+    )
+    agent = FlexDropinGrowthAgent(dependencies)
+
+    assert agent.queue_replenishment_cycle().outcome == "queue_full"
+    assert agent.translation_retry_cycle() == []
+    assert agent.publication_planning_cycle() == []
+    assert agent.adaptive_publish_cycle() == []
+    assert clock.calls == 4
+    assert queue.run_calls == [NOW]
+    assert queue.retry_calls == [(NOW, 3)]
+    assert plans.reconcile_calls == [NOW]
+    assert plans.publish_calls == [(NOW, agent.publisher)]
+
+    agent.stop_event.set()
+    assert agent.queue_replenishment_cycle().outcome == "failed"
+    assert agent.translation_retry_cycle() == []
+    assert agent.publication_planning_cycle() == []
+    assert agent.adaptive_publish_cycle() == []
+    assert clock.calls == 4
 
 
 @pytest.mark.parametrize(
@@ -914,6 +1078,10 @@ def test_falsey_required_boundary_is_used_without_production_fallback(
     ("dependency_name", "agent_attribute"),
     (
         ("notifier", "notifier"),
+        ("adaptive_timing", "adaptive_timing"),
+        ("review_translator", "review_translator"),
+        ("queue_replenisher", "queue_replenisher"),
+        ("publication_planner", "publication_planner"),
         ("planner", "content_planner"),
         ("source_ingestor", "source_ingestor"),
         ("source_refresh", "source_refresh"),
