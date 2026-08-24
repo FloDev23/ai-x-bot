@@ -5,12 +5,38 @@ from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+
+class NewsFetchUnavailable(RuntimeError):
+    pass
+
 class NewsFetcher:
     """Fetcha notizie da NewsAPI"""
     
-    def __init__(self, api_key: str = NEWSAPI_KEY, base_url: str = NEWSAPI_BASE_URL):
+    def __init__(
+        self,
+        api_key: str = NEWSAPI_KEY,
+        base_url: str = NEWSAPI_BASE_URL,
+        requests_client=requests,
+    ):
         self.api_key = api_key
         self.base_url = base_url
+        self.requests = requests_client
+
+    def _fetch(self, path, params, limit):
+        try:
+            response = self.requests.get(
+                f"{self.base_url}/{path}",
+                params=params,
+                timeout=10,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if type(payload) is not dict or type(payload.get("articles")) is not list:
+                raise ValueError("invalid response shape")
+            return payload["articles"][:limit]
+        except Exception:
+            logger.error("News fetch unavailable")
+            raise NewsFetchUnavailable("news_fetch_unavailable") from None
     
     def get_trending_news(self, query: str, limit: int = MAX_SEARCH_RESULTS) -> List[Dict]:
         """
@@ -26,29 +52,13 @@ class NewsFetcher:
         if not self.api_key:
             logger.info("News fetching disabled because NEWSAPI_KEY is not configured")
             return []
-        try:
-            params = {
-                'q': query,
-                'sortBy': 'publishedAt',
-                'language': 'en',
-                'apiKey': self.api_key
-            }
-            
-            response = requests.get(
-                f'{self.base_url}/everything',
-                params=params,
-                timeout=10
-            )
-            response.raise_for_status()
-            
-            articles = response.json().get('articles', [])
-            logger.info(f"✅ Trovate {len(articles)} notizie per: {query}")
-            
-            return articles[:limit]
-        
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Errore nel fetching delle notizie: {e}")
-            return []
+        params = {
+            'q': query,
+            'sortBy': 'publishedAt',
+            'language': 'en',
+            'apiKey': self.api_key
+        }
+        return self._fetch("everything", params, limit)
     
     def get_latest_news_by_source(self, source: str, limit: int = MAX_SEARCH_RESULTS) -> List[Dict]:
         """
@@ -64,25 +74,9 @@ class NewsFetcher:
         if not self.api_key:
             logger.info("News fetching disabled because NEWSAPI_KEY is not configured")
             return []
-        try:
-            params = {
-                'sources': source,
-                'sortBy': 'publishedAt',
-                'apiKey': self.api_key
-            }
-            
-            response = requests.get(
-                f'{self.base_url}/top-headlines',
-                params=params,
-                timeout=10
-            )
-            response.raise_for_status()
-            
-            articles = response.json().get('articles', [])
-            logger.info(f"✅ Trovate {len(articles)} notizie da: {source}")
-            
-            return articles[:limit]
-        
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Errore nel fetching delle notizie: {e}")
-            return []
+        params = {
+            'sources': source,
+            'sortBy': 'publishedAt',
+            'apiKey': self.api_key
+        }
+        return self._fetch("top-headlines", params, limit)

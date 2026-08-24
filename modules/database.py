@@ -1019,6 +1019,92 @@ class Database:
                 conn.rollback()
                 raise
 
+    def insert_verified_news_batch(self, records: List[Dict]) -> int:
+        """Insert complete verified-news rows in one SQLite transaction."""
+        if type(records) is not list:
+            raise ValueError("invalid_verified_news_batch")
+        prepared = []
+        seen_urls = set()
+        for record in records:
+            if (
+                type(record) is not dict
+                or frozenset(record) != frozenset({
+                    "source_type",
+                    "text",
+                    "url",
+                    "metadata",
+                    "trust_state",
+                    "verified_by",
+                })
+                or record.get("source_type") != "verified_news"
+                or record.get("trust_state") != "verified"
+                or record.get("verified_by") != "trusted_news_ingestion"
+                or type(record.get("metadata")) is not dict
+                or frozenset(record["metadata"]) != frozenset({
+                    "title",
+                    "summary",
+                    "published_at",
+                    "source_name",
+                })
+                or record.get("text") != record["metadata"].get("summary")
+                or not is_complete_verified_news(record)
+            ):
+                raise ValueError("invalid_verified_news_batch")
+            url = record.get("url")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            prepared.append(record)
+
+        now = self._now_iso()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing_urls = set()
+                if prepared:
+                    placeholders = ", ".join("?" for _ in prepared)
+                    rows = conn.execute(
+                        "SELECT url FROM content_sources WHERE url IN ("
+                        + placeholders
+                        + ")",
+                        [record["url"] for record in prepared],
+                    ).fetchall()
+                    existing_urls = {row["url"] for row in rows}
+
+                inserted = 0
+                for record in prepared:
+                    if record["url"] in existing_urls:
+                        continue
+                    metadata_json = json.dumps(
+                        record["metadata"],
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    conn.execute("""
+                        INSERT INTO content_sources (
+                            source_type, text, url, metadata_json,
+                            trust_state, verified_by, verified_at,
+                            expires_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    """, (
+                        "verified_news",
+                        record["text"],
+                        record["url"],
+                        metadata_json,
+                        "verified",
+                        "trusted_news_ingestion",
+                        now,
+                        now,
+                        now,
+                    ))
+                    inserted += 1
+                return inserted
+            except Exception:
+                conn.rollback()
+                raise
+
     def _eligible_content_sources_in_conn(
         self,
         conn,

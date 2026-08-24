@@ -23,10 +23,15 @@ class SourceIngestor:
 
     def refresh_verified_news(self, topics, per_topic: int = 1) -> int:
         """Store at most ``per_topic`` complete articles from trusted domains."""
-        if not self.trusted_domains or per_topic <= 0:
+        if (
+            not self.trusted_domains
+            or type(per_topic) is not int
+            or per_topic <= 0
+        ):
             return 0
 
-        inserted = 0
+        records = []
+        seen_urls = set()
         for topic in topics:
             articles = self.news_fetcher.get_trending_news(topic, limit=per_topic)
             stored_for_topic = 0
@@ -34,24 +39,24 @@ class SourceIngestor:
                 if stored_for_topic >= per_topic:
                     break
                 details = self._valid_article_details(article)
-                if not details or self.database.content_source_exists(details["url"]):
+                if not details or details["url"] in seen_urls:
                     continue
-                self.database.add_content_source(
-                    source_type="verified_news",
-                    text=details["summary"],
-                    url=details["url"],
-                    metadata={
+                seen_urls.add(details["url"])
+                records.append({
+                    "source_type": "verified_news",
+                    "text": details["summary"],
+                    "url": details["url"],
+                    "metadata": {
                         "title": details["title"],
                         "summary": details["summary"],
                         "published_at": details["published_at"],
                         "source_name": details["source_name"],
                     },
-                    trust_state="verified",
-                    verified_by="trusted_news_ingestion",
-                )
-                inserted += 1
+                    "trust_state": "verified",
+                    "verified_by": "trusted_news_ingestion",
+                })
                 stored_for_topic += 1
-        return inserted
+        return self.database.insert_verified_news_batch(records)
 
     def _valid_article_details(self, article):
         if not isinstance(article, dict):

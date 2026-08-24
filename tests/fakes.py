@@ -42,6 +42,15 @@ class FakeDatabase:
         self.added_sources.append(stored)
         return source_id
 
+    def insert_verified_news_batch(self, records):
+        inserted = 0
+        for record in records:
+            if self.content_source_exists(record["url"]):
+                continue
+            self.add_content_source(**record)
+            inserted += 1
+        return inserted
+
     def claim_telegram_update(self, update_id, chat_id):
         if update_id in self.telegram_updates:
             return False
