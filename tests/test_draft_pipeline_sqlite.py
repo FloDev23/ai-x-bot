@@ -182,15 +182,19 @@ class _PassingScorer:
 
 
 class _IndexedGenerator:
-    def __init__(self, texts):
+    def __init__(self, texts, raw_reasoning):
         self.texts = tuple(texts)
+        self.raw_reasoning = tuple(raw_reasoning)
         self.candidate_indices = []
 
     def generate_grounded_tweet(
         self, _category, _sources, _include_link, candidate_index=None
     ):
         self.candidate_indices.append(candidate_index)
-        return {"text": self.texts[candidate_index]}
+        return {
+            "text": self.texts[candidate_index],
+            "raw_reasoning": self.raw_reasoning[candidate_index],
+        }
 
 
 class _TextScorer:
@@ -208,12 +212,34 @@ def _candidate_pipeline(db, source_id):
         "Candidate two is the SQLite winner.",
         "Candidate three stays out of storage.",
     )
+    raw_reasoning = (
+        "PRIVATE_GENERATOR_REASONING_LOSER_ONE",
+        "PRIVATE_GENERATOR_REASONING_WINNER",
+        "PRIVATE_GENERATOR_REASONING_LOSER_THREE",
+    )
+    scorer_reasoning = (
+        "PRIVATE_SCORER_REASONING_LOSER_ONE",
+        "PRIVATE_SCORER_REASONING_WINNER",
+        "PRIVATE_SCORER_REASONING_LOSER_THREE",
+    )
     scores = {
-        texts[0]: {"total": 78, "hook": 7},
-        texts[1]: {"total": 93, "hook": 10},
-        texts[2]: {"total": 86, "hook": 8},
+        texts[0]: {
+            "total": 78,
+            "hook": 7,
+            "reasoning": scorer_reasoning[0],
+        },
+        texts[1]: {
+            "total": 93,
+            "hook": 10,
+            "reasoning": scorer_reasoning[1],
+        },
+        texts[2]: {
+            "total": 86,
+            "hook": 8,
+            "reasoning": scorer_reasoning[2],
+        },
     }
-    generator = _IndexedGenerator(texts)
+    generator = _IndexedGenerator(texts, raw_reasoning)
     pipeline = DraftPipeline(
         db,
         _FixedPlanner(source_id),
@@ -221,39 +247,49 @@ def _candidate_pipeline(db, source_id):
         _ApprovedGuard(),
         _TextScorer(scores),
     )
-    return pipeline, generator, texts, scores
+    return (
+        pipeline,
+        generator,
+        texts,
+        raw_reasoning + scorer_reasoning,
+    )
 
 
-def test_candidate_tournament_persists_only_sqlite_winner(tmp_path):
+def test_candidate_tournament_persists_only_sqlite_winner_without_reasoning(
+    tmp_path,
+):
     db = Database(str(tmp_path / "bot.db"))
     source_id = _source(db)
-    pipeline, generator, texts, scores = _candidate_pipeline(db, source_id)
+    pipeline, generator, texts, private_reasoning = (
+        _candidate_pipeline(db, source_id)
+    )
 
     draft = pipeline.create_for_slot(datetime.fromisoformat(SLOT))
 
-    assert draft["text"] == texts[1]
-    assert draft["score_data"] == scores[texts[1]]
     assert draft["status"] == "pending_approval"
     assert generator.candidate_indices == [0, 1, 2]
     with db._conn() as conn:
         stored = conn.execute(
-            "SELECT text, score_json, status FROM post_drafts "
+            "SELECT * FROM post_drafts "
             "WHERE intended_slot = ?",
             (SLOT,),
         ).fetchall()
         evaluations = conn.execute(
-            "SELECT outcome, details_json FROM draft_evaluations "
+            "SELECT * FROM draft_evaluations "
             "WHERE intended_slot = ?",
             (SLOT,),
         ).fetchall()
     assert len(stored) == 1
+    raw_sqlite_payload = repr([dict(row) for row in stored + evaluations])
+    assert all(value not in raw_sqlite_payload for value in private_reasoning)
+    assert draft["text"] == texts[1]
     assert stored[0]["text"] == texts[1]
-    assert json.loads(stored[0]["score_json"]) == scores[texts[1]]
+    assert draft["score_data"] == {"total": 93, "hook": 10}
+    assert json.loads(stored[0]["score_json"]) == {"total": 93, "hook": 10}
     assert stored[0]["status"] == "pending_approval"
     assert [row["outcome"] for row in evaluations] == ["pending_approval"]
-    persisted_payload = repr([dict(row) for row in stored + evaluations])
-    assert texts[0] not in persisted_payload
-    assert texts[2] not in persisted_payload
+    assert texts[0] not in raw_sqlite_payload
+    assert texts[2] not in raw_sqlite_payload
 
 
 class _BarrierBeforePersistenceDatabase(Database):

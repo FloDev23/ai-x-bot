@@ -1,3 +1,4 @@
+import json
 import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -67,6 +68,23 @@ class CandidateScorer:
         return {"total": self.scores[text]}
 
 
+def _candidate_agent(tmp_path, texts, scores):
+    generator = CandidateGenerator(texts)
+    dependencies = dependency_bundle(
+        tmp_path,
+        generator=generator,
+        scorer=CandidateScorer(scores),
+    )
+    agent = FlexDropinGrowthAgent(dependencies)
+    agent.db.add_content_source(
+        "founder_note",
+        texts[1],
+        metadata={"publishable": True},
+        verified_by="floriano",
+    )
+    return agent, dependencies, generator
+
+
 def dependency_bundle(tmp_path, **overrides):
     media_root = tmp_path / "media"
     media_root.mkdir(mode=0o700, parents=True)
@@ -133,80 +151,96 @@ def test_source_to_approval_to_dry_run_without_external_writes(agent_and_fakes):
     assert fakes["x_client"].engagement_writes == []
 
 
-def test_candidate_tournament_sends_one_winner_card_and_no_low_score_card(
-    tmp_path,
-):
+def test_candidate_tournament_sends_one_winner_card_without_x_write(tmp_path):
     winner_texts = (
         "I keep the first candidate out of the approval queue.",
         "I send only the strongest candidate for approval.",
         "I keep the third candidate out of the approval queue.",
     )
-    winner_generator = CandidateGenerator(winner_texts)
-    winner_dependencies = dependency_bundle(
-        tmp_path / "winner",
-        generator=winner_generator,
-        scorer=CandidateScorer({
+    winner_agent, winner_dependencies, winner_generator = _candidate_agent(
+        tmp_path,
+        winner_texts,
+        {
             winner_texts[0]: 79,
             winner_texts[1]: 94,
             winner_texts[2]: 83,
-        }),
-    )
-    winner_agent = FlexDropinGrowthAgent(winner_dependencies)
-    winner_agent.db.add_content_source(
-        "founder_note",
-        "I send only the strongest candidate for approval.",
-        metadata={"publishable": True},
-        verified_by="floriano",
+        },
     )
 
     draft = winner_agent.create_draft_cycle("14:00", now=NOW)
 
-    winner_cards = [
-        text
-        for _chat_id, text, _kwargs
-        in winner_dependencies["telegram_api"].messages
-        if "Bozza #" in text
-    ]
+    winner_messages = winner_dependencies["telegram_api"].messages
     assert draft["text"] == winner_texts[1]
     assert draft["score_data"] == {"total": 94}
     assert winner_generator.candidate_indices == [0, 1, 2]
-    assert len(winner_cards) == 1
-    assert winner_texts[1] in winner_cards[0]
+    assert len(winner_messages) == 1
+    assert winner_texts[1] in winner_messages[0][1]
     assert winner_dependencies["x_client"].posts == []
 
+
+def test_candidate_tournament_accepts_exact_threshold_and_sends_one_card(
+    tmp_path,
+):
+    texts = (
+        "I leave the 73-point candidate out of the approval queue.",
+        "I send the exact-threshold candidate for approval.",
+        "I leave the 74-point candidate out of the approval queue.",
+    )
+    agent, dependencies, generator = _candidate_agent(
+        tmp_path,
+        texts,
+        {
+            texts[0]: 73,
+            texts[1]: 75,
+            texts[2]: 74,
+        },
+    )
+
+    draft = agent.create_draft_cycle("14:00", now=NOW)
+
+    assert draft["text"] == texts[1]
+    assert draft["score_data"] == {"total": 75}
+    assert draft["status"] == "pending_approval"
+    assert generator.candidate_indices == [0, 1, 2]
+    assert len(dependencies["telegram_api"].messages) == 1
+    assert texts[1] in dependencies["telegram_api"].messages[0][1]
+    assert dependencies["x_client"].posts == []
+
+
+def test_candidate_tournament_below_threshold_has_no_side_effects(tmp_path):
     low_texts = (
         "I leave low candidate one unpersisted.",
         "I leave low candidate two unpersisted.",
         "I leave low candidate three unpersisted.",
     )
-    low_generator = CandidateGenerator(low_texts)
-    low_dependencies = dependency_bundle(
-        tmp_path / "low",
-        generator=low_generator,
-        scorer=CandidateScorer({
+    low_agent, low_dependencies, low_generator = _candidate_agent(
+        tmp_path,
+        low_texts,
+        {
             low_texts[0]: 72,
             low_texts[1]: 74,
             low_texts[2]: 71,
-        }),
-    )
-    low_agent = FlexDropinGrowthAgent(low_dependencies)
-    low_agent.db.add_content_source(
-        "founder_note",
-        "I leave low-scoring candidates outside the approval queue.",
-        metadata={"publishable": True},
-        verified_by="floriano",
+        },
     )
 
     assert low_agent.create_draft_cycle("14:00", now=NOW) is None
 
-    low_cards = [
-        text
-        for _chat_id, text, _kwargs in low_dependencies["telegram_api"].messages
-        if "Bozza #" in text
-    ]
     assert low_generator.candidate_indices == [0, 1, 2]
-    assert low_cards == []
+    assert low_dependencies["telegram_api"].messages == []
     assert low_dependencies["x_client"].posts == []
+    assert low_agent.db.list_post_drafts() == []
+    with low_agent.db._conn() as conn:
+        evaluations = conn.execute(
+            "SELECT outcome, details_json FROM draft_evaluations"
+        ).fetchall()
+        error_count = conn.execute(
+            "SELECT COUNT(*) FROM error_events"
+        ).fetchone()[0]
+    assert [
+        (row["outcome"], json.loads(row["details_json"])["scores"]["total"])
+        for row in evaluations
+    ] == [("rejected_score", 74)]
+    assert error_count == 0
 
 
 def test_scheduled_publish_uses_one_effective_clock_read_for_grace_expiry(
