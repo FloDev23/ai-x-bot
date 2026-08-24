@@ -168,7 +168,7 @@ deterministic rotation:
 This ranking is applied across eligible source types rather than using a fixed
 type priority that could permanently starve blog or external sources. The
 existing portfolio mix, two-drafts-per-day cap, candidate tournament, score
-threshold `75`, fact validation, novelty checks, and at-most-one Telegram card
+threshold `70`, fact validation, novelty checks, and at-most-one Telegram card
 remain unchanged.
 
 When the selected source is an `owned_blog_article`, the planner includes its

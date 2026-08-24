@@ -242,7 +242,7 @@ def test_automatic_sources_create_one_grounded_card_without_x_write(tmp_path):
         for source in sources
         if source["source_type"] == "owned_blog_article"
     )]
-    assert draft["score_data"]["total"] >= 75
+    assert draft["score_data"]["total"] >= 70
     assert len(dependencies["telegram_api"].messages) == 1
     assert dependencies["x_client"].posts == []
     assert dependencies["x_client"].engagement_writes == []
@@ -437,24 +437,24 @@ def test_candidate_tournament_accepts_exact_threshold_and_sends_one_card(
     tmp_path,
 ):
     texts = (
-        "I leave the 73-point candidate out of the approval queue.",
+        "I leave the 68-point candidate out of the approval queue.",
         "I send the exact-threshold candidate for approval.",
-        "I leave the 74-point candidate out of the approval queue.",
+        "I leave the 69-point candidate out of the approval queue.",
     )
     agent, dependencies, generator = _candidate_agent(
         tmp_path,
         texts,
         {
-            texts[0]: 73,
-            texts[1]: 75,
-            texts[2]: 74,
+            texts[0]: 68,
+            texts[1]: 70,
+            texts[2]: 69,
         },
     )
 
     draft = agent.create_draft_cycle("14:00", now=NOW)
 
     assert draft["text"] == texts[1]
-    assert draft["score_data"] == {"total": 75}
+    assert draft["score_data"] == {"total": 70}
     assert draft["status"] == "pending_approval"
     assert generator.candidate_indices == [0, 1, 2]
     assert len(dependencies["telegram_api"].messages) == 1
@@ -472,9 +472,9 @@ def test_candidate_tournament_below_threshold_has_no_side_effects(tmp_path):
         tmp_path,
         low_texts,
         {
-            low_texts[0]: 72,
-            low_texts[1]: 74,
-            low_texts[2]: 71,
+            low_texts[0]: 62,
+            low_texts[1]: 69,
+            low_texts[2]: 61,
         },
     )
 
@@ -494,7 +494,7 @@ def test_candidate_tournament_below_threshold_has_no_side_effects(tmp_path):
     assert [
         (row["outcome"], json.loads(row["details_json"])["scores"]["total"])
         for row in evaluations
-    ] == [("rejected_score", 74)]
+    ] == [("rejected_score", 69)]
     assert error_count == 0
 
 

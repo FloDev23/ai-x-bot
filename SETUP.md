@@ -65,7 +65,7 @@ DRAFT_LEAD_MINUTES=120
 PUBLISH_GRACE_SECONDS=300
 APPROVAL_REQUIRED=true
 DRY_RUN=true
-DRAFT_SCORE_THRESHOLD=75
+DRAFT_SCORE_THRESHOLD=70
 SEMANTIC_DUPLICATE_THRESHOLD=0.72
 MAX_LINKS_PER_WEEK=1
 ENABLE_LEAD_DISCOVERY=false
@@ -175,7 +175,7 @@ DRY_RUN=true
 ```
 
 1. Attendere il refresh automatico delle 10:30 oppure avviare il ciclo di refresh previsto dall'applicazione. Verificare `/errors` e che il feed `https://flexdropin.com/api/editorial-feed` risponda con la versione attesa.
-2. Far creare una bozza per uno slot configurato. Deve avere score almeno 75 ed essere ancora entro la grace window quando verrà pubblicata.
+2. Far creare una bozza per uno slot configurato. Deve avere score almeno 70 ed essere ancora entro la grace window quando verrà pubblicata.
 3. Leggere testo e media su Telegram e premere `Approva` dalla chat autorizzata.
 4. Sul VPS acquisire la fingerprint senza cambiare stato:
 

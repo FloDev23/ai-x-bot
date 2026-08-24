@@ -49,6 +49,7 @@ def test_rollout_defaults_are_safe(monkeypatch):
         "APPROVAL_REQUIRED",
         "BOT_TIMEZONE",
         "CONTENT_SLOTS",
+        "DRAFT_SCORE_THRESHOLD",
         "MAX_LINKS_PER_WEEK",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -57,6 +58,7 @@ def test_rollout_defaults_are_safe(monkeypatch):
     assert reloaded.APPROVAL_REQUIRED is True
     assert reloaded.BOT_TIMEZONE == "Europe/Rome"
     assert reloaded.CONTENT_SLOTS == ["14:00", "20:00"]
+    assert reloaded.DRAFT_SCORE_THRESHOLD == 70
     assert reloaded.MAX_LINKS_PER_WEEK == 1
 
 
