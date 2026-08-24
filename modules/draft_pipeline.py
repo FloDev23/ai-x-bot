@@ -120,6 +120,21 @@ def _safe_scores(score) -> Dict:
     }
 
 
+def _safe_attempt_summary(attempt: int, evaluation) -> Dict:
+    details = evaluation.details if isinstance(evaluation.details, dict) else {}
+    reasons = details.get("reason_codes")
+    return {
+        "attempt": attempt,
+        "outcome": evaluation.outcome,
+        "reason_codes": (
+            _safe_reason_codes(reasons)
+            if isinstance(reasons, (list, tuple))
+            else []
+        ),
+        "scores": _safe_scores(details.get("scores")),
+    }
+
+
 class DraftPipeline:
     """Build drafts through ordered gates; never publish or fall back."""
 
@@ -205,6 +220,7 @@ class DraftPipeline:
         sources,
         slot_iso: str,
         recent_texts,
+        candidate_index=None,
     ) -> _CandidateEvaluation:
         if not isinstance(text, str):
             text = ""
@@ -217,12 +233,15 @@ class DraftPipeline:
                 False,
             )
         if len(text) > 280:
+            rewrite_kwargs = {"category": category}
+            if candidate_index is not None:
+                rewrite_kwargs["candidate_index"] = candidate_index
             try:
                 text = self.generator.rewrite_to_limit(
                     text,
                     sources,
                     280,
-                    category=category,
+                    **rewrite_kwargs,
                 )
             except Exception:
                 return _CandidateEvaluation(
@@ -304,7 +323,10 @@ class DraftPipeline:
                 return _CandidateEvaluation(
                     None,
                     "rejected_duplicate",
-                    {"source_ids": safe_source_ids},
+                    {
+                        "source_ids": safe_source_ids,
+                        "scores": safe_score,
+                    },
                     False,
                 )
 
@@ -418,6 +440,7 @@ class DraftPipeline:
                         sources=sources,
                         slot_iso=slot_iso,
                         recent_texts=recent_texts,
+                        candidate_index=candidate_index,
                     )
 
             evaluations.append((attempt, evaluation))
@@ -454,16 +477,18 @@ class DraftPipeline:
             )
             return None
 
-        attempt, evaluation = evaluations[-1]
+        _attempt, evaluation = evaluations[-1]
         details = {
-            "attempt": attempt,
             "source_ids": safe_source_ids,
-            **evaluation.details,
+            "attempts": [
+                _safe_attempt_summary(attempt, candidate_evaluation)
+                for attempt, candidate_evaluation in evaluations[:3]
+            ],
         }
         self._record(slot_iso, category, evaluation.outcome, details)
         return None
 
-    def _persist(self, prepared: _PreparedDraft) -> Optional[Dict]:
+    def _persist(self, prepared: _PreparedDraft):
         draft, outcome = self.db.create_or_get_post_draft(
             text=prepared.text,
             category=prepared.category,
@@ -479,28 +504,33 @@ class DraftPipeline:
                 "no_eligible_source",
                 {"source_ids": prepared.source_ids},
             )
-            return None
-        return draft
+        return draft, outcome
 
-    def create_for_slot(self, intended_slot) -> Optional[Dict]:
+    def create_for_slot_with_outcome(self, intended_slot):
+        """Return a draft with its atomic slot-persistence outcome."""
         slot_iso = _slot_iso(intended_slot)
         if slot_iso is None:
-            return None
+            return None, "rejected"
         existing = self.db.get_active_draft_for_slot(slot_iso)
         if existing:
-            return existing
+            return existing, "existing"
 
         plan = self.planner.plan(intended_slot)
         if plan is None:
             self._record(slot_iso, "unplanned", "no_eligible_source")
-            return None
+            return None, "rejected"
         prepared = self._prepare(
             category=plan.category,
             source_ids=plan.source_ids,
             intended_slot=plan.intended_slot,
             include_link=plan.include_link,
         )
-        return self._persist(prepared) if prepared else None
+        return self._persist(prepared) if prepared else (None, "rejected")
+
+    def create_for_slot(self, intended_slot) -> Optional[Dict]:
+        """Create or return the slot draft while preserving the public API."""
+        draft, _outcome = self.create_for_slot_with_outcome(intended_slot)
+        return draft
 
     def regenerate(self, draft_id) -> Optional[Dict]:
         prior = self.db.get_post_draft(draft_id)

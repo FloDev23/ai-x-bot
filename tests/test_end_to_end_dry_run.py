@@ -68,6 +68,16 @@ class CandidateScorer:
         return {"total": self.scores[text]}
 
 
+class BarrierDraftDatabase(Database):
+    def __init__(self, path, barrier):
+        self.barrier = barrier
+        super().__init__(path)
+
+    def create_or_get_post_draft(self, **values):
+        self.barrier.wait(timeout=5)
+        return super().create_or_get_post_draft(**values)
+
+
 def _candidate_agent(tmp_path, texts, scores):
     generator = CandidateGenerator(texts)
     dependencies = dependency_bundle(
@@ -176,6 +186,70 @@ def test_candidate_tournament_sends_one_winner_card_without_x_write(tmp_path):
     assert len(winner_messages) == 1
     assert winner_texts[1] in winner_messages[0][1]
     assert winner_dependencies["x_client"].posts == []
+
+
+def test_concurrent_agents_and_replay_send_one_card_for_shared_sqlite_draft(
+    tmp_path,
+):
+    shared_path = str(tmp_path / "shared-agent.db")
+    setup = Database(shared_path)
+    setup.set_state("paused", "false")
+    text = "I send one shared SQLite winner for approval."
+    setup.add_content_source(
+        "founder_note",
+        text,
+        metadata={"publishable": True},
+        verified_by="floriano",
+    )
+    barrier = threading.Barrier(2)
+    media_root = tmp_path / "shared-media"
+    media_root.mkdir(mode=0o700)
+    telegram = FakeTelegramApi(media_root)
+    agents = []
+    dependencies = []
+    for index in range(2):
+        database = BarrierDraftDatabase(shared_path, barrier)
+        bundle = dependency_bundle(
+            tmp_path / f"agent-{index}",
+            db=database,
+            telegram_api=telegram,
+            generator=CandidateGenerator((text, text, text)),
+        )
+        dependencies.append(bundle)
+        agents.append(FlexDropinGrowthAgent(bundle))
+
+    results = []
+    errors = []
+
+    def worker(agent):
+        try:
+            results.append(agent.create_draft_cycle("14:00", now=NOW))
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=worker, args=(agent,), daemon=True)
+        for agent in agents
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not [thread for thread in threads if thread.is_alive()]
+    assert errors == []
+    assert len(results) == 2
+    assert all(result is not None for result in results)
+    assert len({result["id"] for result in results}) == 1
+    assert len(telegram.messages) == 1
+    assert text in telegram.messages[0][1]
+    assert agents[0].create_draft_cycle("14:00", now=NOW)["id"] == results[0]["id"]
+    assert len(telegram.messages) == 1
+    assert all(bundle["x_client"].posts == [] for bundle in dependencies)
+    with setup._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM post_drafts"
+        ).fetchone()[0] == 1
 
 
 def test_candidate_tournament_accepts_exact_threshold_and_sends_one_card(

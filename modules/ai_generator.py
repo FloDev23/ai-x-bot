@@ -43,6 +43,11 @@ from typing import BinaryIO, Dict, Optional, List
 
 logger = logging.getLogger(__name__)
 
+
+class AICompletionUnavailable(RuntimeError):
+    """A completion service call failed before producing model output."""
+
+
 # ---------------------------------------------------------------------------
 # Persona e agenti ora vengono costruiti da character.json (vedi modules/character.py).
 # FOUNDER_PERSONA resta come nome per non rompere il resto del file, ma il suo
@@ -141,8 +146,14 @@ class AIGenerator:
     # ------------------------------------------------------------------
     # Helper generico di chiamata a Groq
     # ------------------------------------------------------------------
-    def _complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 400,
-                   temperature: float = 0.8) -> Optional[str]:
+    def _complete(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 400,
+        temperature: float = 0.8,
+        raise_on_error: bool = False,
+    ) -> Optional[str]:
         try:
             response = self.client.chat.completions.create(
                 messages=[
@@ -168,8 +179,15 @@ class AIGenerator:
                 )
                 return None
             return content
-        except Exception as e:
-            logger.error(f"❌ Errore chiamata Groq: {e}")
+        except Exception as error:
+            logger.error(
+                "completion_failed error_type=%s",
+                type(error).__name__,
+            )
+            if raise_on_error:
+                raise AICompletionUnavailable(
+                    "completion service unavailable"
+                ) from None
             return None
 
     @staticmethod
@@ -225,16 +243,6 @@ Reply only with the post text, without quotes or explanation."""
         if not isinstance(text, str) or not text.strip():
             return None
         text = text.strip()
-        if len(text) > 280:
-            text = self.rewrite_to_limit(
-                text,
-                sources,
-                280,
-                category=category,
-                candidate_index=candidate_index,
-            )
-        if not text or len(text) > 280:
-            return None
         return {"text": text, "agent_used": agent_name}
 
     def rewrite_to_limit(
@@ -271,6 +279,7 @@ Reply only with the complete rewritten post."""
             prompt,
             max_tokens=400,
             temperature=0.4,
+            raise_on_error=True,
         )
         if not isinstance(rewritten, str):
             return None

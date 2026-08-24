@@ -1,7 +1,9 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
+from modules.ai_generator import AIGenerator
 from modules.content_planner import ContentPlan
 from modules.draft_pipeline import DraftPipeline
 from modules.fact_guard import FactCheckResult
@@ -290,8 +292,17 @@ class FakeGenerator:
             "raw_reasoning": "must never be persisted",
         }
 
-    def rewrite_to_limit(self, text, sources, limit, category=None):
-        self.rewrites.append((text, sources, limit, category))
+    def rewrite_to_limit(
+        self,
+        text,
+        sources,
+        limit,
+        category=None,
+        candidate_index=None,
+    ):
+        self.rewrites.append(
+            (text, sources, limit, category, candidate_index)
+        )
         if self.raise_rewrite:
             raise RuntimeError("private model payload")
         if self.rewrite_results is not None:
@@ -343,6 +354,34 @@ class FakeScorer:
         return self.result
 
 
+class _SequentialCompletions:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=response),
+                finish_reason="stop",
+            )]
+        )
+
+
+def _real_generator(responses):
+    completions = _SequentialCompletions(responses)
+    generator = AIGenerator.__new__(AIGenerator)
+    generator.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions)
+    )
+    generator.model = "fake-model"
+    return generator, completions
+
+
 @pytest.fixture
 def pipeline_parts():
     database = FakeDraftDatabase()
@@ -359,6 +398,77 @@ def pipeline_parts():
         now_fn=lambda: NOW,
     )
     return pipeline, database, planner, generator, guard, scorer
+
+
+def test_real_generator_invalid_rewrite_continues_to_candidate_index_one():
+    database = FakeDraftDatabase()
+    planner = FakePlanner()
+    overlength = "A sourced contrast that is too long. " * 20
+    generator, completions = _real_generator([
+        overlength,
+        "This invalid rewrite stops midway",
+        "The second grounded candidate survives.",
+        "The third grounded candidate is safe but lower.",
+    ])
+    scorer = FakeScorer()
+    scorer.results = [{"total": 84}, {"total": 79}]
+    pipeline = DraftPipeline(
+        database,
+        planner,
+        generator,
+        FakeGuard(),
+        scorer,
+        now_fn=lambda: NOW,
+    )
+
+    draft = pipeline.create_for_slot(database.next_slot)
+
+    assert draft["text"] == "The second grounded candidate survives."
+    assert len(completions.calls) == 4
+    prompts = [
+        call["messages"][1]["content"].lower()
+        for call in completions.calls
+    ]
+    assert "sharp sourced contrast" in prompts[0]
+    assert "sharp sourced contrast" in prompts[1]
+    assert "overlooked sourced trend or metric" in prompts[2]
+    assert database.evaluations[-1]["outcome"] == "pending_approval"
+
+
+def test_real_generator_rewrite_service_exception_aborts_tournament():
+    database = FakeDraftDatabase()
+    planner = FakePlanner()
+    private_error = "PRIVATE_REWRITE_SERVICE_PAYLOAD"
+    generator, completions = _real_generator([
+        "A sourced contrast that is too long. " * 20,
+        RuntimeError(private_error),
+    ])
+    pipeline = DraftPipeline(
+        database,
+        planner,
+        generator,
+        FakeGuard(),
+        FakeScorer(),
+        now_fn=lambda: NOW,
+    )
+
+    assert pipeline.create_for_slot(database.next_slot) is None
+
+    assert len(completions.calls) == 2
+    assert database.created_drafts == []
+    assert database.evaluations == [
+        {
+            "intended_slot": database.next_slot.isoformat(),
+            "category": "gym_strategy",
+            "outcome": "rewrite_failed",
+            "details": {
+                "attempt": 1,
+                "reason_codes": ["rewrite_unavailable"],
+                "source_ids": [7],
+            },
+        }
+    ]
+    assert private_error not in repr(database.evaluations)
 
 
 def test_candidate_tournament_persists_only_highest_safe_score(pipeline_parts):
@@ -540,13 +650,105 @@ def test_candidate_tournament_records_one_sanitized_fact_rejection(
             "category": "gym_strategy",
             "outcome": "rejected_fact",
             "details": {
-                "attempt": 3,
-                "reason_codes": ["unsupported_claim:number"],
                 "source_ids": [7],
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "outcome": "rejected_fact",
+                        "reason_codes": ["unsupported_number"],
+                        "scores": {},
+                    },
+                    {
+                        "attempt": 2,
+                        "outcome": "rejected_fact",
+                        "reason_codes": ["invalid_reason_code"],
+                        "scores": {},
+                    },
+                    {
+                        "attempt": 3,
+                        "outcome": "rejected_fact",
+                        "reason_codes": ["unsupported_claim:number"],
+                        "scores": {},
+                    },
+                ],
             },
         }
     ]
     assert "Fact-invalid" not in repr(database.evaluations)
+
+
+def test_candidate_tournament_records_bounded_sanitized_local_attempts(
+    pipeline_parts,
+):
+    pipeline, database, _, generator, guard, scorer = pipeline_parts
+    private_values = (
+        "PRIVATE_SOURCE_BODY",
+        "PRIVATE_GENERATOR_REASONING_ONE",
+        "PRIVATE_GENERATOR_REASONING_TWO",
+        "PRIVATE_GENERATOR_REASONING_THREE",
+        "PRIVATE_SCORER_REASONING",
+        "PRIVATE_FACT_REASON",
+    )
+    database.sources[7]["text"] = private_values[0]
+    duplicate = "The third candidate duplicates recent copy."
+    database.recent_texts = [duplicate]
+    generator.results = [
+        {
+            "text": "The first candidate fails fact checking.",
+            "raw_reasoning": private_values[1],
+        },
+        {"text": "x" * 281, "raw_reasoning": private_values[2]},
+        {"text": duplicate, "raw_reasoning": private_values[3]},
+    ]
+    generator.rewrite_results = [None]
+    guard.results = [
+        FactCheckResult(False, [private_values[5]]),
+        FactCheckResult(True, []),
+    ]
+    scorer.results = [
+        {"total": 91, "reasoning": private_values[4]},
+    ]
+
+    assert pipeline.create_for_slot(database.next_slot) is None
+
+    assert database.created_drafts == []
+    assert database.evaluations == [
+        {
+            "intended_slot": database.next_slot.isoformat(),
+            "category": "gym_strategy",
+            "outcome": "rejected_duplicate",
+            "details": {
+                "source_ids": [7],
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "outcome": "rejected_fact",
+                        "reason_codes": ["invalid_reason_code"],
+                        "scores": {},
+                    },
+                    {
+                        "attempt": 2,
+                        "outcome": "rewrite_failed",
+                        "reason_codes": [],
+                        "scores": {},
+                    },
+                    {
+                        "attempt": 3,
+                        "outcome": "rejected_duplicate",
+                        "reason_codes": [],
+                        "scores": {"total": 91},
+                    },
+                ],
+            },
+        }
+    ]
+    assert len(database.evaluations[0]["details"]["attempts"]) == 3
+    assert all(
+        set(summary) == {"attempt", "outcome", "reason_codes", "scores"}
+        for summary in database.evaluations[0]["details"]["attempts"]
+    )
+    audit = repr(database.evaluations)
+    assert all(private not in audit for private in private_values)
 
 
 def test_candidate_tournament_malformed_candidate_cannot_win_or_leak(
@@ -848,11 +1050,15 @@ def test_fact_failure_skips_slot_and_records_reason_codes(pipeline_parts):
 
     assert database.created_drafts == []
     assert database.evaluations[-1]["outcome"] == "rejected_fact"
-    assert database.evaluations[-1]["details"] == {
-        "attempt": 3,
-        "reason_codes": ["unsupported_claim:number"],
-        "source_ids": [7],
-    }
+    assert database.evaluations[-1]["details"]["source_ids"] == [7]
+    assert [
+        summary["reason_codes"]
+        for summary in database.evaluations[-1]["details"]["attempts"]
+    ] == [
+        ["unsupported_claim:number"],
+        ["unsupported_claim:number"],
+        ["unsupported_claim:number"],
+    ]
 
 
 def test_unsupported_number_reason_is_preserved_for_audit(pipeline_parts):
@@ -862,8 +1068,13 @@ def test_unsupported_number_reason_is_preserved_for_audit(pipeline_parts):
 
     assert pipeline.create_for_slot(database.next_slot) is None
 
-    assert database.evaluations[-1]["details"]["reason_codes"] == [
-        "unsupported_number"
+    assert [
+        summary["reason_codes"]
+        for summary in database.evaluations[-1]["details"]["attempts"]
+    ] == [
+        ["unsupported_number"],
+        ["unsupported_number"],
+        ["unsupported_number"],
     ]
 
 
@@ -883,8 +1094,13 @@ def test_model_supplied_fact_reason_is_reduced_to_a_safe_code(
 
     assert pipeline.create_for_slot(database.next_slot) is None
 
-    assert database.evaluations[-1]["details"]["reason_codes"] == [
-        safe_reason
+    assert [
+        summary["reason_codes"]
+        for summary in database.evaluations[-1]["details"]["attempts"]
+    ] == [
+        [safe_reason],
+        [safe_reason],
+        [safe_reason],
     ]
 
 
@@ -900,10 +1116,18 @@ def test_duplicate_skips_slot(pipeline_parts):
     assert pipeline.create_for_slot(database.next_slot) is None
 
     assert database.evaluations[-1]["outcome"] == "rejected_duplicate"
-    assert database.evaluations[-1]["details"] == {
-        "attempt": 3,
-        "source_ids": [7],
-    }
+    details = database.evaluations[-1]["details"]
+    assert details["source_ids"] == [7]
+    assert [summary["outcome"] for summary in details["attempts"]] == [
+        "rejected_duplicate",
+        "rejected_duplicate",
+        "rejected_duplicate",
+    ]
+    assert [summary["scores"] for summary in details["attempts"]] == [
+        {"total": 88, "hook": 9},
+        {"total": 88, "hook": 9},
+        {"total": 88, "hook": 9},
+    ]
 
 
 def test_good_draft_waits_for_approval(pipeline_parts):

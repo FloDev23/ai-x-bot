@@ -347,9 +347,13 @@ class FlexDropinGrowthAgent:
     def create_draft_cycle(self, intended_slot_time, now=None):
         try:
             intended_slot = self._slot(intended_slot_time, now)
-            draft = self.draft_pipeline.create_for_slot(intended_slot)
+            draft, persistence_outcome = (
+                self.draft_pipeline.create_for_slot_with_outcome(intended_slot)
+            )
             if not draft:
                 return None
+            if persistence_outcome != "created":
+                return draft
             self.media_matcher.attach_best(draft["id"])
             current = self.db.get_post_draft(draft["id"]) or draft
             self.telegram_controller._send_draft_card(

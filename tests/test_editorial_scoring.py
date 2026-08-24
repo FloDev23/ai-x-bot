@@ -60,14 +60,15 @@ def test_rewrite_fails_closed_for_missing_long_or_incomplete_output(fake_ai):
         assert fake_ai.rewrite_to_limit("Original text.", [], limit=50) is None
 
 
-def test_long_grounded_generation_uses_complete_rewrite(fake_ai):
-    fake_ai.responses = ["Long sentence. " * 30, "A concise complete post."]
+def test_grounded_generation_leaves_overlength_copy_for_pipeline(fake_ai):
+    long_text = "Long sentence. " * 30
+    fake_ai.responses = [long_text, "A concise complete post."]
     result = fake_ai.generate_grounded_tweet("gym_strategy", [], include_link=False)
-    assert result["text"] == "A concise complete post."
-    assert len(result["text"]) <= 280
+    assert result["text"] == long_text.strip()
+    assert len(result["text"]) > 280
 
 
-def test_long_grounded_generation_keeps_category_instruction_during_rewrite(fake_ai):
+def test_pipeline_owned_rewrite_keeps_category_instruction(fake_ai):
     prompts = []
 
     def complete(system_prompt, user_prompt, **_kwargs):
@@ -81,13 +82,21 @@ def test_long_grounded_generation_keeps_category_instruction_during_rewrite(fake
 
     fake_ai._complete = complete
 
-    result = fake_ai.generate_grounded_tweet(
+    sources = [
+        {"id": 1, "source_type": "evergreen_idea", "text": "Useful idea."}
+    ]
+    candidate = fake_ai.generate_grounded_tweet(
         "gym_strategy",
-        [{"id": 1, "source_type": "evergreen_idea", "text": "Useful idea."}],
+        sources,
         include_link=False,
     )
+    rewritten = fake_ai.rewrite_to_limit(
+        candidate["text"],
+        sources,
+        category="gym_strategy",
+    )
 
-    assert result["text"] == "Useful standalone advice for operators."
+    assert rewritten == "Useful standalone advice for operators."
     assert len(prompts) == 2
     assert all(
         "Do not mention FlexDropin or describe its features" in prompt["user"]
@@ -101,9 +110,15 @@ def test_long_grounded_generation_keeps_category_instruction_during_rewrite(fake
     )
 
 
-def test_grounded_generation_fails_when_rewrite_fails(fake_ai):
+def test_pipeline_owned_rewrite_rejects_invalid_output(fake_ai):
     fake_ai.responses = ["Long sentence. " * 30, "Still incomplete"]
-    assert fake_ai.generate_grounded_tweet("gym_strategy", [], include_link=False) is None
+    candidate = fake_ai.generate_grounded_tweet(
+        "gym_strategy",
+        [],
+        include_link=False,
+    )
+
+    assert fake_ai.rewrite_to_limit(candidate["text"], [], limit=280) is None
 
 
 def test_current_editorial_categories_use_specialist_agents():
@@ -218,26 +233,33 @@ def test_grounded_candidate_index_is_preserved_during_overflow_rewrite(fake_ai):
 
     fake_ai._complete = complete
 
-    result = fake_ai.generate_grounded_tweet(
+    sources = [{
+        "id": 8,
+        "source_type": "verified_news",
+        "trust_state": "verified",
+        "text": "Membership reached 81 million in 2025.",
+        "url": "https://industry.example/report",
+        "metadata": {
+            "title": "Industry report",
+            "summary": "Membership reached 81 million in 2025.",
+            "published_at": "2026-08-23",
+            "source_name": "Industry Association",
+        },
+    }]
+    candidate = fake_ai.generate_grounded_tweet(
         "gym_strategy",
-        [{
-            "id": 8,
-            "source_type": "verified_news",
-            "trust_state": "verified",
-            "text": "Membership reached 81 million in 2025.",
-            "url": "https://industry.example/report",
-            "metadata": {
-                "title": "Industry report",
-                "summary": "Membership reached 81 million in 2025.",
-                "published_at": "2026-08-23",
-                "source_name": "Industry Association",
-            },
-        }],
+        sources,
         include_link=False,
         candidate_index=2,
     )
+    rewritten = fake_ai.rewrite_to_limit(
+        candidate["text"],
+        sources,
+        category="gym_strategy",
+        candidate_index=2,
+    )
 
-    assert result["text"] == "A concise sourced question."
+    assert rewritten == "A concise sourced question."
     assert len(prompts) == 2
     assert all(
         "build the post around one operator-relevant question" in prompt
@@ -342,13 +364,18 @@ def test_verified_news_must_anchor_generation_and_rewrite(fake_ai):
         },
     }]
 
-    result = fake_ai.generate_grounded_tweet(
+    candidate = fake_ai.generate_grounded_tweet(
         "gym_strategy",
         sources,
         include_link=False,
     )
+    rewritten = fake_ai.rewrite_to_limit(
+        candidate["text"],
+        sources,
+        category="gym_strategy",
+    )
 
-    assert result["text"] == "A concise, attributed HFA insight."
+    assert rewritten == "A concise, attributed HFA insight."
     assert len(prompts) == 2
     for prompt in prompts:
         assert "use at least one exact concrete fact" in prompt
