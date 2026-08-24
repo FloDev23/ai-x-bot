@@ -1,10 +1,15 @@
 import json
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from scripts import preflight_production
+
+
+REPOSITORY_ROOT = Path(__file__).parents[1]
 
 
 def _database(path):
@@ -169,7 +174,7 @@ def test_cli_emits_only_sanitized_json(tmp_path, monkeypatch, capsys):
 
 
 def test_deploy_runs_preflight_before_any_service_restart():
-    deploy = (Path(__file__).parents[1] / "deploy.sh").read_text(encoding="utf-8")
+    deploy = (REPOSITORY_ROOT / "deploy.sh").read_text(encoding="utf-8")
 
     preflight = deploy.index("scripts/preflight_production.py")
     first_restart = deploy.index('systemctl restart "$BOT_SERVICE"')
@@ -177,3 +182,20 @@ def test_deploy_runs_preflight_before_any_service_restart():
     assert "--require-dry-run" in deploy
     assert "cat .env" not in deploy
     assert "printenv" not in deploy
+
+
+def test_preflight_script_is_importable_when_invoked_by_path():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPOSITORY_ROOT / "scripts" / "preflight_production.py"),
+            "--help",
+        ],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "ModuleNotFoundError" not in result.stderr

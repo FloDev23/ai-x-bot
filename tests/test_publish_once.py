@@ -1,7 +1,10 @@
 import json
 import re
+import subprocess
+import sys
 from copy import deepcopy
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +18,25 @@ from scripts.publish_once import (
 )
 
 
+REPOSITORY_ROOT = Path(__file__).parents[1]
 SLOT = datetime.fromisoformat("2030-01-10T14:00:00+01:00")
+
+
+def test_publish_once_script_is_importable_when_invoked_by_path():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPOSITORY_ROOT / "scripts" / "publish_once.py"),
+            "--help",
+        ],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "ModuleNotFoundError" not in result.stderr
 
 
 def approved_snapshot():

@@ -8,7 +8,11 @@ import json
 import re
 import sys
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import (
     APPROVAL_REQUIRED,
@@ -187,7 +191,12 @@ def _print(value):
 def run_cli(argv=None, *, database_factory=Database, x_client_factory=TwitterClient):
     try:
         arguments = _parser().parse_args(argv)
-    except (argparse.ArgumentError, SystemExit):
+    except argparse.ArgumentError:
+        _print({"error": "invalid_arguments"})
+        return 4
+    except SystemExit as error:
+        if error.code == 0:
+            return 0
         _print({"error": "invalid_arguments"})
         return 4
 

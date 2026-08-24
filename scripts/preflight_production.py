@@ -6,7 +6,11 @@ import contextlib
 import io
 import json
 import sqlite3
+import sys
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config
 
@@ -85,7 +89,12 @@ def _print(value):
 def run_cli(argv=None):
     try:
         arguments = _parser().parse_args(argv)
-    except (argparse.ArgumentError, SystemExit):
+    except argparse.ArgumentError:
+        _print({"error": "invalid_arguments"})
+        return 2
+    except SystemExit as error:
+        if error.code == 0:
+            return 0
         _print({"error": "invalid_arguments"})
         return 2
     try:
