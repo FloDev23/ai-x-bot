@@ -279,7 +279,11 @@ SOURCE_BUNDLE:
 {self._source_bundle(sources)}
 
 Reply only with the post text, without quotes or explanation."""
-        text = self._complete(_agent_prompt(agent_name), prompt)
+        text = self._complete(
+            _agent_prompt(agent_name),
+            prompt,
+            max_tokens=800,
+        )
         if not isinstance(text, str) or not text.strip():
             return None
         text = text.strip()

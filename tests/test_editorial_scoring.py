@@ -136,6 +136,7 @@ def test_grounded_generation_targets_the_editorial_score_axes(fake_ai):
     def complete(system_prompt, user_prompt, **_kwargs):
         captured["system"] = system_prompt
         captured["user"] = user_prompt
+        captured["max_tokens"] = _kwargs.get("max_tokens")
         return "A sharp, grounded post."
 
     fake_ai._complete = complete
@@ -147,6 +148,7 @@ def test_grounded_generation_targets_the_editorial_score_axes(fake_ai):
     )
 
     assert result["text"] == "A sharp, grounded post."
+    assert captured["max_tokens"] == 800
     assert "fitness business expert" in captured["system"]
     normalized_prompt = " ".join(captured["user"].split())
     assert "Do not mention FlexDropin or describe its features" in normalized_prompt
