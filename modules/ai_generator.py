@@ -153,8 +153,11 @@ def _source_instruction(sources: List[Dict], candidate_index=None) -> str:
             "assertion must be a literal paraphrase of the article title or "
             "summary. Never assert a FlexDropin product capability, benefit, "
             "customer result or first-person experience. Do not introduce any "
-            "number absent from the title or summary. Build the takeaway as a "
-            "question or imperative grounded in those exact article details."
+            "number absent from the title or summary. Use at least two distinct "
+            "concrete details from the title or summary. Lead with the sharpest "
+            "operator tension in those details, then give one measurable test, "
+            "decision or question grounded in them. Avoid a generic summary or "
+            "generic 'test and learn' advice."
         )
     if instructions:
         return " ".join(instructions)

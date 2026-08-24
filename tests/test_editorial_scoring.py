@@ -453,6 +453,9 @@ def test_owned_blog_generation_and_rewrite_forbid_unsourced_product_claims(
         assert "never assert a flexdropin product capability" in normalized
         assert "do not introduce any number absent from the title or summary" in normalized
         assert "literal paraphrase of the article title or summary" in normalized
+        assert "use at least two distinct concrete details" in normalized
+        assert "lead with the sharpest operator tension" in normalized
+        assert "avoid a generic summary" in normalized
 
 
 def test_incomplete_verified_news_does_not_force_invented_attribution(fake_ai):
