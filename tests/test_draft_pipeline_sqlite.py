@@ -181,6 +181,148 @@ class _PassingScorer:
         return {"total": 90}
 
 
+class _IndexedGenerator:
+    def __init__(self, texts):
+        self.texts = tuple(texts)
+        self.candidate_indices = []
+
+    def generate_grounded_tweet(
+        self, _category, _sources, _include_link, candidate_index=None
+    ):
+        self.candidate_indices.append(candidate_index)
+        return {"text": self.texts[candidate_index]}
+
+
+class _TextScorer:
+    def __init__(self, scores):
+        self.scores = dict(scores)
+
+    def score_draft(self, text, sources=None, recent_texts=None):
+        del sources, recent_texts
+        return dict(self.scores[text])
+
+
+def _candidate_pipeline(db, source_id):
+    texts = (
+        "Candidate one stays out of storage.",
+        "Candidate two is the SQLite winner.",
+        "Candidate three stays out of storage.",
+    )
+    scores = {
+        texts[0]: {"total": 78, "hook": 7},
+        texts[1]: {"total": 93, "hook": 10},
+        texts[2]: {"total": 86, "hook": 8},
+    }
+    generator = _IndexedGenerator(texts)
+    pipeline = DraftPipeline(
+        db,
+        _FixedPlanner(source_id),
+        generator,
+        _ApprovedGuard(),
+        _TextScorer(scores),
+    )
+    return pipeline, generator, texts, scores
+
+
+def test_candidate_tournament_persists_only_sqlite_winner(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    source_id = _source(db)
+    pipeline, generator, texts, scores = _candidate_pipeline(db, source_id)
+
+    draft = pipeline.create_for_slot(datetime.fromisoformat(SLOT))
+
+    assert draft["text"] == texts[1]
+    assert draft["score_data"] == scores[texts[1]]
+    assert draft["status"] == "pending_approval"
+    assert generator.candidate_indices == [0, 1, 2]
+    with db._conn() as conn:
+        stored = conn.execute(
+            "SELECT text, score_json, status FROM post_drafts "
+            "WHERE intended_slot = ?",
+            (SLOT,),
+        ).fetchall()
+        evaluations = conn.execute(
+            "SELECT outcome, details_json FROM draft_evaluations "
+            "WHERE intended_slot = ?",
+            (SLOT,),
+        ).fetchall()
+    assert len(stored) == 1
+    assert stored[0]["text"] == texts[1]
+    assert json.loads(stored[0]["score_json"]) == scores[texts[1]]
+    assert stored[0]["status"] == "pending_approval"
+    assert [row["outcome"] for row in evaluations] == ["pending_approval"]
+    persisted_payload = repr([dict(row) for row in stored + evaluations])
+    assert texts[0] not in persisted_payload
+    assert texts[2] not in persisted_payload
+
+
+class _BarrierBeforePersistenceDatabase(Database):
+    def __init__(self, path, persistence_barrier):
+        self.persistence_barrier = persistence_barrier
+        super().__init__(path)
+
+    def create_or_get_post_draft(self, **values):
+        self.persistence_barrier.wait(timeout=5)
+        return super().create_or_get_post_draft(**values)
+
+
+def test_candidate_tournament_concurrent_workers_claim_one_sqlite_draft(
+    tmp_path,
+):
+    path = str(tmp_path / "bot.db")
+    setup = Database(path)
+    source_id = _source(setup)
+    persistence_barrier = threading.Barrier(2)
+    databases = [
+        _BarrierBeforePersistenceDatabase(path, persistence_barrier)
+        for _ in range(2)
+    ]
+    pipelines = [
+        _candidate_pipeline(database, source_id)[0]
+        for database in databases
+    ]
+    results = []
+    errors = []
+
+    def worker(index):
+        try:
+            results.append(
+                pipelines[index].create_for_slot(datetime.fromisoformat(SLOT))
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=worker, args=(index,), daemon=True)
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not [thread for thread in threads if thread.is_alive()]
+    assert errors == []
+    assert len(results) == 2
+    assert len({draft["id"] for draft in results}) == 1
+    assert {draft["text"] for draft in results} == {
+        "Candidate two is the SQLite winner."
+    }
+    with setup._conn() as conn:
+        drafts = conn.execute(
+            "SELECT id, text, status FROM post_drafts WHERE intended_slot = ?",
+            (SLOT,),
+        ).fetchall()
+        evaluations = conn.execute(
+            "SELECT outcome FROM draft_evaluations WHERE intended_slot = ?",
+            (SLOT,),
+        ).fetchall()
+    assert len(drafts) == 1
+    assert drafts[0]["text"] == "Candidate two is the SQLite winner."
+    assert drafts[0]["status"] == "pending_approval"
+    assert [row["outcome"] for row in evaluations] == ["pending_approval"]
+
+
 @pytest.mark.parametrize("invalidity", ["revoked", "expired", "malformed"])
 def test_create_revalidates_source_inside_slot_claim_transaction(
     tmp_path, invalidity

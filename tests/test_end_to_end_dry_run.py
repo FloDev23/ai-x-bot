@@ -46,6 +46,27 @@ class FalseyProxy:
         return getattr(self.target, name)
 
 
+class CandidateGenerator(FakeGroundedGenerator):
+    def __init__(self, texts):
+        super().__init__()
+        self.texts = tuple(texts)
+
+    def generate_grounded_tweet(
+        self, _category, _sources, _include_link, candidate_index=None
+    ):
+        self.candidate_indices.append(candidate_index)
+        return {"text": self.texts[candidate_index]}
+
+
+class CandidateScorer:
+    def __init__(self, scores):
+        self.scores = dict(scores)
+
+    def score_draft(self, text, sources=None, recent_texts=None):
+        del sources, recent_texts
+        return {"total": self.scores[text]}
+
+
 def dependency_bundle(tmp_path, **overrides):
     media_root = tmp_path / "media"
     media_root.mkdir(mode=0o700, parents=True)
@@ -110,6 +131,82 @@ def test_source_to_approval_to_dry_run_without_external_writes(agent_and_fakes):
     assert result.status == "dry_run"
     assert fakes["x_client"].posts == []
     assert fakes["x_client"].engagement_writes == []
+
+
+def test_candidate_tournament_sends_one_winner_card_and_no_low_score_card(
+    tmp_path,
+):
+    winner_texts = (
+        "I keep the first candidate out of the approval queue.",
+        "I send only the strongest candidate for approval.",
+        "I keep the third candidate out of the approval queue.",
+    )
+    winner_generator = CandidateGenerator(winner_texts)
+    winner_dependencies = dependency_bundle(
+        tmp_path / "winner",
+        generator=winner_generator,
+        scorer=CandidateScorer({
+            winner_texts[0]: 79,
+            winner_texts[1]: 94,
+            winner_texts[2]: 83,
+        }),
+    )
+    winner_agent = FlexDropinGrowthAgent(winner_dependencies)
+    winner_agent.db.add_content_source(
+        "founder_note",
+        "I send only the strongest candidate for approval.",
+        metadata={"publishable": True},
+        verified_by="floriano",
+    )
+
+    draft = winner_agent.create_draft_cycle("14:00", now=NOW)
+
+    winner_cards = [
+        text
+        for _chat_id, text, _kwargs
+        in winner_dependencies["telegram_api"].messages
+        if "Bozza #" in text
+    ]
+    assert draft["text"] == winner_texts[1]
+    assert draft["score_data"] == {"total": 94}
+    assert winner_generator.candidate_indices == [0, 1, 2]
+    assert len(winner_cards) == 1
+    assert winner_texts[1] in winner_cards[0]
+    assert winner_dependencies["x_client"].posts == []
+
+    low_texts = (
+        "I leave low candidate one unpersisted.",
+        "I leave low candidate two unpersisted.",
+        "I leave low candidate three unpersisted.",
+    )
+    low_generator = CandidateGenerator(low_texts)
+    low_dependencies = dependency_bundle(
+        tmp_path / "low",
+        generator=low_generator,
+        scorer=CandidateScorer({
+            low_texts[0]: 72,
+            low_texts[1]: 74,
+            low_texts[2]: 71,
+        }),
+    )
+    low_agent = FlexDropinGrowthAgent(low_dependencies)
+    low_agent.db.add_content_source(
+        "founder_note",
+        "I leave low-scoring candidates outside the approval queue.",
+        metadata={"publishable": True},
+        verified_by="floriano",
+    )
+
+    assert low_agent.create_draft_cycle("14:00", now=NOW) is None
+
+    low_cards = [
+        text
+        for _chat_id, text, _kwargs in low_dependencies["telegram_api"].messages
+        if "Bozza #" in text
+    ]
+    assert low_generator.candidate_indices == [0, 1, 2]
+    assert low_cards == []
+    assert low_dependencies["x_client"].posts == []
 
 
 def test_scheduled_publish_uses_one_effective_clock_read_for_grace_expiry(
