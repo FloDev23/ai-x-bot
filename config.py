@@ -1,5 +1,7 @@
 import os
 import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -64,6 +66,126 @@ def _strict_boolean_env(name, default):
     if raw_value == "false":
         return False, True
     return default, False
+
+
+_TIME_WINDOW_FORMAT = re.compile(
+    r"^(?P<start_hour>[01][0-9]|2[0-3]):(?P<start_minute>[0-5][0-9])-"
+    r"(?P<end_hour>[01][0-9]|2[0-3]):(?P<end_minute>[0-5][0-9])$"
+)
+
+
+def _strict_positive_int_env(name, default):
+    raw_value = os.getenv(name, str(default))
+    if (
+        not isinstance(raw_value, str)
+        or not raw_value.isascii()
+        or not raw_value.isdecimal()
+        or len(raw_value) > 9
+    ):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _strict_time_window_env(name, default):
+    raw_value = os.getenv(name, default)
+    match = (
+        _TIME_WINDOW_FORMAT.fullmatch(raw_value)
+        if isinstance(raw_value, str)
+        else None
+    )
+    if match is None:
+        raise ValueError(f"{name} must use HH:MM-HH:MM")
+    start = int(match["start_hour"]) * 60 + int(match["start_minute"])
+    end = int(match["end_hour"]) * 60 + int(match["end_minute"])
+    if start >= end:
+        raise ValueError(f"{name} must have an end after its start")
+    return raw_value, start, end
+
+
+def _adaptive_configuration():
+    posts_per_day = _strict_positive_int_env("POSTS_PER_DAY", 2)
+    if posts_per_day != 2:
+        raise ValueError("POSTS_PER_DAY must be exactly 2 for this release")
+
+    approved_queue_target = _strict_positive_int_env(
+        "APPROVED_QUEUE_TARGET", 7,
+    )
+    if approved_queue_target < posts_per_day:
+        raise ValueError("APPROVED_QUEUE_TARGET must cover POSTS_PER_DAY")
+
+    pending_review_limit = _strict_positive_int_env("PENDING_REVIEW_LIMIT", 3)
+    if pending_review_limit > approved_queue_target:
+        raise ValueError("PENDING_REVIEW_LIMIT cannot exceed APPROVED_QUEUE_TARGET")
+
+    generation_cap = _strict_positive_int_env("DRAFT_GENERATION_DAILY_CAP", 4)
+    audience_timezone = os.getenv("AUDIENCE_TIMEZONE", "America/New_York")
+    try:
+        ZoneInfo(audience_timezone)
+    except (TypeError, ValueError, ZoneInfoNotFoundError) as error:
+        raise ValueError("AUDIENCE_TIMEZONE must be a valid IANA timezone") from error
+
+    morning_window, morning_start, morning_end = _strict_time_window_env(
+        "MORNING_WINDOW", "08:30-11:30",
+    )
+    evening_window, evening_start, evening_end = _strict_time_window_env(
+        "EVENING_WINDOW", "16:30-20:30",
+    )
+    if morning_end > evening_start:
+        raise ValueError("MORNING_WINDOW must end before EVENING_WINDOW")
+
+    min_post_gap_hours = _strict_positive_int_env("MIN_POST_GAP_HOURS", 6)
+    if evening_end - morning_start < min_post_gap_hours * 60:
+        raise ValueError(
+            "MIN_POST_GAP_HOURS cannot fit inside MORNING_WINDOW and EVENING_WINDOW"
+        )
+
+    timing_min_posts = _strict_positive_int_env("ADAPTIVE_TIMING_MIN_POSTS", 30)
+    weekday_min_posts = _strict_positive_int_env(
+        "ADAPTIVE_WEEKDAY_MIN_POSTS", 90,
+    )
+    if weekday_min_posts < timing_min_posts:
+        raise ValueError(
+            "ADAPTIVE_WEEKDAY_MIN_POSTS cannot be below ADAPTIVE_TIMING_MIN_POSTS"
+        )
+
+    grace_minutes = _strict_positive_int_env(
+        "PUBLICATION_PLAN_GRACE_MINUTES", 90,
+    )
+    return {
+        "POSTS_PER_DAY": posts_per_day,
+        "APPROVED_QUEUE_TARGET": approved_queue_target,
+        "PENDING_REVIEW_LIMIT": pending_review_limit,
+        "DRAFT_GENERATION_DAILY_CAP": generation_cap,
+        "AUDIENCE_TIMEZONE": audience_timezone,
+        "MORNING_WINDOW": morning_window,
+        "EVENING_WINDOW": evening_window,
+        "MIN_POST_GAP_HOURS": min_post_gap_hours,
+        "ADAPTIVE_TIMING_MIN_POSTS": timing_min_posts,
+        "ADAPTIVE_WEEKDAY_MIN_POSTS": weekday_min_posts,
+        "PUBLICATION_PLAN_GRACE_MINUTES": grace_minutes,
+    }
+
+
+_ADAPTIVE_CONFIGURATION = _adaptive_configuration()
+POSTS_PER_DAY = _ADAPTIVE_CONFIGURATION["POSTS_PER_DAY"]
+APPROVED_QUEUE_TARGET = _ADAPTIVE_CONFIGURATION["APPROVED_QUEUE_TARGET"]
+PENDING_REVIEW_LIMIT = _ADAPTIVE_CONFIGURATION["PENDING_REVIEW_LIMIT"]
+DRAFT_GENERATION_DAILY_CAP = _ADAPTIVE_CONFIGURATION["DRAFT_GENERATION_DAILY_CAP"]
+AUDIENCE_TIMEZONE = _ADAPTIVE_CONFIGURATION["AUDIENCE_TIMEZONE"]
+MORNING_WINDOW = _ADAPTIVE_CONFIGURATION["MORNING_WINDOW"]
+EVENING_WINDOW = _ADAPTIVE_CONFIGURATION["EVENING_WINDOW"]
+MIN_POST_GAP_HOURS = _ADAPTIVE_CONFIGURATION["MIN_POST_GAP_HOURS"]
+ADAPTIVE_TIMING_MIN_POSTS = _ADAPTIVE_CONFIGURATION["ADAPTIVE_TIMING_MIN_POSTS"]
+ADAPTIVE_WEEKDAY_MIN_POSTS = _ADAPTIVE_CONFIGURATION["ADAPTIVE_WEEKDAY_MIN_POSTS"]
+PUBLICATION_PLAN_GRACE_MINUTES = _ADAPTIVE_CONFIGURATION[
+    "PUBLICATION_PLAN_GRACE_MINUTES"
+]
 
 
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Rome")
@@ -185,6 +307,7 @@ def validate_config():
     current_dry_run, current_dry_run_valid = _strict_boolean_env(
         "DRY_RUN", True,
     )
+    current_adaptive_configuration = _adaptive_configuration()
     required_keys = [
         'TWITTER_API_KEY',
         'TWITTER_API_SECRET',
@@ -232,5 +355,8 @@ def validate_config():
         or APPROVAL_REQUIRED is not True
     ):
         raise ValueError("APPROVAL_REQUIRED must be true for this release")
+
+    if current_adaptive_configuration != _ADAPTIVE_CONFIGURATION:
+        raise ValueError("Adaptive publishing configuration changed after import")
 
     print("✅ Configurazione validata con successo!")
