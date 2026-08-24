@@ -15,12 +15,13 @@ import logging
 import json
 import os
 import re
+import secrets
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, List, Dict, Mapping, Optional, Set, Tuple
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from modules.media_store import (
     PinnedMediaFile,
@@ -57,6 +58,7 @@ _LIVE_DRAFT_STATUS_SQL = (
 MEDIA_FILE_DELETE_SAFE_STATES = ("available", "used", "archived")
 _MEDIA_STORE_MUTATION_MAX_ATTEMPTS = 5
 _MEDIA_LIFECYCLE_MIGRATION_KEY = "migration:media_lifecycle_state"
+_EDITORIAL_QUEUE_MIGRATION_KEY = "migration:approved_editorial_queue_v1"
 _MEDIA_MUTATION_SNAPSHOT_COLUMNS = (
     "id",
     "filename",
@@ -121,6 +123,18 @@ class PostDraftPublicationClaim:
     media_id: Optional[int]
     approved_at: Optional[str]
     approved_by: Optional[str]
+
+
+@dataclass(frozen=True)
+class PublicationPlanClaim:
+    """Immutable identity of one exact planned publication attempt."""
+
+    plan_id: int
+    plan_revision: int
+    draft_id: int
+    draft_revision: int
+    scheduled_for: str
+    claim_token: str
 
 
 class Database:
@@ -561,6 +575,90 @@ class Database:
                     updated_at TEXT NOT NULL
                 )
             """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS editorial_queue (
+                    draft_id INTEGER PRIMARY KEY REFERENCES post_drafts(id),
+                    translation_it TEXT,
+                    translation_status TEXT NOT NULL CHECK (
+                        translation_status IN (
+                            'pending', 'ready', 'failed', 'invalidated'
+                        )
+                    ),
+                    review_ready_at TEXT,
+                    approved_queue_at TEXT,
+                    not_before TEXT,
+                    blocked_reason TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS publication_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    local_date TEXT NOT NULL,
+                    position INTEGER NOT NULL CHECK (position IN (1, 2)),
+                    scheduled_for TEXT NOT NULL UNIQUE,
+                    draft_id INTEGER REFERENCES post_drafts(id),
+                    draft_revision INTEGER,
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'open', 'planned', 'publishing', 'published',
+                            'simulated', 'skipped', 'unknown'
+                        )
+                    ),
+                    selection_reason_json TEXT NOT NULL DEFAULT '{}',
+                    claim_token TEXT,
+                    published_tweet_id TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(local_date, position)
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS draft_replenishment_claims (
+                    token TEXT PRIMARY KEY,
+                    operator_date TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('claimed', 'completed', 'released')
+                    ),
+                    claimed_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    draft_id INTEGER REFERENCES post_drafts(id),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    uq_publication_plans_active_draft
+                ON publication_plans(draft_id)
+                WHERE draft_id IS NOT NULL
+                  AND status IN ('planned', 'publishing', 'unknown')
+            """)
+            queue_migration = c.execute(
+                "SELECT value FROM bot_state WHERE key = ?",
+                (_EDITORIAL_QUEUE_MIGRATION_KEY,),
+            ).fetchone()
+            if queue_migration is None or queue_migration["value"] != "complete":
+                queue_now = self._now_iso()
+                c.execute("""
+                    INSERT OR IGNORE INTO editorial_queue (
+                        draft_id, translation_status, created_at, updated_at
+                    )
+                    SELECT id, 'pending', ?, ?
+                    FROM post_drafts
+                    WHERE status IN ('pending_approval', 'approved')
+                """, (queue_now, queue_now))
+                c.execute("""
+                    INSERT INTO bot_state (key, value, updated_at)
+                    VALUES (?, 'complete', ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = 'complete', updated_at = excluded.updated_at
+                """, (_EDITORIAL_QUEUE_MIGRATION_KEY, queue_now))
+
             lifecycle_migration = c.execute(
                 "SELECT value FROM bot_state WHERE key = ?",
                 (_MEDIA_LIFECYCLE_MIGRATION_KEY,),
@@ -1625,6 +1723,821 @@ class Database:
             if intended.astimezone(local_timezone).date() == local_date:
                 count += 1
         return count
+
+    # ---------- Approved editorial queue / adaptive publication plans ----------
+
+    @staticmethod
+    def _exact_positive_identifier(value: Any) -> bool:
+        return type(value) is int and value > 0
+
+    @staticmethod
+    def _exact_nonnegative_revision(value: Any) -> bool:
+        return type(value) is int and value >= 0
+
+    @staticmethod
+    def _strict_aware_datetime(value: Any) -> Optional[datetime]:
+        if type(value) is datetime:
+            parsed = value
+        elif type(value) is str and value and len(value) <= 64:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except (TypeError, ValueError):
+                return None
+        else:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _decode_source_ids(raw_value: Any) -> Optional[List[int]]:
+        try:
+            decoded = json.loads(raw_value)
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+            return None
+        if (
+            type(decoded) is not list
+            or not decoded
+            or any(type(source_id) is not int or source_id <= 0 for source_id in decoded)
+            or len(decoded) != len(set(decoded))
+        ):
+            return None
+        return decoded
+
+    @classmethod
+    def _decode_queue_draft_row(cls, row: Optional[sqlite3.Row]) -> Optional[Dict]:
+        if row is None:
+            return None
+        record = dict(row)
+        source_ids = cls._decode_source_ids(record.pop("source_ids_json", None))
+        try:
+            score_data = json.loads(record.pop("score_json", ""))
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+            return None
+        queue_statuses = {"pending", "ready", "failed", "invalidated"}
+        draft_statuses = {
+            "pending_approval",
+            "approved",
+            "publishing",
+            "published",
+            "publication_unknown",
+            "publication_failed",
+            "expired",
+            "superseded",
+            "discarded",
+        }
+        if (
+            source_ids is None
+            or type(score_data) is not dict
+            or record.get("translation_status") not in queue_statuses
+            or record.get("status") not in draft_statuses
+            or not cls._exact_positive_identifier(record.get("id"))
+            or not cls._exact_positive_identifier(record.get("draft_id"))
+            or record["id"] != record["draft_id"]
+            or not cls._exact_nonnegative_revision(record.get("revision"))
+            or not cls._exact_nonnegative_revision(record.get("queue_revision"))
+        ):
+            return None
+        translation = record.get("translation_it")
+        if translation is not None and (
+            type(translation) is not str
+            or not translation.strip()
+            or len(translation) > 4096
+            or len(translation.encode("utf-8")) > 8192
+        ):
+            return None
+        if record["translation_status"] == "ready" and translation is None:
+            return None
+        blocked_reason = record.get("blocked_reason")
+        if blocked_reason is not None and (
+            type(blocked_reason) is not str
+            or not blocked_reason
+            or len(blocked_reason) > 128
+        ):
+            return None
+        for field in ("created_at", "updated_at", "queue_created_at", "queue_updated_at"):
+            if cls._strict_aware_datetime(record.get(field)) is None:
+                return None
+        for field in (
+            "review_ready_at",
+            "approved_queue_at",
+            "not_before",
+            "approved_at",
+        ):
+            if record.get(field) is not None and cls._strict_aware_datetime(
+                record[field]
+            ) is None:
+                return None
+        current = datetime.now(timezone.utc)
+        for field in ("approved_queue_at", "approved_at"):
+            parsed = cls._strict_aware_datetime(record.get(field))
+            if parsed is not None and parsed > current:
+                return None
+        record["source_ids"] = source_ids
+        record["score_data"] = score_data
+        return record
+
+    @staticmethod
+    def _queue_draft_row_in_conn(conn, draft_id: int) -> Optional[sqlite3.Row]:
+        return conn.execute("""
+            SELECT
+                d.id, d.publication_key, d.text, d.category,
+                d.source_ids_json, d.score_json, d.intended_slot, d.status,
+                d.media_id, d.approved_at, d.approved_by,
+                d.published_tweet_id, d.error, d.created_at, d.updated_at,
+                d.revision,
+                q.draft_id, q.translation_it, q.translation_status,
+                q.review_ready_at, q.approved_queue_at, q.not_before,
+                q.blocked_reason, q.revision AS queue_revision,
+                q.created_at AS queue_created_at,
+                q.updated_at AS queue_updated_at
+            FROM post_drafts d
+            JOIN editorial_queue q ON q.draft_id = d.id
+            WHERE d.id = ?
+        """, (draft_id,)).fetchone()
+
+    def ensure_editorial_queue(self, draft_id: int) -> Optional[Dict]:
+        if not self._exact_positive_identifier(draft_id):
+            return None
+        with self._post_draft_mutation_lock(draft_id) as conn:
+            draft = conn.execute(
+                "SELECT status FROM post_drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+            if draft is None or draft["status"] not in ("pending_approval", "approved"):
+                return None
+            now = self._now_iso()
+            conn.execute("""
+                INSERT OR IGNORE INTO editorial_queue (
+                    draft_id, translation_status, created_at, updated_at
+                ) VALUES (?, 'pending', ?, ?)
+            """, (draft_id, now, now))
+            return self._decode_queue_draft_row(
+                self._queue_draft_row_in_conn(conn, draft_id)
+            )
+
+    def get_queue_draft(self, draft_id: int) -> Optional[Dict]:
+        if not self._exact_positive_identifier(draft_id):
+            return None
+        with self._conn() as conn:
+            row = self._queue_draft_row_in_conn(conn, draft_id)
+        return self._decode_queue_draft_row(row)
+
+    def save_review_translation(
+        self,
+        draft_id: int,
+        expected_draft_revision: int,
+        text_it: str,
+    ) -> bool:
+        if (
+            not self._exact_positive_identifier(draft_id)
+            or not self._exact_nonnegative_revision(expected_draft_revision)
+            or type(text_it) is not str
+            or not text_it.strip()
+            or len(text_it) > 4096
+            or len(text_it.encode("utf-8")) > 8192
+        ):
+            return False
+        with self._post_draft_mutation_lock(draft_id) as conn:
+            current = self._queue_draft_row_in_conn(conn, draft_id)
+            if (
+                current is None
+                or current["revision"] != expected_draft_revision
+                or current["status"] not in ("pending_approval", "approved")
+            ):
+                return False
+            if (
+                current["translation_status"] == "ready"
+                and current["translation_it"] == text_it
+            ):
+                return True
+            now = self._now_iso()
+            cursor = conn.execute("""
+                UPDATE editorial_queue
+                SET translation_it = ?, translation_status = 'ready',
+                    review_ready_at = ?, approved_queue_at = NULL,
+                    blocked_reason = NULL, updated_at = ?,
+                    revision = revision + 1
+                WHERE draft_id = ? AND revision = ?
+            """, (
+                text_it,
+                now,
+                now,
+                draft_id,
+                current["queue_revision"],
+            ))
+            return cursor.rowcount == 1
+
+    def approve_queued_draft_atomic(
+        self,
+        draft_id: int,
+        expected_draft_revision: int,
+        expected_queue_revision: int,
+        approved_by: str,
+        approved_at: str,
+    ) -> bool:
+        try:
+            return self._approve_queued_draft_atomic(
+                draft_id,
+                expected_draft_revision,
+                expected_queue_revision,
+                approved_by,
+                approved_at,
+            )
+        except (OSError, ValueError, sqlite3.DatabaseError):
+            return False
+
+    def _approve_queued_draft_atomic(
+        self,
+        draft_id: int,
+        expected_draft_revision: int,
+        expected_queue_revision: int,
+        approved_by: str,
+        approved_at: str,
+    ) -> bool:
+        approval_time = self._strict_aware_datetime(approved_at)
+        validation_time = datetime.now(timezone.utc)
+        if (
+            not self._exact_positive_identifier(draft_id)
+            or not self._exact_nonnegative_revision(expected_draft_revision)
+            or not self._exact_nonnegative_revision(expected_queue_revision)
+            or type(approved_by) is not str
+            or not approved_by.strip()
+            or len(approved_by) > 64
+            or approval_time is None
+            or approval_time > validation_time
+        ):
+            return False
+        with self._post_draft_mutation_lock(draft_id) as conn:
+            current = self._queue_draft_row_in_conn(conn, draft_id)
+            if (
+                current is None
+                or current["revision"] != expected_draft_revision
+                or current["queue_revision"] != expected_queue_revision
+                or current["status"] not in ("pending_approval", "approved")
+                or current["translation_status"] != "ready"
+                or type(current["translation_it"]) is not str
+                or not current["translation_it"].strip()
+            ):
+                return False
+            source_ids = self._decode_source_ids(current["source_ids_json"])
+            if source_ids is None or not self._eligible_content_sources_in_conn(
+                conn, source_ids, validation_time
+            ):
+                return False
+            if not self._queue_media_binding_valid_in_conn(conn, current):
+                return False
+            now = self._now_iso()
+            draft_cursor = conn.execute("""
+                UPDATE post_drafts
+                SET status = 'approved', approved_at = ?, approved_by = ?,
+                    updated_at = ?, revision = revision + 1
+                WHERE id = ? AND revision = ?
+                  AND status IN ('pending_approval', 'approved')
+            """, (
+                approval_time.isoformat(),
+                approved_by.strip(),
+                now,
+                draft_id,
+                expected_draft_revision,
+            ))
+            if draft_cursor.rowcount != 1:
+                return False
+            queue_cursor = conn.execute("""
+                UPDATE editorial_queue
+                SET approved_queue_at = ?, blocked_reason = NULL,
+                    updated_at = ?, revision = revision + 1
+                WHERE draft_id = ? AND revision = ?
+                  AND translation_status = 'ready'
+            """, (
+                approval_time.isoformat(),
+                now,
+                draft_id,
+                expected_queue_revision,
+            ))
+            if queue_cursor.rowcount != 1:
+                conn.rollback()
+                return False
+            return True
+
+    @staticmethod
+    def _queue_media_binding_valid_in_conn(conn, draft_row: Mapping) -> bool:
+        reserved = conn.execute("""
+            SELECT * FROM media_library
+            WHERE reserved_by_draft_id = ? AND lifecycle_state = 'reserved'
+            ORDER BY id
+        """, (draft_row["id"],)).fetchall()
+        media_id = draft_row["media_id"]
+        if media_id is None:
+            return not reserved
+        if type(media_id) is not int or media_id <= 0 or len(reserved) != 1:
+            return False
+        media = reserved[0]
+        return (
+            media["id"] == media_id
+            and media["file_deleted"] == 0
+            and media["lifecycle_state"] == "reserved"
+            and media["reserved_by_draft_id"] == draft_row["id"]
+            and record_has_media_identity(dict(media))
+        )
+
+    def invalidate_review_translation(
+        self,
+        draft_id: int,
+        expected_draft_revision: int,
+    ) -> bool:
+        if (
+            not self._exact_positive_identifier(draft_id)
+            or not self._exact_nonnegative_revision(expected_draft_revision)
+        ):
+            return False
+        with self._post_draft_mutation_lock(draft_id) as conn:
+            current = self._queue_draft_row_in_conn(conn, draft_id)
+            if (
+                current is None
+                or current["revision"] != expected_draft_revision
+                or current["status"] not in ("pending_approval", "approved")
+            ):
+                return False
+            now = self._now_iso()
+            draft_cursor = conn.execute("""
+                UPDATE post_drafts
+                SET status = 'pending_approval', approved_at = NULL,
+                    approved_by = NULL, updated_at = ?, revision = revision + 1
+                WHERE id = ? AND revision = ?
+                  AND status IN ('pending_approval', 'approved')
+            """, (now, draft_id, expected_draft_revision))
+            if draft_cursor.rowcount != 1:
+                return False
+            queue_cursor = conn.execute("""
+                UPDATE editorial_queue
+                SET translation_it = NULL, translation_status = 'invalidated',
+                    review_ready_at = NULL, approved_queue_at = NULL,
+                    blocked_reason = NULL, updated_at = ?,
+                    revision = revision + 1
+                WHERE draft_id = ? AND revision = ?
+            """, (now, draft_id, current["queue_revision"]))
+            if queue_cursor.rowcount != 1:
+                conn.rollback()
+                return False
+            return True
+
+    def get_queue_counts(self, operator_date: date, timezone_name: str) -> Dict[str, int]:
+        if type(operator_date) is not date or type(timezone_name) is not str:
+            raise ValueError("invalid queue count boundary")
+        try:
+            operator_zone = ZoneInfo(timezone_name)
+        except (TypeError, ValueError, ZoneInfoNotFoundError) as error:
+            raise ValueError("invalid queue count timezone") from error
+        counts = {
+            "awaiting_translation": 0,
+            "awaiting_review": 0,
+            "approved_available": 0,
+            "planned_today": 0,
+            "blocked": 0,
+        }
+        now = datetime.now(timezone.utc)
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT d.id, d.status, q.translation_status,
+                       q.translation_it, q.approved_queue_at,
+                       q.not_before, q.blocked_reason
+                FROM editorial_queue q
+                JOIN post_drafts d ON d.id = q.draft_id
+            """).fetchall()
+            plans = conn.execute("""
+                SELECT scheduled_for, status FROM publication_plans
+                WHERE status IN (
+                    'planned', 'publishing', 'published',
+                    'simulated', 'unknown'
+                )
+            """).fetchall()
+            active_drafts = {
+                row["draft_id"]
+                for row in conn.execute("""
+                    SELECT draft_id FROM publication_plans
+                    WHERE draft_id IS NOT NULL
+                      AND status IN ('planned', 'publishing', 'unknown')
+                """).fetchall()
+            }
+        for row in rows:
+            if row["blocked_reason"]:
+                counts["blocked"] += 1
+                continue
+            if row["status"] not in ("pending_approval", "approved"):
+                continue
+            if row["translation_status"] != "ready" or not row["translation_it"]:
+                counts["awaiting_translation"] += 1
+            elif row["approved_queue_at"] is None:
+                counts["awaiting_review"] += 1
+            elif row["status"] == "approved" and row["id"] not in active_drafts:
+                not_before = self._strict_aware_datetime(row["not_before"])
+                if row["not_before"] is None or (
+                    not_before is not None and not_before <= now
+                ):
+                    counts["approved_available"] += 1
+        for plan in plans:
+            scheduled = self._strict_aware_datetime(plan["scheduled_for"])
+            if scheduled and scheduled.astimezone(operator_zone).date() == operator_date:
+                counts["planned_today"] += 1
+        return counts
+
+    @staticmethod
+    def _decode_replenishment_claim(row: Optional[sqlite3.Row]) -> Optional[Dict]:
+        if row is None:
+            return None
+        record = dict(row)
+        if (
+            type(record.get("token")) is not str
+            or not record["token"]
+            or record.get("status") not in {"claimed", "completed", "released"}
+        ):
+            return None
+        return record
+
+    def claim_replenishment(
+        self,
+        operator_date: date,
+        max_daily: int,
+        now: datetime,
+        ttl_seconds: int = 1800,
+    ) -> Optional[Dict]:
+        current = self._strict_aware_datetime(now)
+        if (
+            type(operator_date) is not date
+            or type(max_daily) is not int
+            or max_daily <= 0
+            or current is None
+            or type(ttl_seconds) is not int
+            or ttl_seconds <= 0
+            or ttl_seconds > 86400
+        ):
+            return None
+        now_iso = current.isoformat()
+        expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                UPDATE draft_replenishment_claims
+                SET status = 'released', updated_at = ?
+                WHERE operator_date = ? AND status = 'claimed'
+                  AND julianday(expires_at) <= julianday(?)
+            """, (now_iso, operator_date.isoformat(), now_iso))
+            count = conn.execute("""
+                SELECT COUNT(*) AS count
+                FROM draft_replenishment_claims
+                WHERE operator_date = ?
+                  AND (
+                    status = 'completed'
+                    OR (
+                        status = 'claimed'
+                        AND julianday(expires_at) > julianday(?)
+                    )
+                  )
+            """, (operator_date.isoformat(), now_iso)).fetchone()["count"]
+            if count >= max_daily:
+                return None
+            token = secrets.token_urlsafe(24)
+            conn.execute("""
+                INSERT INTO draft_replenishment_claims (
+                    token, operator_date, status, claimed_at, expires_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'claimed', ?, ?, ?, ?)
+            """, (
+                token,
+                operator_date.isoformat(),
+                now_iso,
+                expires_at,
+                now_iso,
+                now_iso,
+            ))
+            return self._decode_replenishment_claim(conn.execute(
+                "SELECT * FROM draft_replenishment_claims WHERE token = ?",
+                (token,),
+            ).fetchone())
+
+    def complete_replenishment_claim(self, token: str, draft_id: int) -> bool:
+        if (
+            type(token) is not str
+            or not token
+            or len(token) > 128
+            or not self._exact_positive_identifier(draft_id)
+        ):
+            return False
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM post_drafts WHERE id = ?", (draft_id,)
+            ).fetchone() is None:
+                return False
+            cursor = conn.execute("""
+                UPDATE draft_replenishment_claims
+                SET status = 'completed', draft_id = ?, updated_at = ?
+                WHERE token = ? AND status = 'claimed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM draft_replenishment_claims other
+                    WHERE other.draft_id = ? AND other.status = 'completed'
+                  )
+            """, (draft_id, self._now_iso(), token, draft_id))
+            return cursor.rowcount == 1
+
+    def release_replenishment_claim(self, token: str) -> bool:
+        if type(token) is not str or not token or len(token) > 128:
+            return False
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute("""
+                UPDATE draft_replenishment_claims
+                SET status = 'released', updated_at = ?
+                WHERE token = ? AND status = 'claimed'
+            """, (self._now_iso(), token))
+            return cursor.rowcount == 1
+
+    @classmethod
+    def _decode_publication_plan(cls, row: Optional[sqlite3.Row]) -> Optional[Dict]:
+        if row is None:
+            return None
+        record = dict(row)
+        try:
+            reason = json.loads(record.pop("selection_reason_json"))
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+            return None
+        allowed_reason_keys = {
+            "reason", "bucket_id", "sample_count", "score",
+            "rank", "urgency", "category_balance", "format_diversity",
+            "source_expiry",
+        }
+        if (
+            type(reason) is not dict
+            or not reason
+            or not set(reason).issubset(allowed_reason_keys)
+            or reason.get("reason") not in {"cold_start", "performance_weighted"}
+            or type(reason.get("bucket_id")) is not str
+            or re.fullmatch(
+                r"(?:morning|evening):[0-9]{1,2}", reason["bucket_id"]
+            ) is None
+            or record.get("status") not in {
+                "open", "planned", "publishing", "published",
+                "simulated", "skipped", "unknown",
+            }
+            or not cls._exact_positive_identifier(record.get("id"))
+            or not cls._exact_nonnegative_revision(record.get("revision"))
+            or cls._strict_aware_datetime(record.get("scheduled_for")) is None
+        ):
+            return None
+        record["selection_reason"] = reason
+        return record
+
+    def create_or_get_publication_positions(
+        self,
+        local_date: date,
+        decision,
+        now: datetime,
+    ) -> List[Dict]:
+        from modules.adaptive_timing import DailyTimingDecision
+
+        current = self._strict_aware_datetime(now)
+        if (
+            type(local_date) is not date
+            or type(decision) is not DailyTimingDecision
+            or current is None
+            or type(decision.times) is not tuple
+            or len(decision.times) != 2
+            or type(decision.bucket_ids) is not tuple
+            or len(decision.bucket_ids) != 2
+            or decision.reason not in {"cold_start", "performance_weighted"}
+        ):
+            return []
+        prepared = []
+        for position, (scheduled, bucket_id) in enumerate(
+            zip(decision.times, decision.bucket_ids), start=1
+        ):
+            normalized = self._strict_aware_datetime(scheduled)
+            if (
+                normalized is None
+                or scheduled.date() != local_date
+                or type(bucket_id) is not str
+                or re.fullmatch(r"(?:morning|evening):[0-9]{1,2}", bucket_id) is None
+            ):
+                return []
+            reason = json.dumps(
+                {"bucket_id": bucket_id, "reason": decision.reason},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            prepared.append((position, scheduled.isoformat(), reason))
+        if decision.times[1] <= decision.times[0]:
+            return []
+        now_iso = current.isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM publication_plans WHERE local_date = ? ORDER BY position",
+                (local_date.isoformat(),),
+            ).fetchall()
+            if existing:
+                decoded = [self._decode_publication_plan(row) for row in existing]
+                return decoded if len(decoded) == 2 and all(decoded) else []
+            for position, scheduled_for, reason in prepared:
+                conn.execute("""
+                    INSERT INTO publication_plans (
+                        local_date, position, scheduled_for, status,
+                        selection_reason_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'open', ?, ?, ?)
+                """, (
+                    local_date.isoformat(),
+                    position,
+                    scheduled_for,
+                    reason,
+                    now_iso,
+                    now_iso,
+                ))
+            rows = conn.execute(
+                "SELECT * FROM publication_plans WHERE local_date = ? ORDER BY position",
+                (local_date.isoformat(),),
+            ).fetchall()
+            decoded = [self._decode_publication_plan(row) for row in rows]
+            return decoded if len(decoded) == 2 and all(decoded) else []
+
+    def list_approved_queue(self, now: datetime) -> List[Dict]:
+        current = self._strict_aware_datetime(now)
+        if current is None:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT
+                    d.id, d.publication_key, d.text, d.category,
+                    d.source_ids_json, d.score_json, d.intended_slot, d.status,
+                    d.media_id, d.approved_at, d.approved_by,
+                    d.published_tweet_id, d.error, d.created_at, d.updated_at,
+                    d.revision,
+                    q.draft_id, q.translation_it, q.translation_status,
+                    q.review_ready_at, q.approved_queue_at, q.not_before,
+                    q.blocked_reason, q.revision AS queue_revision,
+                    q.created_at AS queue_created_at,
+                    q.updated_at AS queue_updated_at
+                FROM editorial_queue q
+                JOIN post_drafts d ON d.id = q.draft_id
+                WHERE d.status = 'approved'
+                  AND q.translation_status = 'ready'
+                  AND q.approved_queue_at IS NOT NULL
+                  AND q.blocked_reason IS NULL
+                  AND (q.not_before IS NULL OR julianday(q.not_before) <= julianday(?))
+                  AND NOT EXISTS (
+                    SELECT 1 FROM publication_plans p
+                    WHERE p.draft_id = d.id
+                      AND p.status IN ('planned', 'publishing', 'unknown')
+                  )
+                ORDER BY julianday(q.approved_queue_at), d.id
+            """, (current.isoformat(),)).fetchall()
+        return [
+            decoded
+            for row in rows
+            if (decoded := self._decode_queue_draft_row(row)) is not None
+        ]
+
+    @staticmethod
+    def _safe_plan_reason(reason: Any) -> Optional[str]:
+        if type(reason) is not dict or len(reason) > 8:
+            return None
+        allowed = {
+            "rank", "urgency", "score", "category_balance",
+            "format_diversity", "source_expiry",
+        }
+        projected = {}
+        for key, value in reason.items():
+            if key not in allowed or type(key) is not str:
+                continue
+            if value is None or type(value) in (bool, int, float):
+                projected[key] = value
+            elif type(value) is str and len(value) <= 128:
+                projected[key] = value
+        try:
+            encoded = json.dumps(
+                projected,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return None
+        return encoded if len(encoded.encode("utf-8")) <= 1024 else None
+
+    def assign_publication_plan_atomic(
+        self,
+        plan_id: int,
+        draft_id: int,
+        expected_draft_revision: int,
+        reason: Dict,
+    ) -> bool:
+        reason_json = self._safe_plan_reason(reason)
+        if (
+            not self._exact_positive_identifier(plan_id)
+            or not self._exact_positive_identifier(draft_id)
+            or not self._exact_nonnegative_revision(expected_draft_revision)
+            or reason_json is None
+        ):
+            return False
+        try:
+            with self._post_draft_mutation_lock(draft_id) as conn:
+                plan = conn.execute(
+                    "SELECT * FROM publication_plans WHERE id = ?", (plan_id,)
+                ).fetchone()
+                current = self._queue_draft_row_in_conn(conn, draft_id)
+                if (
+                    plan is None
+                    or plan["status"] != "open"
+                    or plan["draft_id"] is not None
+                    or current is None
+                    or current["status"] != "approved"
+                    or current["revision"] != expected_draft_revision
+                    or current["translation_status"] != "ready"
+                    or not current["translation_it"]
+                    or current["approved_queue_at"] is None
+                    or current["blocked_reason"] is not None
+                ):
+                    return False
+                scheduled = self._strict_aware_datetime(plan["scheduled_for"])
+                if scheduled is None:
+                    return False
+                not_before = self._strict_aware_datetime(current["not_before"])
+                if current["not_before"] is not None and (
+                    not_before is None or not_before > scheduled
+                ):
+                    return False
+                source_ids = self._decode_source_ids(current["source_ids_json"])
+                if source_ids is None or not self._eligible_content_sources_in_conn(
+                    conn, source_ids, scheduled
+                ):
+                    return False
+                if not self._queue_media_binding_valid_in_conn(conn, current):
+                    return False
+                try:
+                    timing_reason = json.loads(plan["selection_reason_json"])
+                    ranking_reason = json.loads(reason_json)
+                except (
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                    RecursionError,
+                ):
+                    return False
+                if type(timing_reason) is not dict or type(ranking_reason) is not dict:
+                    return False
+                merged_reason = {
+                    key: timing_reason[key]
+                    for key in ("bucket_id", "reason")
+                    if key in timing_reason
+                }
+                merged_reason.update(ranking_reason)
+                try:
+                    merged_reason_json = json.dumps(
+                        merged_reason,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                except (TypeError, ValueError):
+                    return False
+                if len(merged_reason_json.encode("utf-8")) > 1024:
+                    return False
+                cursor = conn.execute("""
+                    UPDATE publication_plans
+                    SET draft_id = ?, draft_revision = ?, status = 'planned',
+                        selection_reason_json = ?, updated_at = ?,
+                        revision = revision + 1
+                    WHERE id = ? AND revision = ? AND status = 'open'
+                      AND draft_id IS NULL
+                """, (
+                    draft_id,
+                    expected_draft_revision,
+                    merged_reason_json,
+                    self._now_iso(),
+                    plan_id,
+                    plan["revision"],
+                ))
+                return cursor.rowcount == 1
+        except (sqlite3.IntegrityError, OSError, ValueError):
+            return False
+
+    def mark_publication_plan_simulated(
+        self,
+        plan_id: int,
+        expected_revision: int,
+    ) -> bool:
+        if (
+            not self._exact_positive_identifier(plan_id)
+            or not self._exact_nonnegative_revision(expected_revision)
+        ):
+            return False
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute("""
+                UPDATE publication_plans
+                SET status = 'simulated', claim_token = NULL,
+                    updated_at = ?, revision = revision + 1
+                WHERE id = ? AND revision = ? AND status = 'planned'
+            """, (self._now_iso(), plan_id, expected_revision))
+            return cursor.rowcount == 1
 
     def get_recent_content_texts(
         self,
