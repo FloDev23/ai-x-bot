@@ -1,5 +1,7 @@
 import hashlib
 import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 import pytest
@@ -11,6 +13,8 @@ from modules.editorial_feed import (
     FlexDropinEditorialFeedClient,
     validate_editorial_feed,
 )
+from modules.database import Database
+from modules.source_validation import is_complete_owned_blog_article
 
 
 VALID_ITEM = {
@@ -279,3 +283,212 @@ def test_transport_swallows_close_error_without_leaking_it():
 
     assert records[0]["slug"] == VALID_ITEM["slug"]
     assert response.close_calls == 1
+
+
+def valid_database_records():
+    feed = clone_feed()
+    feed["items"].append({
+        "slug": "drop-in-vs-gym-membership",
+        "url": "https://flexdropin.com/blog/drop-in-vs-gym-membership",
+        "title": "Drop-in vs gym membership",
+        "summary": "A practical comparison for flexible training.",
+        "published_at": "2026-08-04",
+    })
+    return validate_editorial_feed(feed, TODAY)
+
+
+def test_database_imports_complete_owned_blog_articles(tmp_path):
+    database = Database(tmp_path / "bot.db")
+
+    counts = database.import_owned_blog_articles(valid_database_records())
+
+    assert counts == {"inserted": 2, "updated": 0, "unchanged": 0}
+    sources = database.get_eligible_sources("owned_blog_article")
+    assert len(sources) == 2
+    source = next(item for item in sources if item["url"] == VALID_ITEM["url"])
+    assert source["source_type"] == "owned_blog_article"
+    assert source["trust_state"] == "verified"
+    assert source["verified_by"] == "flexdropin_editorial_feed"
+    assert source["expires_at"] is None
+    assert source["text"] == (
+        source["metadata"]["title"]
+        + "\n"
+        + source["metadata"]["summary"]
+    )
+    assert source["metadata"] == {
+        "title": VALID_ITEM["title"],
+        "summary": VALID_ITEM["summary"],
+        "published_at": VALID_ITEM["published_at"],
+        "source_name": "FlexDropin Blog",
+        "slug": VALID_ITEM["slug"],
+        "feed_version": 1,
+        "content_hash": source["metadata"]["content_hash"],
+    }
+    assert is_complete_owned_blog_article(source) is True
+
+
+def test_database_import_is_idempotent_updates_changed_and_retains_missing(tmp_path):
+    database = Database(tmp_path / "bot.db")
+    records = valid_database_records()
+    database.import_owned_blog_articles(records)
+    original = database.get_eligible_sources("owned_blog_article")
+    created_by_url = {source["url"]: source["created_at"] for source in original}
+
+    assert database.import_owned_blog_articles(records) == {
+        "inserted": 0,
+        "updated": 0,
+        "unchanged": 2,
+    }
+
+    changed_feed = clone_feed()
+    changed_feed["items"][0]["summary"] = "A revised bounded guide."
+    changed = validate_editorial_feed(changed_feed, TODAY)
+    assert database.import_owned_blog_articles(changed) == {
+        "inserted": 0,
+        "updated": 1,
+        "unchanged": 0,
+    }
+    after = database.get_eligible_sources("owned_blog_article")
+    assert len(after) == 2
+    changed_source = next(item for item in after if item["url"] == VALID_ITEM["url"])
+    assert changed_source["metadata"]["summary"] == "A revised bounded guide."
+    assert changed_source["created_at"] == created_by_url[VALID_ITEM["url"]]
+
+
+def test_database_import_conflict_rolls_back_entire_batch(tmp_path):
+    database = Database(tmp_path / "bot.db")
+    records = valid_database_records()
+    database.add_content_source(
+        "verified_news",
+        "Existing unrelated source",
+        url=records[1]["url"],
+    )
+
+    with pytest.raises(ValueError, match="^owned_blog_source_conflict$"):
+        database.import_owned_blog_articles(records)
+
+    assert database.content_source_exists(records[0]["url"]) is False
+
+
+def test_database_import_does_not_reenable_or_overwrite_revoked_article(tmp_path):
+    database = Database(tmp_path / "bot.db")
+    original = valid_database_records()[:1]
+    database.import_owned_blog_articles(original)
+    with sqlite3.connect(database.db_path) as connection:
+        connection.execute(
+            "UPDATE content_sources SET trust_state = 'pending' WHERE url = ?",
+            (original[0]["url"],),
+        )
+
+    changed_feed = clone_feed()
+    changed_feed["items"][0]["summary"] = "Changed after manual revocation."
+    changed = validate_editorial_feed(changed_feed, TODAY)
+
+    assert database.import_owned_blog_articles(changed) == {
+        "inserted": 0,
+        "updated": 0,
+        "unchanged": 1,
+    }
+    with sqlite3.connect(database.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM content_sources WHERE url = ?",
+            (original[0]["url"],),
+        ).fetchone()
+    assert row["trust_state"] == "pending"
+    assert json.loads(row["metadata_json"])["summary"] == VALID_ITEM["summary"]
+    assert database.get_eligible_sources("owned_blog_article") == []
+
+
+def test_database_import_trigger_failure_rolls_back_first_insert(tmp_path):
+    database = Database(tmp_path / "bot.db")
+    records = valid_database_records()
+    with sqlite3.connect(database.db_path) as connection:
+        connection.execute("""
+            CREATE TRIGGER abort_second_owned_blog
+            BEFORE INSERT ON content_sources
+            WHEN NEW.url = 'https://flexdropin.com/blog/drop-in-vs-gym-membership'
+            BEGIN
+                SELECT RAISE(ABORT, 'blocked');
+            END
+        """)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        database.import_owned_blog_articles(records)
+
+    assert database.content_source_exists(records[0]["url"]) is False
+    assert database.content_source_exists(records[1]["url"]) is False
+
+
+def test_database_import_is_serialized_across_connections(tmp_path):
+    path = tmp_path / "bot.db"
+    Database(path)
+    records = valid_database_records()[:1]
+
+    def import_once():
+        return Database(path).import_owned_blog_articles(records)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: import_once(), range(2)))
+
+    assert sorted(result["inserted"] for result in results) == [0, 1]
+    with sqlite3.connect(path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM content_sources WHERE url = ?",
+            (records[0]["url"],),
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_database_import_rejects_ambiguous_existing_url_rows(tmp_path):
+    database = Database(tmp_path / "bot.db")
+    record = valid_database_records()[0]
+    for _index in range(2):
+        database.add_content_source(
+            "owned_blog_article",
+            "Legacy duplicate",
+            url=record["url"],
+            verified_by="flexdropin_editorial_feed",
+        )
+
+    with pytest.raises(ValueError, match="^owned_blog_source_conflict$"):
+        database.import_owned_blog_articles([record])
+
+
+def test_database_import_does_not_coerce_hostile_values(tmp_path):
+    class HostileValue:
+        def __str__(self):
+            raise RuntimeError("SECRET_VALUE")
+
+    database = Database(tmp_path / "bot.db")
+    records = valid_database_records()
+    records[0]["title"] = HostileValue()
+
+    with pytest.raises(ValueError, match="^invalid_owned_blog_import$"):
+        database.import_owned_blog_articles(records)
+
+    assert database.get_eligible_sources("owned_blog_article") == []
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda record: record.update(content_hash="0" * 64),
+        lambda record: record.update(url="https://example.com/blog/unsafe"),
+        lambda record: record.update(published_at="not-a-date"),
+        lambda record: record.update(extra="field"),
+        lambda record: record.update(title=True),
+    ],
+)
+def test_database_import_rejects_malformed_records_before_mutation(
+    tmp_path,
+    mutate,
+):
+    database = Database(tmp_path / "bot.db")
+    records = valid_database_records()
+    mutate(records[1])
+
+    with pytest.raises(ValueError, match="^invalid_owned_blog_import$"):
+        database.import_owned_blog_articles(records)
+
+    assert database.get_eligible_sources("owned_blog_article") == []

@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 
 from modules.fact_guard import FactGuard
@@ -14,6 +16,43 @@ class ClaimAnalyzer:
 class FailingClaimAnalyzer:
     def analyze_claims(self, text, sources):
         raise RuntimeError("analysis unavailable")
+
+
+def owned_blog_source():
+    item = {
+        "slug": "gym-drop-ins-sell-single-classes",
+        "url": (
+            "https://flexdropin.com/blog/"
+            "gym-drop-ins-sell-single-classes"
+        ),
+        "title": "FlexDropin tested a pilot with 3 class formats",
+        "summary": "The guide explains a measured drop-in pilot.",
+        "published_at": "2026-08-20",
+    }
+    content_hash = hashlib.sha256(json.dumps(
+        item,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return {
+        "id": 42,
+        "source_type": "owned_blog_article",
+        "trust_state": "verified",
+        "verified_by": "flexdropin_editorial_feed",
+        "text": item["title"] + "\n" + item["summary"],
+        "url": item["url"],
+        "metadata": {
+            "title": item["title"],
+            "summary": item["summary"],
+            "published_at": item["published_at"],
+            "source_name": "FlexDropin Blog",
+            "slug": item["slug"],
+            "feed_version": 1,
+            "content_hash": content_hash,
+        },
+    }
 
 
 def test_first_person_claim_requires_founder_note():
@@ -62,6 +101,79 @@ def test_supported_product_number_passes():
         {"type": "number", "text": "15% fee", "supported_by": [7]},
     ])
     assert FactGuard(analyzer).check("The verified fee is 15%.", [source]).approved is True
+
+
+def test_owned_blog_article_supports_only_cited_exact_number_and_named_entity():
+    source = owned_blog_source()
+    claims = [
+        {
+            "type": "number",
+            "text": "3 class formats",
+            "supported_by": [42],
+        },
+        {
+            "type": "named_entity",
+            "text": "FlexDropin",
+            "supported_by": [42],
+        },
+    ]
+
+    result = FactGuard(ClaimAnalyzer(claims)).check(
+        "FlexDropin tested 3 class formats.",
+        [source],
+    )
+
+    assert result.approved is True
+    assert result.reasons == []
+
+
+def test_owned_blog_article_cannot_support_sensitive_claim_classes():
+    source = owned_blog_source()
+    claims = (
+        {"type": "first_person", "text": "I tested it", "supported_by": [42]},
+        {"type": "product_claim", "text": "The app converts", "supported_by": [42]},
+        {
+            "type": "incident",
+            "subtype": "payment",
+            "text": "A payment incident",
+            "supported_by": [42],
+        },
+        {"type": "testimonial", "text": "A customer loved it", "supported_by": [42]},
+        {"type": "medical", "text": "It improves health", "supported_by": [42]},
+        {
+            "type": "named_current_event",
+            "text": "A current event",
+            "supported_by": [42],
+        },
+    )
+
+    for claim in claims:
+        result = FactGuard(ClaimAnalyzer([claim])).check(claim["text"], [source])
+        assert result.approved is False
+        assert result.reasons == ["unsupported_claim:" + claim["type"]]
+
+
+def test_owned_blog_number_cannot_borrow_from_another_source():
+    owned = owned_blog_source()
+    product = {
+        "id": 7,
+        "source_type": "product_fact",
+        "trust_state": "verified",
+        "text": "The verified fee is 15%.",
+    }
+    claim = {
+        "type": "number",
+        "text": "The guide reports 15%",
+        "supported_by": [42],
+    }
+
+    result = FactGuard(ClaimAnalyzer([claim])).check(
+        "The guide reports 15%.",
+        [owned, product],
+    )
+
+    assert result.approved is False
+    assert result.reasons == ["unsupported_number"]
 
 
 def test_number_claim_is_rejected_when_value_is_absent_from_source_content():

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List
 
+from modules.source_validation import is_complete_owned_blog_article
+
 
 @dataclass(frozen=True)
 class FactCheckResult:
@@ -13,12 +15,22 @@ class FactCheckResult:
 
 REQUIRED_SOURCE_TYPES = {
     "first_person": {"founder_note"},
-    "number": {"founder_note", "product_fact", "verified_news"},
+    "number": {
+        "founder_note",
+        "product_fact",
+        "verified_news",
+        "owned_blog_article",
+    },
     "product_claim": {"product_fact"},
     "incident": {"founder_note"},
     "medical": {"verified_news"},
     "testimonial": {"founder_note"},
-    "named_entity": {"founder_note", "product_fact", "verified_news"},
+    "named_entity": {
+        "founder_note",
+        "product_fact",
+        "verified_news",
+        "owned_blog_article",
+    },
     "named_current_event": {"verified_news"},
 }
 SUPPORTED_CLAIM_TYPES = frozenset(REQUIRED_SOURCE_TYPES)
@@ -123,6 +135,8 @@ def _source_is_valid(source, allowed_types):
         return False
     if source.get("source_type") == "founder_note":
         return source.get("metadata", {}).get("publishable") is True
+    if source.get("source_type") == "owned_blog_article":
+        return is_complete_owned_blog_article(source)
     return True
 
 

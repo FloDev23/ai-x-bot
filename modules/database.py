@@ -35,7 +35,10 @@ from modules.growth_candidate_schema import (
     is_json_safe_mapping,
     parse_growth_datetime,
 )
-from modules.source_validation import is_complete_verified_news
+from modules.source_validation import (
+    is_complete_owned_blog_article,
+    is_complete_verified_news,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -877,6 +880,145 @@ class Database:
             return None
         return self._decode_json_fields(row, {"metadata_json": "metadata"})
 
+    def import_owned_blog_articles(self, records: List[Dict]) -> Dict[str, int]:
+        """Atomically import one validated snapshot of the official blog feed."""
+        if type(records) is not list or len(records) > 100:
+            raise ValueError("invalid_owned_blog_import")
+
+        now = self._now_iso()
+        prepared = []
+        seen_urls = set()
+        for record in records:
+            if type(record) is not dict or frozenset(record) != frozenset({
+                "slug",
+                "url",
+                "title",
+                "summary",
+                "published_at",
+                "content_hash",
+            }):
+                raise ValueError("invalid_owned_blog_import")
+            if any(type(record[field]) is not str for field in record):
+                raise ValueError("invalid_owned_blog_import")
+            metadata = {
+                "title": record.get("title"),
+                "summary": record.get("summary"),
+                "published_at": record.get("published_at"),
+                "source_name": "FlexDropin Blog",
+                "slug": record.get("slug"),
+                "feed_version": 1,
+                "content_hash": record.get("content_hash"),
+            }
+            source = {
+                "source_type": "owned_blog_article",
+                "text": f"{record.get('title')}\n{record.get('summary')}",
+                "url": record.get("url"),
+                "metadata": metadata,
+                "trust_state": "verified",
+                "verified_by": "flexdropin_editorial_feed",
+            }
+            if (
+                not is_complete_owned_blog_article(source)
+                or source["url"] in seen_urls
+            ):
+                raise ValueError("invalid_owned_blog_import")
+            seen_urls.add(source["url"])
+            prepared.append(source)
+
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing_by_url = {}
+                if prepared:
+                    placeholders = ", ".join("?" for _ in prepared)
+                    rows = conn.execute(
+                        "SELECT * FROM content_sources WHERE url IN ("
+                        + placeholders
+                        + ")",
+                        [source["url"] for source in prepared],
+                    ).fetchall()
+                    existing_by_url = {}
+                    for row in rows:
+                        if row["url"] in existing_by_url:
+                            raise ValueError("owned_blog_source_conflict")
+                        existing_by_url[row["url"]] = row
+
+                for row in existing_by_url.values():
+                    if (
+                        row["source_type"] != "owned_blog_article"
+                        or row["verified_by"] != "flexdropin_editorial_feed"
+                    ):
+                        raise ValueError("owned_blog_source_conflict")
+
+                inserted = 0
+                updated = 0
+                unchanged = 0
+                for source in prepared:
+                    row = existing_by_url.get(source["url"])
+                    metadata_json = json.dumps(
+                        source["metadata"],
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    if row is None:
+                        conn.execute("""
+                            INSERT INTO content_sources (
+                                source_type, text, url, metadata_json,
+                                trust_state, verified_by, verified_at,
+                                expires_at, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                        """, (
+                            "owned_blog_article",
+                            source["text"],
+                            source["url"],
+                            metadata_json,
+                            "verified",
+                            "flexdropin_editorial_feed",
+                            now,
+                            now,
+                            now,
+                        ))
+                        inserted += 1
+                        continue
+
+                    if row["trust_state"] != "verified":
+                        unchanged += 1
+                        continue
+                    try:
+                        current_metadata = json.loads(row["metadata_json"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        current_metadata = None
+                    if (
+                        isinstance(current_metadata, dict)
+                        and current_metadata.get("content_hash")
+                        == source["metadata"]["content_hash"]
+                    ):
+                        unchanged += 1
+                        continue
+                    conn.execute("""
+                        UPDATE content_sources
+                        SET text = ?, metadata_json = ?, verified_at = ?,
+                            expires_at = NULL, updated_at = ?
+                        WHERE id = ?
+                    """, (
+                        source["text"],
+                        metadata_json,
+                        now,
+                        now,
+                        row["id"],
+                    ))
+                    updated += 1
+                return {
+                    "inserted": inserted,
+                    "updated": updated,
+                    "unchanged": unchanged,
+                }
+            except Exception:
+                conn.rollback()
+                raise
+
     def _eligible_content_sources_in_conn(
         self,
         conn,
@@ -919,6 +1061,11 @@ class Database:
             if (
                 source.get("source_type") == "verified_news"
                 and not is_complete_verified_news(source)
+            ):
+                return []
+            if (
+                source.get("source_type") == "owned_blog_article"
+                and not is_complete_owned_blog_article(source)
             ):
                 return []
             eligible.append(source)
@@ -968,6 +1115,11 @@ class Database:
             if (
                 source.get("source_type") == "verified_news"
                 and not is_complete_verified_news(source)
+            ):
+                continue
+            if (
+                source.get("source_type") == "owned_blog_article"
+                and not is_complete_owned_blog_article(source)
             ):
                 continue
             eligible.append(source)
