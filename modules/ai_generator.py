@@ -65,6 +65,8 @@ _CANDIDATE_ANGLE_INSTRUCTIONS = (
     "Build the post around one operator-relevant question supported by the source.",
 )
 
+_GROUNDED_COMPLETION_MAX_TOKENS = 1200
+
 
 def _candidate_angle_instruction(candidate_index):
     if candidate_index is None:
@@ -282,7 +284,7 @@ Reply only with the post text, without quotes or explanation."""
         text = self._complete(
             _agent_prompt(agent_name),
             prompt,
-            max_tokens=800,
+            max_tokens=_GROUNDED_COMPLETION_MAX_TOKENS,
         )
         if not isinstance(text, str) or not text.strip():
             return None
@@ -305,14 +307,30 @@ Reply only with the post text, without quotes or explanation."""
             return None
         grounded_link = _get_link(sources)
         required_link = grounded_link if grounded_link in text else None
-        link_instruction = (
-            _required_link_instruction(required_link, limit, rewrite=True)
-            if required_link
-            else "Do not add a link that was absent from POST."
+        agent_name = _category_agents(category)[0]
+        minimum_target = len(required_link) + 2 if required_link else 1
+        targets = (
+            min(limit, max(220, minimum_target)),
+            min(limit, max(180, minimum_target)),
         )
-        prompt = f"""Rewrite the full post below into one complete English X post of at
-most {limit} characters. Preserve only claims supported by SOURCE_BUNDLE.
-Do not slice, abbreviate into a fragment, or end with an ellipsis.
+
+        for attempt, target in enumerate(targets):
+            link_instruction = (
+                _required_link_instruction(required_link, target, rewrite=True)
+                if required_link
+                else "Do not add a link that was absent from POST."
+            )
+            retry_instruction = (
+                "The previous rewrite was invalid. Produce a substantially "
+                "shorter replacement."
+                if attempt
+                else ""
+            )
+            prompt = f"""Rewrite the full post below into one complete English X post.
+Hard output budget: aim for at most {target} total characters and never exceed
+the absolute {limit}-character limit. Preserve only claims supported by
+SOURCE_BUNDLE. Do not slice, abbreviate into a fragment, or end with an
+ellipsis. {retry_instruction}
 {link_instruction}
 {_category_instruction(category)}
 {_source_instruction(sources, candidate_index=candidate_index)}
@@ -325,29 +343,29 @@ SOURCE_BUNDLE:
 {self._source_bundle(sources)}
 
 Reply only with the complete rewritten post."""
-        agent_name = _category_agents(category)[0]
-        rewritten = self._complete(
-            _agent_prompt(agent_name),
-            prompt,
-            max_tokens=800,
-            temperature=0.4,
-            raise_on_error=True,
-        )
-        if not isinstance(rewritten, str):
-            return None
-        rewritten = rewritten.strip()
-        if len(rewritten) > limit:
-            return None
-        sentence_text = rewritten
-        if required_link:
-            if rewritten.count(required_link) != 1:
-                return None
-            sentence_text = rewritten.replace(required_link, "").strip()
-            if len(sentence_text) > limit - len(required_link) - 1:
-                return None
-        if not self._is_complete_sentence(sentence_text):
-            return None
-        return rewritten
+            rewritten = self._complete(
+                _agent_prompt(agent_name),
+                prompt,
+                max_tokens=_GROUNDED_COMPLETION_MAX_TOKENS,
+                temperature=0.4,
+                raise_on_error=True,
+            )
+            if not isinstance(rewritten, str):
+                continue
+            rewritten = rewritten.strip()
+            if not rewritten or len(rewritten) > limit:
+                continue
+            sentence_text = rewritten
+            if required_link:
+                if rewritten.count(required_link) != 1:
+                    continue
+                sentence_text = rewritten.replace(required_link, "").strip()
+                if len(sentence_text) > limit - len(required_link) - 1:
+                    continue
+            if not self._is_complete_sentence(sentence_text):
+                continue
+            return rewritten
+        return None
 
     def analyze_claims(self, text: str, sources: List[Dict]) -> Optional[Dict]:
         """Return strict structured claim analysis, or ``None`` on ambiguity."""

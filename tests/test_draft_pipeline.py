@@ -407,6 +407,7 @@ def test_real_generator_invalid_rewrite_continues_to_candidate_index_one():
     generator, completions = _real_generator([
         overlength,
         "This invalid rewrite stops midway",
+        "This second invalid rewrite also stops midway",
         "The second grounded candidate survives.",
         "The third grounded candidate is safe but lower.",
     ])
@@ -424,14 +425,16 @@ def test_real_generator_invalid_rewrite_continues_to_candidate_index_one():
     draft = pipeline.create_for_slot(database.next_slot)
 
     assert draft["text"] == "The second grounded candidate survives."
-    assert len(completions.calls) == 4
+    assert len(completions.calls) == 5
     prompts = [
         call["messages"][1]["content"].lower()
         for call in completions.calls
     ]
     assert "sharp sourced contrast" in prompts[0]
     assert "sharp sourced contrast" in prompts[1]
-    assert "overlooked sourced trend or metric" in prompts[2]
+    assert "sharp sourced contrast" in prompts[2]
+    assert "previous rewrite was invalid" in prompts[2]
+    assert "overlooked sourced trend or metric" in prompts[3]
     assert database.evaluations[-1]["outcome"] == "pending_approval"
 
 

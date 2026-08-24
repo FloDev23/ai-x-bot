@@ -54,6 +54,35 @@ def test_rewrite_is_used_instead_of_slicing(fake_ai):
     assert all(not rewritten.endswith(marker) for marker in ("…", "..."))
 
 
+def test_rewrite_retries_once_with_a_stricter_budget(fake_ai):
+    calls = []
+    responses = [
+        "This rewrite is still too long. " * 20,
+        "One concise complete post.",
+    ]
+
+    def complete(_system_prompt, user_prompt, **kwargs):
+        calls.append({
+            "prompt": " ".join(user_prompt.split()),
+            "max_tokens": kwargs.get("max_tokens"),
+        })
+        return responses.pop(0)
+
+    fake_ai._complete = complete
+
+    rewritten = fake_ai.rewrite_to_limit(
+        "An overlong source-grounded post. " * 20,
+        [],
+        limit=280,
+        category="gym_strategy",
+    )
+
+    assert rewritten == "One concise complete post."
+    assert len(calls) == 2
+    assert [call["max_tokens"] for call in calls] == [1200, 1200]
+    assert "previous rewrite was invalid" in calls[1]["prompt"].lower()
+
+
 def test_rewrite_fails_closed_for_missing_long_or_incomplete_output(fake_ai):
     long_output = "Still far too long. " * 20
     for output in (None, long_output, "This thought stops midway", "An ellipsis…", "Three dots..."):
@@ -148,7 +177,7 @@ def test_grounded_generation_targets_the_editorial_score_axes(fake_ai):
     )
 
     assert result["text"] == "A sharp, grounded post."
-    assert captured["max_tokens"] == 800
+    assert captured["max_tokens"] == 1200
     assert "fitness business expert" in captured["system"]
     normalized_prompt = " ".join(captured["user"].split())
     assert "Do not mention FlexDropin or describe its features" in normalized_prompt
@@ -454,15 +483,15 @@ def test_owned_blog_generation_and_rewrite_forbid_unsourced_product_claims(
         "Ask which class rule removes the most booking friction. " + article_url
     )
     assert len(prompts) == 2
-    assert prompts[0]["max_tokens"] == 800
-    assert prompts[1]["max_tokens"] == 800
+    assert prompts[0]["max_tokens"] == 1200
+    assert prompts[1]["max_tokens"] == 1200
     assert (
         "include exactly https://flexdropin.com/blog/"
         "gym-drop-ins-test-demand once"
     ) in prompts[0]["user"].lower()
     assert "keep all other copy at most 227 characters" in prompts[0]["user"].lower()
     assert "preserve exactly https://flexdropin.com/blog/" in prompts[1]["user"].lower()
-    assert "keep all other copy at most 227 characters" in prompts[1]["user"].lower()
+    assert "hard output budget" in prompts[1]["user"].lower()
     for prompt in prompts:
         normalized = prompt["user"].lower()
         assert "owned_blog_article" in normalized
