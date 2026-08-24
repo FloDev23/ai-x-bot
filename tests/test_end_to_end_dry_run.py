@@ -237,7 +237,7 @@ def test_bilingual_queue_plans_and_simulates_two_us_posts_restart_safely(tmp_pat
         callback_update(3301, f"draft:approve:{first['id']}"),
     ) == "processed"
 
-    for index in range(6):
+    for index in range(13):
         draft_id = agent.db.create_post_draft(
             f"Approved reserve note {index}",
             "proof" if index % 2 else "gym_strategy",
@@ -262,7 +262,7 @@ def test_bilingual_queue_plans_and_simulates_two_us_posts_restart_safely(tmp_pat
         )
 
     counts = agent.db.get_queue_counts(NOW.date(), "Europe/Rome")
-    assert counts["approved_or_planned"] == 7
+    assert counts["approved_or_planned"] == 14
     plans = agent.publication_planning_cycle(now=NOW)
     assert len(plans) == 2
     assert all(plan["status"] == "planned" for plan in plans)

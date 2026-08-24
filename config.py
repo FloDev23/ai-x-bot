@@ -113,17 +113,27 @@ def _adaptive_configuration():
     if posts_per_day != 2:
         raise ValueError("POSTS_PER_DAY must be exactly 2 for this release")
 
-    approved_queue_target = _strict_positive_int_env(
-        "APPROVED_QUEUE_TARGET", 7,
-    )
-    if approved_queue_target < posts_per_day:
-        raise ValueError("APPROVED_QUEUE_TARGET must cover POSTS_PER_DAY")
+    third_post_days = _strict_positive_int_env("THIRD_POST_DAYS_PER_WEEK", 3)
+    if third_post_days != 3:
+        raise ValueError(
+            "THIRD_POST_DAYS_PER_WEEK must be exactly 3 for this release"
+        )
 
-    pending_review_limit = _strict_positive_int_env("PENDING_REVIEW_LIMIT", 3)
+    approved_queue_target = _strict_positive_int_env(
+        "APPROVED_QUEUE_TARGET", 14,
+    )
+    if approved_queue_target < 14:
+        raise ValueError("APPROVED_QUEUE_TARGET must be at least 14")
+
+    pending_review_limit = _strict_positive_int_env("PENDING_REVIEW_LIMIT", 5)
     if pending_review_limit > approved_queue_target:
         raise ValueError("PENDING_REVIEW_LIMIT cannot exceed APPROVED_QUEUE_TARGET")
 
-    generation_cap = _strict_positive_int_env("DRAFT_GENERATION_DAILY_CAP", 4)
+    generation_cap = _strict_positive_int_env("DRAFT_GENERATION_DAILY_CAP", 5)
+    if generation_cap < pending_review_limit:
+        raise ValueError(
+            "DRAFT_GENERATION_DAILY_CAP must cover PENDING_REVIEW_LIMIT"
+        )
     audience_timezone = os.getenv("AUDIENCE_TIMEZONE", "America/New_York")
     try:
         ZoneInfo(audience_timezone)
@@ -131,18 +141,26 @@ def _adaptive_configuration():
         raise ValueError("AUDIENCE_TIMEZONE must be a valid IANA timezone") from error
 
     morning_window, morning_start, morning_end = _strict_time_window_env(
-        "MORNING_WINDOW", "08:30-11:30",
+        "MORNING_WINDOW", "08:30-10:30",
+    )
+    midday_window, midday_start, midday_end = _strict_time_window_env(
+        "MIDDAY_WINDOW", "13:00-15:30",
     )
     evening_window, evening_start, evening_end = _strict_time_window_env(
-        "EVENING_WINDOW", "16:30-20:30",
+        "EVENING_WINDOW", "18:00-20:30",
     )
-    if morning_end > evening_start:
-        raise ValueError("MORNING_WINDOW must end before EVENING_WINDOW")
+    if morning_end > midday_start:
+        raise ValueError("MORNING_WINDOW must end before MIDDAY_WINDOW")
+    if midday_end > evening_start:
+        raise ValueError("EVENING_WINDOW must start after MIDDAY_WINDOW")
 
-    min_post_gap_hours = _strict_positive_int_env("MIN_POST_GAP_HOURS", 6)
-    if evening_end - morning_start < min_post_gap_hours * 60:
+    min_post_gap_hours = _strict_positive_int_env("MIN_POST_GAP_HOURS", 4)
+    gap_minutes = min_post_gap_hours * 60
+    feasible_midday_start = max(midday_start, morning_start + gap_minutes)
+    feasible_midday_end = min(midday_end, evening_end - gap_minutes)
+    if feasible_midday_start > feasible_midday_end:
         raise ValueError(
-            "MIN_POST_GAP_HOURS cannot fit inside MORNING_WINDOW and EVENING_WINDOW"
+            "MIN_POST_GAP_HOURS cannot fit across all publication windows"
         )
 
     timing_min_posts = _strict_positive_int_env("ADAPTIVE_TIMING_MIN_POSTS", 30)
@@ -154,35 +172,51 @@ def _adaptive_configuration():
             "ADAPTIVE_WEEKDAY_MIN_POSTS cannot be below ADAPTIVE_TIMING_MIN_POSTS"
         )
 
+    third_timing_min_posts = _strict_positive_int_env(
+        "THIRD_POST_TIMING_MIN_POSTS", 30,
+    )
+    if third_timing_min_posts < timing_min_posts:
+        raise ValueError(
+            "THIRD_POST_TIMING_MIN_POSTS cannot be below ADAPTIVE_TIMING_MIN_POSTS"
+        )
+
     grace_minutes = _strict_positive_int_env(
         "PUBLICATION_PLAN_GRACE_MINUTES", 90,
     )
     return {
         "POSTS_PER_DAY": posts_per_day,
+        "THIRD_POST_DAYS_PER_WEEK": third_post_days,
         "APPROVED_QUEUE_TARGET": approved_queue_target,
         "PENDING_REVIEW_LIMIT": pending_review_limit,
         "DRAFT_GENERATION_DAILY_CAP": generation_cap,
         "AUDIENCE_TIMEZONE": audience_timezone,
         "MORNING_WINDOW": morning_window,
+        "MIDDAY_WINDOW": midday_window,
         "EVENING_WINDOW": evening_window,
         "MIN_POST_GAP_HOURS": min_post_gap_hours,
         "ADAPTIVE_TIMING_MIN_POSTS": timing_min_posts,
         "ADAPTIVE_WEEKDAY_MIN_POSTS": weekday_min_posts,
+        "THIRD_POST_TIMING_MIN_POSTS": third_timing_min_posts,
         "PUBLICATION_PLAN_GRACE_MINUTES": grace_minutes,
     }
 
 
 _ADAPTIVE_CONFIGURATION = _adaptive_configuration()
 POSTS_PER_DAY = _ADAPTIVE_CONFIGURATION["POSTS_PER_DAY"]
+THIRD_POST_DAYS_PER_WEEK = _ADAPTIVE_CONFIGURATION["THIRD_POST_DAYS_PER_WEEK"]
 APPROVED_QUEUE_TARGET = _ADAPTIVE_CONFIGURATION["APPROVED_QUEUE_TARGET"]
 PENDING_REVIEW_LIMIT = _ADAPTIVE_CONFIGURATION["PENDING_REVIEW_LIMIT"]
 DRAFT_GENERATION_DAILY_CAP = _ADAPTIVE_CONFIGURATION["DRAFT_GENERATION_DAILY_CAP"]
 AUDIENCE_TIMEZONE = _ADAPTIVE_CONFIGURATION["AUDIENCE_TIMEZONE"]
 MORNING_WINDOW = _ADAPTIVE_CONFIGURATION["MORNING_WINDOW"]
+MIDDAY_WINDOW = _ADAPTIVE_CONFIGURATION["MIDDAY_WINDOW"]
 EVENING_WINDOW = _ADAPTIVE_CONFIGURATION["EVENING_WINDOW"]
 MIN_POST_GAP_HOURS = _ADAPTIVE_CONFIGURATION["MIN_POST_GAP_HOURS"]
 ADAPTIVE_TIMING_MIN_POSTS = _ADAPTIVE_CONFIGURATION["ADAPTIVE_TIMING_MIN_POSTS"]
 ADAPTIVE_WEEKDAY_MIN_POSTS = _ADAPTIVE_CONFIGURATION["ADAPTIVE_WEEKDAY_MIN_POSTS"]
+THIRD_POST_TIMING_MIN_POSTS = _ADAPTIVE_CONFIGURATION[
+    "THIRD_POST_TIMING_MIN_POSTS"
+]
 PUBLICATION_PLAN_GRACE_MINUTES = _ADAPTIVE_CONFIGURATION[
     "PUBLICATION_PLAN_GRACE_MINUTES"
 ]

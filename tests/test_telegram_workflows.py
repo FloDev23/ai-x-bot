@@ -1290,7 +1290,7 @@ def test_status_exposes_queue_and_us_publication_targets(tmp_path):
     assert controller.process_update(message_update(315, "/status")) == "processed"
 
     rendered = telegram.messages[-1][1]
-    assert "coda approvata target: 7" in rendered
+    assert "coda approvata target: 14" in rendered
     assert "pubblicazioni target: 2 al giorno" in rendered
     assert "pubblico: Stati Uniti (America/New_York)" in rendered
 
