@@ -41,6 +41,7 @@ class Publisher:
         clock=None,
         grace_seconds=300,
         timezone_name="Europe/Rome",
+        plan_grace_minutes=90,
     ):
         self.db = db
         self.x_client = x_client
@@ -48,6 +49,12 @@ class Publisher:
         self.timezone = ZoneInfo(timezone_name)
         self.clock = clock or (lambda: datetime.now(self.timezone))
         self.grace_seconds = grace_seconds
+        if (
+            type(plan_grace_minutes) is not int
+            or not 1 <= plan_grace_minutes <= 1440
+        ):
+            raise ValueError("plan_grace_minutes must be between 1 and 1440")
+        self.plan_grace_minutes = plan_grace_minutes
 
     def publish(self, draft_id, now=None, expected_revision=None):
         draft = self.db.get_post_draft(draft_id)
@@ -97,6 +104,79 @@ class Publisher:
             return PublishResult("already_claimed")
         claimed_draft, claim = claimed
         return self._write_claimed_draft(claimed_draft, claim)
+
+    def publish_plan(self, plan_id, now=None):
+        if type(plan_id) is not int or plan_id <= 0:
+            return PublishResult("not_found")
+        try:
+            plan = self.db.get_publication_plan(plan_id)
+        except Exception as error:
+            logger.error(
+                "plan_read_failed plan_id=%s error_type=%s",
+                plan_id,
+                type(error).__name__,
+            )
+            return PublishResult("publication_failed")
+        if not plan:
+            return PublishResult("not_found")
+        if plan.get("status") == "published" and is_valid_x_tweet_id(
+            plan.get("published_tweet_id")
+        ):
+            return PublishResult("already_published", plan["published_tweet_id"])
+        if plan.get("status") != "planned":
+            return PublishResult("not_publishable")
+        try:
+            current = self._as_aware(now if now is not None else self.clock())
+            scheduled = self._as_aware(datetime.fromisoformat(plan["scheduled_for"]))
+        except (TypeError, ValueError):
+            return PublishResult("not_publishable")
+        if current < scheduled:
+            return PublishResult("not_due")
+        if current > scheduled + timedelta(minutes=self.plan_grace_minutes):
+            try:
+                self.db.skip_expired_publication_plan(
+                    plan_id,
+                    plan.get("revision"),
+                    current,
+                    self.plan_grace_minutes,
+                )
+            except Exception:
+                pass
+            return PublishResult("expired")
+        if self._publication_is_paused():
+            return PublishResult("paused")
+        if self.dry_run:
+            try:
+                simulated = self.db.mark_publication_plan_simulated(
+                    plan_id,
+                    plan.get("revision"),
+                )
+            except Exception:
+                simulated = False
+            return PublishResult("dry_run" if simulated else "already_claimed")
+        try:
+            claimed = self.db.claim_due_publication_plan(
+                plan_id,
+                plan.get("revision"),
+                current,
+                self.plan_grace_minutes,
+            )
+        except Exception as error:
+            logger.error(
+                "plan_claim_failed plan_id=%s error_type=%s",
+                plan_id,
+                type(error).__name__,
+            )
+            return PublishResult("publication_failed")
+        if not claimed:
+            return PublishResult("already_claimed")
+        claimed_draft, draft_claim, plan_claim = claimed
+        return self._write_claimed_plan(
+            claimed_draft,
+            draft_claim,
+            plan_claim,
+            current,
+        )
 
     def _as_aware(self, value):
         if isinstance(value, str):
@@ -182,6 +262,182 @@ class Publisher:
         if media_exit_error is not None and write_result.status == "published":
             return self._unknown_outcome(claim, media_exit_error)
         return write_result
+
+    def _write_claimed_plan(
+        self,
+        draft,
+        draft_claim,
+        plan_claim,
+        current,
+    ):
+        media_id = draft.get("media_id")
+        if media_id is None:
+            outcome = self._transport_to_x(
+                draft, None, "image", None,
+            )
+            return self._persist_plan_transport_outcome(
+                draft_claim,
+                plan_claim,
+                outcome,
+                None,
+                current,
+            )
+        try:
+            media = self.db.get_media_by_id(media_id)
+        except Exception as error:
+            return self._planned_definite_failure(
+                draft_claim, plan_claim, error, current,
+            )
+        if (
+            not media
+            or media.get("id") != media_id
+            or media.get("lifecycle_state") != "reserved"
+            or media.get("reserved_by_draft_id") != draft["id"]
+            or media.get("file_deleted")
+        ):
+            return self._planned_definite_failure(
+                draft_claim,
+                plan_claim,
+                ValueError("invalid_media_reservation"),
+                current,
+            )
+        outcome = None
+        local_failure = None
+        exit_failure = None
+        try:
+            with open_verified_media(media) as media_file:
+                try:
+                    valid = self.db.validate_publication_plan_media(
+                        draft_claim,
+                        plan_claim,
+                        media,
+                    )
+                except Exception as error:
+                    local_failure = error
+                else:
+                    if not valid:
+                        local_failure = ValueError(
+                            "planned_media_changed_under_lease"
+                        )
+                if local_failure is None:
+                    outcome = self._transport_to_x(
+                        draft,
+                        media_file,
+                        media.get("media_type") or "image",
+                        media.get("filename"),
+                    )
+        except (OSError, PermissionError, RuntimeError, ValueError) as error:
+            exit_failure = error
+        if exit_failure is not None and outcome is not None:
+            return self._planned_unknown(
+                draft_claim, plan_claim, exit_failure,
+            )
+        if outcome is None:
+            return self._planned_definite_failure(
+                draft_claim,
+                plan_claim,
+                exit_failure
+                or local_failure
+                or RuntimeError("planned_media_transport_unavailable"),
+                current,
+            )
+        return self._persist_plan_transport_outcome(
+            draft_claim,
+            plan_claim,
+            outcome,
+            media,
+            current,
+        )
+
+    def _persist_plan_transport_outcome(
+        self,
+        draft_claim,
+        plan_claim,
+        outcome,
+        expected_media,
+        current,
+    ):
+        if outcome.kind == "paused":
+            try:
+                self.db.restore_publication_plan_claim(
+                    draft_claim,
+                    plan_claim,
+                    current,
+                    self.plan_grace_minutes,
+                )
+            except Exception:
+                pass
+            return PublishResult("paused")
+        if outcome.kind == "rejected":
+            return self._planned_definite_failure(
+                draft_claim, plan_claim, outcome.error, current,
+            )
+        if outcome.kind == "unknown":
+            return self._planned_unknown(
+                draft_claim, plan_claim, outcome.error,
+            )
+        if outcome.kind != "confirmed" or not is_valid_x_tweet_id(
+            outcome.tweet_id
+        ):
+            return self._planned_unknown(
+                draft_claim,
+                plan_claim,
+                ValueError("invalid_planned_x_outcome"),
+            )
+        try:
+            finalized = self.db.finalize_publication_plan(
+                draft_claim,
+                plan_claim,
+                outcome.tweet_id,
+                expected_media,
+            )
+        except Exception as error:
+            return self._planned_unknown(draft_claim, plan_claim, error)
+        if not finalized:
+            return self._planned_unknown(
+                draft_claim,
+                plan_claim,
+                RuntimeError("planned_publication_finalization_conflict"),
+            )
+        return PublishResult("published", outcome.tweet_id)
+
+    def _planned_definite_failure(
+        self,
+        draft_claim,
+        plan_claim,
+        error,
+        current,
+    ):
+        try:
+            self.db.restore_publication_plan_claim(
+                draft_claim,
+                plan_claim,
+                current,
+                self.plan_grace_minutes,
+                safe_error=type(error).__name__,
+            )
+        except Exception as persistence_error:
+            logger.error(
+                "planned_failure_persistence_failed plan_id=%s error_type=%s",
+                plan_claim.plan_id,
+                type(persistence_error).__name__,
+            )
+        return PublishResult("publication_failed")
+
+    def _planned_unknown(self, draft_claim, plan_claim, error):
+        try:
+            self.db.mark_publication_plan_unknown(
+                draft_claim,
+                plan_claim,
+                type(error).__name__,
+            )
+        except Exception as persistence_error:
+            logger.error(
+                "planned_unknown_persistence_failed plan_id=%s error_type=%s",
+                plan_claim.plan_id,
+                type(persistence_error).__name__,
+            )
+        return PublishResult("publication_unknown")
 
     def _write_to_x(
         self,

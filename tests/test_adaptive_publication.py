@@ -1,11 +1,14 @@
 import json
 import threading
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from modules.adaptive_timing import AdaptiveTimingPolicy, TimingSample
 from modules.analytics import PerformanceAnalyzer
 from modules.database import Database
 from modules.media_processor import MediaProcessor
+from modules.publisher import Publisher
+from modules.twitter_client import XPublicationRejected
 
 
 NOW = datetime(2026, 8, 24, 10, 0, tzinfo=timezone.utc)
@@ -156,12 +159,6 @@ def _approved_queue_draft(
         "evergreen_idea",
         f"Grounded source for {category}",
     )
-    if expiry is not None:
-        with db._conn() as conn:
-            conn.execute(
-                "UPDATE content_sources SET expires_at = ? WHERE id = ?",
-                (expiry.isoformat(), source_id),
-            )
     draft_id = db.create_post_draft(
         text,
         category,
@@ -187,6 +184,12 @@ def _approved_queue_draft(
         "floriano",
         NOW.isoformat(),
     )
+    if expiry is not None:
+        with db._conn() as conn:
+            conn.execute(
+                "UPDATE content_sources SET expires_at = ? WHERE id = ?",
+                (expiry.isoformat(), source_id),
+            )
     return draft_id
 
 
@@ -611,3 +614,371 @@ def test_plan_reason_decoder_rejects_sensitive_or_malformed_values(tmp_path):
     assert db.list_publication_positions(
         NOW.astimezone(_planner(db).audience_zone).date()
     ) == [plans[1]]
+
+
+def _planned_publication_fixture(
+    tmp_path,
+    *,
+    text="ENGLISH_PLAN_SENTINEL",
+    media_id=None,
+):
+    db = Database(str(tmp_path / "planned-publication.db"))
+    draft_id = _approved_queue_draft(
+        db,
+        text=text,
+        category="gym_strategy",
+        score=91,
+        media_id=media_id,
+    )
+    db.set_state("paused", "false")
+    plans = _planner(db, dry_run=False).reconcile(NOW)
+    plan = next(plan for plan in plans if plan.get("draft_id") == draft_id)
+    return db, draft_id, plan
+
+
+def test_plan_claim_transitions_plan_and_exact_draft_in_one_transaction(tmp_path):
+    db, draft_id, plan = _planned_publication_fixture(tmp_path)
+    due = datetime.fromisoformat(plan["scheduled_for"])
+
+    claimed = db.claim_due_publication_plan(
+        plan["id"], plan["revision"], due, grace_minutes=90,
+    )
+
+    assert claimed is not None
+    claimed_draft, draft_claim, plan_claim = claimed
+    assert claimed_draft["status"] == "publishing"
+    assert draft_claim.draft_id == draft_id
+    assert plan_claim.plan_id == plan["id"]
+    assert plan_claim.draft_id == draft_id
+    assert plan_claim.draft_revision == draft_claim.revision
+    stored_plan = db.get_publication_plan(plan["id"])
+    stored_draft = db.get_post_draft(draft_id)
+    assert stored_plan["status"] == "publishing"
+    assert stored_draft["status"] == "publishing"
+    assert stored_plan["claim_token"] == plan_claim.claim_token
+    assert db.claim_due_publication_plan(
+        plan["id"], plan["revision"], due, grace_minutes=90,
+    ) is None
+
+
+def test_plan_claim_rejects_early_late_pause_and_stale_revision(tmp_path):
+    db, draft_id, plan = _planned_publication_fixture(tmp_path)
+    due = datetime.fromisoformat(plan["scheduled_for"])
+
+    assert db.claim_due_publication_plan(
+        plan["id"], plan["revision"], due - timedelta(microseconds=1), 90,
+    ) is None
+    assert db.claim_due_publication_plan(
+        plan["id"], plan["revision"] + 1, due, 90,
+    ) is None
+    db.set_state("paused", "true")
+    assert db.claim_due_publication_plan(
+        plan["id"], plan["revision"], due, 90,
+    ) is None
+    db.set_state("paused", "false")
+    assert db.claim_due_publication_plan(
+        plan["id"], plan["revision"], due + timedelta(minutes=91), 90,
+    ) is None
+    assert db.get_publication_plan(plan["id"])["status"] == "planned"
+    assert db.get_post_draft(draft_id)["status"] == "approved"
+
+
+class _PlanXClient:
+    def __init__(self, *, error=None, tweet_id="123456"):
+        self.error = error
+        self.tweet_id = tweet_id
+        self.calls = []
+        self.media_bytes = []
+        self._lock = threading.Lock()
+
+    def post_tweet(self, text, media_path=None, *_args, **_kwargs):
+        payload = media_path.read() if media_path is not None else None
+        with self._lock:
+            self.calls.append({"text": text})
+            self.media_bytes.append(payload)
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(data={"id": self.tweet_id})
+
+
+def test_publish_plan_sends_only_english_and_finalizes_plan_atomically(tmp_path):
+    db, draft_id, plan = _planned_publication_fixture(tmp_path)
+    due = datetime.fromisoformat(plan["scheduled_for"])
+    x_client = _PlanXClient()
+
+    result = Publisher(
+        db,
+        x_client,
+        dry_run=False,
+        plan_grace_minutes=90,
+    ).publish_plan(plan["id"], now=due)
+
+    assert result.status == "published"
+    assert result.tweet_id == "123456"
+    assert x_client.calls == [{"text": "ENGLISH_PLAN_SENTINEL"}]
+    assert "ITALIAN" not in repr(x_client.calls)
+    assert db.get_publication_plan(plan["id"])["status"] == "published"
+    stored = db.get_post_draft(draft_id)
+    assert stored["status"] == "published"
+    assert stored["published_tweet_id"] == "123456"
+    with db._conn() as conn:
+        posted = conn.execute(
+            "SELECT text FROM posted_tweets WHERE tweet_id = '123456'"
+        ).fetchone()[0]
+    assert posted == "ENGLISH_PLAN_SENTINEL"
+
+
+def test_publish_plan_timeout_is_unknown_and_never_retried(tmp_path):
+    db, draft_id, plan = _planned_publication_fixture(tmp_path)
+    due = datetime.fromisoformat(plan["scheduled_for"])
+    x_client = _PlanXClient(error=TimeoutError("raw provider timeout"))
+    publisher = Publisher(
+        db,
+        x_client,
+        dry_run=False,
+        plan_grace_minutes=90,
+    )
+
+    first = publisher.publish_plan(plan["id"], now=due)
+    second = publisher.publish_plan(plan["id"], now=due + timedelta(minutes=1))
+
+    assert first.status == "publication_unknown"
+    assert second.status == "not_publishable"
+    assert len(x_client.calls) == 1
+    assert db.get_publication_plan(plan["id"])["status"] == "unknown"
+    assert db.get_post_draft(draft_id)["status"] == "publication_unknown"
+
+
+def test_publish_plan_dry_run_marks_plan_simulated_without_x(tmp_path):
+    db, draft_id, plan = _planned_publication_fixture(tmp_path)
+    due = datetime.fromisoformat(plan["scheduled_for"])
+    x_client = _PlanXClient()
+
+    result = Publisher(
+        db,
+        x_client,
+        dry_run=True,
+        plan_grace_minutes=90,
+    ).publish_plan(plan["id"], now=due)
+
+    assert result.status == "dry_run"
+    assert x_client.calls == []
+    assert db.get_publication_plan(plan["id"])["status"] == "simulated"
+    assert db.get_post_draft(draft_id)["status"] == "approved"
+
+
+def test_publish_plan_definite_rejection_restores_same_plan_within_grace(tmp_path):
+    db, draft_id, plan = _planned_publication_fixture(tmp_path)
+    due = datetime.fromisoformat(plan["scheduled_for"])
+    x_client = _PlanXClient(error=XPublicationRejected("raw provider body"))
+
+    result = Publisher(
+        db, x_client, dry_run=False, plan_grace_minutes=90,
+    ).publish_plan(plan["id"], now=due)
+
+    assert result.status == "publication_failed"
+    stored_plan = db.get_publication_plan(plan["id"])
+    stored_draft = db.get_post_draft(draft_id)
+    assert stored_plan["status"] == "planned"
+    assert stored_plan["claim_token"] is None
+    assert stored_plan["draft_revision"] == stored_draft["revision"]
+    assert stored_draft["status"] == "approved"
+    assert "provider" not in repr(stored_draft).lower()
+
+
+def test_publish_plan_db_failure_after_x_rolls_back_and_becomes_unknown(tmp_path):
+    db, draft_id, plan = _planned_publication_fixture(tmp_path)
+    due = datetime.fromisoformat(plan["scheduled_for"])
+    with db._conn() as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_planned_publish
+            BEFORE UPDATE OF status ON publication_plans
+            WHEN NEW.status = 'published'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced plan finalization failure');
+            END
+        """)
+    x_client = _PlanXClient(tweet_id="987654")
+
+    result = Publisher(
+        db, x_client, dry_run=False, plan_grace_minutes=90,
+    ).publish_plan(plan["id"], now=due)
+
+    assert result.status == "publication_unknown"
+    assert len(x_client.calls) == 1
+    assert db.get_publication_plan(plan["id"])["status"] == "unknown"
+    assert db.get_post_draft(draft_id)["status"] == "publication_unknown"
+    with db._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM posted_tweets WHERE tweet_id = '987654'"
+        ).fetchone()[0] == 0
+
+
+class _BarrierPlanReadDatabase(Database):
+    barrier = None
+
+    def __init__(self, path):
+        super().__init__(path)
+        self._waited = False
+
+    def get_publication_plan(self, plan_id):
+        plan = super().get_publication_plan(plan_id)
+        if plan and plan["status"] == "planned" and not self._waited:
+            self._waited = True
+            self.barrier.wait(timeout=5)
+        return plan
+
+
+def test_two_publishers_claim_one_plan_and_call_x_once(tmp_path):
+    path = str(tmp_path / "plan-publisher-race.db")
+    setup, draft_id, plan = _planned_publication_fixture(tmp_path)
+    setup_path = setup.db_path
+    assert setup_path != path
+    path = setup_path
+    due = datetime.fromisoformat(plan["scheduled_for"])
+    _BarrierPlanReadDatabase.barrier = threading.Barrier(2)
+    x_client = _PlanXClient(tweet_id="234567")
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            results.append(Publisher(
+                _BarrierPlanReadDatabase(path),
+                x_client,
+                dry_run=False,
+                plan_grace_minutes=90,
+            ).publish_plan(plan["id"], now=due))
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    assert not any(thread.is_alive() for thread in threads)
+    assert sorted(result.status for result in results) == [
+        "already_claimed", "published",
+    ]
+    assert len(x_client.calls) == 1
+    assert Database(path).get_post_draft(draft_id)["status"] == "published"
+
+
+def test_publish_plan_uses_verified_media_stream_and_consumes_reservation(tmp_path):
+    db = Database(str(tmp_path / "plan-media.db"))
+    media_root = tmp_path / "plan-media-root"
+    media_root.mkdir(mode=0o700)
+    staged = media_root / "staged.jpg"
+    content = b"\xff\xd8\xff\xe0planned-media"
+    staged.write_bytes(content)
+    media = MediaProcessor(db).process_new_file(
+        str(staged),
+        "planned.jpg",
+        "image/jpeg",
+        len(content),
+        "Planned publication preview",
+    )
+    draft_id = _approved_queue_draft(
+        db,
+        text="ENGLISH_MEDIA_PLAN",
+        category="proof",
+        score=91,
+        media_id=media["id"],
+    )
+    db.set_state("paused", "false")
+    plan = next(
+        row for row in _planner(db, dry_run=False).reconcile(NOW)
+        if row.get("draft_id") == draft_id
+    )
+    due = datetime.fromisoformat(plan["scheduled_for"])
+    x_client = _PlanXClient(tweet_id="345678")
+
+    result = Publisher(
+        db, x_client, dry_run=False, plan_grace_minutes=90,
+    ).publish_plan(plan["id"], now=due)
+
+    assert result.status == "published"
+    assert x_client.media_bytes == [content]
+    stored_media = db.get_media_by_id(media["id"])
+    assert stored_media["lifecycle_state"] == "used"
+    assert stored_media["used_in_tweet_id"] == "345678"
+
+
+class _RecordingPlanPublisher:
+    def __init__(self, statuses):
+        self.statuses = list(statuses)
+        self.calls = []
+
+    def publish_plan(self, plan_id, now=None):
+        from modules.publisher import PublishResult
+
+        self.calls.append((plan_id, now))
+        status = self.statuses.pop(0)
+        return PublishResult(status, "456789" if status == "published" else "")
+
+
+def test_publication_planner_publishes_two_due_positions_in_order(tmp_path):
+    db = Database(str(tmp_path / "publish-due.db"))
+    for index, category in enumerate(("gym_strategy", "proof")):
+        _approved_queue_draft(
+            db,
+            text=f"Due publication {index}",
+            category=category,
+            score=90 - index,
+        )
+    publisher = _RecordingPlanPublisher(["published", "published"])
+    planner = _planner(db, dry_run=False)
+    plans = planner.reconcile(NOW)
+    due = max(datetime.fromisoformat(plan["scheduled_for"]) for plan in plans)
+
+    outcomes = planner.publish_due(due, publisher=publisher)
+
+    assert [outcome["status"] for outcome in outcomes] == [
+        "published", "published",
+    ]
+    assert [call[0] for call in publisher.calls] == [
+        plan["id"] for plan in sorted(plans, key=lambda row: row["position"])
+    ]
+    assert all(call[1] == due for call in publisher.calls)
+
+
+def test_publication_planner_stops_cycle_after_ambiguous_outcome(tmp_path):
+    db = Database(str(tmp_path / "publish-stop.db"))
+    for index, category in enumerate(("gym_strategy", "proof")):
+        _approved_queue_draft(
+            db,
+            text=f"Ambiguous publication {index}",
+            category=category,
+            score=90 - index,
+        )
+    publisher = _RecordingPlanPublisher(["publication_unknown", "published"])
+    planner = _planner(db, dry_run=False)
+    plans = planner.reconcile(NOW)
+    due = max(datetime.fromisoformat(plan["scheduled_for"]) for plan in plans)
+
+    outcomes = planner.publish_due(due, publisher=publisher)
+
+    assert [outcome["status"] for outcome in outcomes] == ["publication_unknown"]
+    assert len(publisher.calls) == 1
+
+
+def test_live_publication_planner_without_publisher_fails_closed(tmp_path):
+    db = Database(str(tmp_path / "publish-no-boundary.db"))
+    _approved_queue_draft(
+        db,
+        text="No live publisher boundary",
+        category="gym_strategy",
+        score=90,
+    )
+    planner = _planner(db, dry_run=False)
+    plans = planner.reconcile(NOW)
+    due = max(datetime.fromisoformat(plan["scheduled_for"]) for plan in plans)
+
+    assert planner.publish_due(due) == []
+    assert all(
+        plan["status"] == "planned"
+        for plan in db.list_publication_positions(statuses=["planned"])
+    )

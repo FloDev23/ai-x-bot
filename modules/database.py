@@ -2752,6 +2752,419 @@ class Database:
             if self._exact_positive_identifier(row["draft_id"])
         }
 
+    def get_publication_plan(self, plan_id: int) -> Optional[Dict]:
+        if not self._exact_positive_identifier(plan_id):
+            return None
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM publication_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+        return self._decode_publication_plan(row)
+
+    @staticmethod
+    def _publication_plan_matches_claim(
+        row: Optional[sqlite3.Row],
+        claim: PublicationPlanClaim,
+    ) -> bool:
+        return (
+            row is not None
+            and isinstance(claim, PublicationPlanClaim)
+            and row["id"] == claim.plan_id
+            and row["status"] == "publishing"
+            and row["revision"] == claim.plan_revision
+            and row["draft_id"] == claim.draft_id
+            and row["draft_revision"] == claim.draft_revision
+            and row["scheduled_for"] == claim.scheduled_for
+            and row["claim_token"] == claim.claim_token
+            and row["published_tweet_id"] is None
+        )
+
+    def claim_due_publication_plan(
+        self,
+        plan_id: int,
+        expected_plan_revision: int,
+        now: datetime,
+        grace_minutes: int,
+    ) -> Optional[Tuple[Dict, PostDraftPublicationClaim, PublicationPlanClaim]]:
+        current = self._strict_aware_datetime(now)
+        if (
+            not self._exact_positive_identifier(plan_id)
+            or not self._exact_nonnegative_revision(expected_plan_revision)
+            or current is None
+            or type(grace_minutes) is not int
+            or not 1 <= grace_minutes <= 1440
+        ):
+            return None
+        initial = self.get_publication_plan(plan_id)
+        if (
+            initial is None
+            or initial.get("status") != "planned"
+            or not self._exact_positive_identifier(initial.get("draft_id"))
+        ):
+            return None
+        draft_id = initial["draft_id"]
+        with self._post_draft_mutation_lock(draft_id) as conn:
+            plan = conn.execute(
+                "SELECT * FROM publication_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+            draft = self._queue_draft_row_in_conn(conn, draft_id)
+            scheduled = self._strict_aware_datetime(
+                plan["scheduled_for"] if plan is not None else None
+            )
+            pause = conn.execute(
+                "SELECT value FROM bot_state WHERE key = 'paused'"
+            ).fetchone()
+            if (
+                plan is None
+                or plan["status"] != "planned"
+                or plan["revision"] != expected_plan_revision
+                or plan["draft_id"] != draft_id
+                or scheduled is None
+                or current < scheduled
+                or current > scheduled + timedelta(minutes=grace_minutes)
+                or pause is None
+                or pause["value"] != "false"
+                or draft is None
+                or draft["status"] != "approved"
+                or draft["revision"] != plan["draft_revision"]
+                or draft["translation_status"] != "ready"
+                or type(draft["translation_it"]) is not str
+                or not draft["translation_it"].strip()
+                or draft["blocked_reason"] is not None
+            ):
+                return None
+            source_ids = self._decode_source_ids(draft["source_ids_json"])
+            if source_ids is None or not self._eligible_content_sources_in_conn(
+                conn, source_ids, current
+            ):
+                return None
+            if not self._queue_media_binding_valid_in_conn(conn, draft):
+                return None
+            token = secrets.token_urlsafe(24)
+            updated_at = self._now_iso()
+            draft_update = conn.execute("""
+                UPDATE post_drafts
+                SET status = 'publishing', updated_at = ?, revision = revision + 1
+                WHERE id = ? AND status = 'approved' AND revision = ?
+                  AND published_tweet_id IS NULL
+            """, (updated_at, draft_id, draft["revision"]))
+            if draft_update.rowcount != 1:
+                return None
+            claimed_draft_row = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+            draft_claim = self._publication_claim_from_row(claimed_draft_row)
+            plan_update = conn.execute("""
+                UPDATE publication_plans
+                SET status = 'publishing', claim_token = ?,
+                    draft_revision = ?, updated_at = ?, revision = revision + 1
+                WHERE id = ? AND status = 'planned' AND revision = ?
+                  AND draft_id = ?
+            """, (
+                token,
+                draft_claim.revision,
+                updated_at,
+                plan_id,
+                expected_plan_revision,
+                draft_id,
+            ))
+            if plan_update.rowcount != 1:
+                raise sqlite3.IntegrityError("publication_plan_claim_conflict")
+            claimed_plan_row = conn.execute(
+                "SELECT * FROM publication_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+            plan_claim = PublicationPlanClaim(
+                plan_id=claimed_plan_row["id"],
+                plan_revision=claimed_plan_row["revision"],
+                draft_id=draft_id,
+                draft_revision=draft_claim.revision,
+                scheduled_for=claimed_plan_row["scheduled_for"],
+                claim_token=token,
+            )
+            return self._decode_post_draft(claimed_draft_row), draft_claim, plan_claim
+
+    def validate_publication_plan_media(
+        self,
+        draft_claim: PostDraftPublicationClaim,
+        plan_claim: PublicationPlanClaim,
+        expected_media: Mapping,
+    ) -> bool:
+        if (
+            not isinstance(draft_claim, PostDraftPublicationClaim)
+            or not isinstance(plan_claim, PublicationPlanClaim)
+        ):
+            return False
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_claim.draft_id,)
+            ).fetchone()
+            plan = conn.execute(
+                "SELECT * FROM publication_plans WHERE id = ?", (plan_claim.plan_id,)
+            ).fetchone()
+            return (
+                self._post_draft_matches_publication_claim(draft, draft_claim)
+                and self._publication_plan_matches_claim(plan, plan_claim)
+                and self._publication_media_matches_in_conn(
+                    conn, draft_claim, expected_media,
+                )
+            )
+
+    def finalize_publication_plan(
+        self,
+        draft_claim: PostDraftPublicationClaim,
+        plan_claim: PublicationPlanClaim,
+        tweet_id: str,
+        expected_media: Optional[Mapping] = None,
+    ) -> bool:
+        if (
+            not isinstance(draft_claim, PostDraftPublicationClaim)
+            or not isinstance(plan_claim, PublicationPlanClaim)
+            or not self._canonical_x_tweet_id(tweet_id)
+        ):
+            return False
+        with self._media_store_mutation_lock(
+            "draft_reservations", draft_claim.draft_id,
+        ) as conn:
+            draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_claim.draft_id,)
+            ).fetchone()
+            plan = conn.execute(
+                "SELECT * FROM publication_plans WHERE id = ?", (plan_claim.plan_id,)
+            ).fetchone()
+            if (
+                not self._post_draft_matches_publication_claim(draft, draft_claim)
+                or not self._publication_plan_matches_claim(plan, plan_claim)
+                or not self._publication_media_matches_in_conn(
+                    conn, draft_claim, expected_media,
+                )
+            ):
+                return False
+            try:
+                score_data = json.loads(draft_claim.score_json)
+            except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+                score_data = {}
+            score_total = score_data.get("total") if type(score_data) is dict else None
+            if type(score_total) is not int or not 0 <= score_total <= 100:
+                score_total = None
+            completed_at = self._now_iso()
+            conn.execute("""
+                INSERT INTO posted_tweets (
+                    tweet_id, text, category, topic, has_link, score_total,
+                    agent_used, created_at
+                ) VALUES (?, ?, ?, '', ?, ?, 'adaptive_approved_publisher', ?)
+            """, (
+                tweet_id,
+                draft_claim.text,
+                draft_claim.category,
+                int(bool(re.search(r"https?://", draft_claim.text))),
+                score_total,
+                completed_at,
+            ))
+            if draft_claim.media_id is not None:
+                media_update = conn.execute("""
+                    UPDATE media_library
+                    SET used = 1, used_at = ?, used_in_tweet_id = ?,
+                        lifecycle_state = 'used', reserved_by_draft_id = NULL
+                    WHERE id = ? AND lifecycle_state = 'reserved'
+                      AND reserved_by_draft_id = ? AND file_deleted = 0
+                """, (
+                    completed_at,
+                    tweet_id,
+                    draft_claim.media_id,
+                    draft_claim.draft_id,
+                ))
+                if media_update.rowcount != 1:
+                    raise sqlite3.IntegrityError("planned_media_changed")
+            draft_update = conn.execute("""
+                UPDATE post_drafts
+                SET status = 'published', published_tweet_id = ?, error = NULL,
+                    updated_at = ?, revision = revision + 1
+                WHERE id = ? AND status = 'publishing' AND revision = ?
+            """, (
+                tweet_id,
+                completed_at,
+                draft_claim.draft_id,
+                draft_claim.revision,
+            ))
+            plan_update = conn.execute("""
+                UPDATE publication_plans
+                SET status = 'published', published_tweet_id = ?,
+                    claim_token = NULL, updated_at = ?, revision = revision + 1
+                WHERE id = ? AND status = 'publishing' AND revision = ?
+                  AND claim_token = ?
+            """, (
+                tweet_id,
+                completed_at,
+                plan_claim.plan_id,
+                plan_claim.plan_revision,
+                plan_claim.claim_token,
+            ))
+            if draft_update.rowcount != 1 or plan_update.rowcount != 1:
+                raise sqlite3.IntegrityError("planned_publication_finalization_conflict")
+            self._insert_draft_evaluation_in_conn(
+                conn,
+                plan_claim.scheduled_for,
+                draft_claim.category,
+                "published",
+                {
+                    "draft_id": draft_claim.draft_id,
+                    "plan_id": plan_claim.plan_id,
+                },
+                completed_at,
+            )
+            return True
+
+    def _transition_publication_plan_claim(
+        self,
+        draft_claim: PostDraftPublicationClaim,
+        plan_claim: PublicationPlanClaim,
+        *,
+        plan_status: str,
+        draft_status: str,
+        safe_error: Optional[str],
+    ) -> bool:
+        if (
+            not isinstance(draft_claim, PostDraftPublicationClaim)
+            or not isinstance(plan_claim, PublicationPlanClaim)
+            or plan_status not in {"planned", "skipped", "unknown"}
+            or draft_status not in {"approved", "publication_unknown"}
+        ):
+            return False
+        sanitized = (
+            self._sanitize_persisted_text(safe_error)
+            if safe_error is not None
+            else None
+        )
+        with self._post_draft_mutation_lock(draft_claim.draft_id) as conn:
+            draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_claim.draft_id,)
+            ).fetchone()
+            plan = conn.execute(
+                "SELECT * FROM publication_plans WHERE id = ?", (plan_claim.plan_id,)
+            ).fetchone()
+            if (
+                not self._post_draft_matches_publication_claim(draft, draft_claim)
+                or not self._publication_plan_matches_claim(plan, plan_claim)
+            ):
+                return False
+            changed_at = self._now_iso()
+            draft_update = conn.execute("""
+                UPDATE post_drafts
+                SET status = ?, error = ?, updated_at = ?, revision = revision + 1
+                WHERE id = ? AND status = 'publishing' AND revision = ?
+                  AND published_tweet_id IS NULL
+            """, (
+                draft_status,
+                sanitized,
+                changed_at,
+                draft_claim.draft_id,
+                draft_claim.revision,
+            ))
+            new_draft_revision = draft_claim.revision + 1
+            plan_update = conn.execute("""
+                UPDATE publication_plans
+                SET status = ?, claim_token = NULL, draft_revision = ?,
+                    updated_at = ?, revision = revision + 1
+                WHERE id = ? AND status = 'publishing' AND revision = ?
+                  AND claim_token = ?
+            """, (
+                plan_status,
+                new_draft_revision,
+                changed_at,
+                plan_claim.plan_id,
+                plan_claim.plan_revision,
+                plan_claim.claim_token,
+            ))
+            if draft_update.rowcount != 1 or plan_update.rowcount != 1:
+                raise sqlite3.IntegrityError("planned_publication_transition_conflict")
+            return True
+
+    def restore_publication_plan_claim(
+        self,
+        draft_claim: PostDraftPublicationClaim,
+        plan_claim: PublicationPlanClaim,
+        now: datetime,
+        grace_minutes: int,
+        safe_error: Optional[str] = None,
+    ) -> bool:
+        current = self._strict_aware_datetime(now)
+        scheduled = self._strict_aware_datetime(plan_claim.scheduled_for)
+        if (
+            current is None
+            or scheduled is None
+            or type(grace_minutes) is not int
+            or not 1 <= grace_minutes <= 1440
+        ):
+            return False
+        within_grace = current <= scheduled + timedelta(minutes=grace_minutes)
+        return self._transition_publication_plan_claim(
+            draft_claim,
+            plan_claim,
+            plan_status="planned" if within_grace else "skipped",
+            draft_status="approved",
+            safe_error=safe_error,
+        )
+
+    def mark_publication_plan_unknown(
+        self,
+        draft_claim: PostDraftPublicationClaim,
+        plan_claim: PublicationPlanClaim,
+        safe_error: str,
+    ) -> bool:
+        return self._transition_publication_plan_claim(
+            draft_claim,
+            plan_claim,
+            plan_status="unknown",
+            draft_status="publication_unknown",
+            safe_error=safe_error,
+        )
+
+    def skip_expired_publication_plan(
+        self,
+        plan_id: int,
+        expected_revision: int,
+        now: datetime,
+        grace_minutes: int,
+    ) -> bool:
+        current = self._strict_aware_datetime(now)
+        if (
+            not self._exact_positive_identifier(plan_id)
+            or not self._exact_nonnegative_revision(expected_revision)
+            or current is None
+            or type(grace_minutes) is not int
+            or not 1 <= grace_minutes <= 1440
+        ):
+            return False
+        plan = self.get_publication_plan(plan_id)
+        if plan is None or not self._exact_positive_identifier(plan.get("draft_id")):
+            return False
+        scheduled = self._strict_aware_datetime(plan.get("scheduled_for"))
+        if scheduled is None or current <= scheduled + timedelta(minutes=grace_minutes):
+            return False
+        with self._post_draft_mutation_lock(plan["draft_id"]) as conn:
+            current_plan = conn.execute(
+                "SELECT * FROM publication_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+            current_draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (plan["draft_id"],)
+            ).fetchone()
+            if (
+                current_plan is None
+                or current_plan["status"] != "planned"
+                or current_plan["revision"] != expected_revision
+                or current_draft is None
+                or current_draft["status"] != "approved"
+                or current_draft["revision"] != current_plan["draft_revision"]
+            ):
+                return False
+            cursor = conn.execute("""
+                UPDATE publication_plans
+                SET status = 'skipped', updated_at = ?, revision = revision + 1
+                WHERE id = ? AND status = 'planned' AND revision = ?
+            """, (self._now_iso(), plan_id, expected_revision))
+            return cursor.rowcount == 1
+
     def get_recent_content_texts(
         self,
         days: int = 30,

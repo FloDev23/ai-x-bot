@@ -635,3 +635,69 @@ class PublicationPlanner:
                 if row is not None:
                     simulated.append(row)
         return simulated
+
+    def publish_due(self, now=None, *, publisher=None) -> list[dict]:
+        """Publish due plans through the injected boundary, never by raw X calls."""
+        current = self._now(now)
+        if current is None:
+            return []
+        if self.dry_run:
+            return self.simulate_due(current)
+        publish_plan = getattr(publisher, "publish_plan", None)
+        if not callable(publish_plan):
+            return []
+        try:
+            plans = self.db.list_publication_positions(statuses=["planned"])
+        except Exception as error:
+            logger.error(
+                "publication_due_list_failed error_type=%s",
+                type(error).__name__,
+            )
+            return []
+        due_plans = []
+        for plan in plans:
+            scheduled = self._parse_aware(plan.get("scheduled_for"))
+            if scheduled is not None and scheduled <= current:
+                due_plans.append((scheduled, plan.get("position"), plan))
+        due_plans.sort(
+            key=lambda item: (
+                item[0],
+                item[1] if type(item[1]) is int else 99,
+                item[2].get("id") if type(item[2].get("id")) is int else 0,
+            )
+        )
+        outcomes = []
+        published = 0
+        for _scheduled, _position, plan in due_plans:
+            if published >= 2:
+                break
+            plan_id = plan.get("id")
+            if type(plan_id) is not int or plan_id <= 0:
+                continue
+            try:
+                result = publish_plan(plan_id, now=current)
+            except Exception as error:
+                logger.error(
+                    "publication_due_failed plan_id=%s error_type=%s",
+                    plan_id,
+                    type(error).__name__,
+                )
+                break
+            status = getattr(result, "status", None)
+            tweet_id = getattr(result, "tweet_id", "")
+            if type(status) is not str or not status:
+                break
+            outcomes.append({
+                "plan_id": plan_id,
+                "status": status,
+                "tweet_id": tweet_id if type(tweet_id) is str else "",
+            })
+            if status in {"published", "already_published"}:
+                published += 1
+            if status in {
+                "publication_unknown",
+                "publication_failed",
+                "paused",
+            }:
+                break
+        return outcomes
