@@ -201,12 +201,40 @@ def test_transport_uses_only_fixed_bounded_request_and_closes_response():
     assert http.calls == [(
         FLEXDROPIN_EDITORIAL_FEED_URL,
         {
+            "headers": {"Accept-Encoding": "identity"},
             "timeout": (5, 10),
             "allow_redirects": False,
             "stream": True,
         },
     )]
     assert response.close_calls == 1
+
+
+def test_transport_requests_identity_encoding_for_a_declared_length():
+    compressed = FakeResponse(encoded_feed())
+    compressed.headers.pop("Content-Length")
+    identity = FakeResponse(encoded_feed())
+
+    class EncodingAwareHttp:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if kwargs.get("headers") == {"Accept-Encoding": "identity"}:
+                return identity
+            return compressed
+
+    http = EncodingAwareHttp()
+    result = FlexDropinEditorialFeedClient(
+        http,
+        now_fn=lambda: TODAY,
+    ).fetch()
+
+    assert result[0]["slug"] == VALID_ITEM["slug"]
+    assert http.calls[0][1]["headers"] == {"Accept-Encoding": "identity"}
+    assert identity.close_calls == 1
+    assert compressed.close_calls == 0
 
 
 @pytest.mark.parametrize(

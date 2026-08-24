@@ -159,6 +159,7 @@ class FlexDropinEditorialFeedClient:
         try:
             response = self.http.get(
                 FLEXDROPIN_EDITORIAL_FEED_URL,
+                headers={"Accept-Encoding": "identity"},
                 timeout=(5, 10),
                 allow_redirects=False,
                 stream=True,
