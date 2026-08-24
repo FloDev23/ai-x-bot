@@ -2199,6 +2199,29 @@ class Database:
                 counts["planned_today"] += 1
         return counts
 
+    def get_replenishment_usage(self, operator_date: date, now: datetime) -> int:
+        """Return the claims consuming today's automatic generation budget."""
+        current = self._strict_aware_datetime(now)
+        if type(operator_date) is not date or current is None:
+            raise ValueError("invalid replenishment usage boundary")
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT COUNT(*) AS count
+                FROM draft_replenishment_claims
+                WHERE operator_date = ?
+                  AND (
+                    status = 'completed'
+                    OR (
+                        status = 'claimed'
+                        AND julianday(expires_at) > julianday(?)
+                    )
+                  )
+            """, (operator_date.isoformat(), current.isoformat())).fetchone()
+        count = row["count"] if row is not None else None
+        if type(count) is not int or count < 0:
+            raise ValueError("invalid replenishment usage result")
+        return count
+
     @staticmethod
     def _decode_replenishment_claim(row: Optional[sqlite3.Row]) -> Optional[Dict]:
         if row is None:

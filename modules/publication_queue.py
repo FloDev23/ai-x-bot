@@ -50,9 +50,9 @@ class QueueReplenisher:
         translator,
         media_matcher=None,
         operator_timezone: str = "Europe/Rome",
-        approved_queue_target: int = 7,
-        pending_review_limit: int = 3,
-        daily_generation_cap: int = 4,
+        approved_queue_target: int = 14,
+        pending_review_limit: int = 5,
+        daily_generation_cap: int = 5,
     ):
         if type(operator_timezone) is not str or not operator_timezone:
             raise ValueError("operator_timezone must be an IANA timezone")
@@ -125,7 +125,8 @@ class QueueReplenisher:
 
         try:
             draft, persistence_outcome = self.pipeline.create_for_queue_with_outcome(
-                anchor
+                anchor,
+                daily_draft_cap=self.daily_generation_cap,
             )
         except Exception as error:
             logger.error(
@@ -296,7 +297,7 @@ class QueueReplenisher:
 
 
 class PublicationPlanner:
-    """Create two stable US publication positions and fill them safely."""
+    """Create stable US publication positions and fill them safely."""
 
     _INSTALLATION_STATE_KEY = "adaptive_publication_installation_id"
 
@@ -305,6 +306,7 @@ class PublicationPlanner:
         *,
         db,
         timing_policy,
+        cadence_policy,
         timing_sample_provider,
         now_fn,
         audience_timezone: str,
@@ -341,6 +343,9 @@ class PublicationPlanner:
             raise ValueError("invalid publication plan grace")
         self.db = db
         self.timing_policy = timing_policy
+        if not callable(getattr(cadence_policy, "choose", None)):
+            raise ValueError("cadence_policy must expose choose")
+        self.cadence_policy = cadence_policy
         self.timing_sample_provider = timing_sample_provider
         self.now_fn = now_fn
         self.installation_id_provider = installation_id_provider
@@ -402,11 +407,13 @@ class PublicationPlanner:
             return []
         local_date = current.astimezone(self.audience_zone).date()
         try:
-            samples = self.timing_sample_provider(current)
+            samples = tuple(self.timing_sample_provider(current))
+            cadence = self.cadence_policy.choose(local_date, samples)
             decision = self.timing_policy.choose(
                 local_date,
                 installation_id,
-                samples if isinstance(samples, (list, tuple)) else (),
+                samples,
+                post_count=cadence.post_count,
             )
             return self.db.create_or_get_publication_positions(
                 local_date,
@@ -510,7 +517,7 @@ class PublicationPlanner:
         if current is None:
             return []
         plans = self.ensure_day(current)
-        if len(plans) != 2:
+        if len(plans) not in {2, 3}:
             return []
         selected_categories = set()
         selected_formats = set()
@@ -681,7 +688,7 @@ class PublicationPlanner:
         outcomes = []
         published = 0
         for _scheduled, _position, plan in due_plans:
-            if published >= 2:
+            if published >= 3:
                 break
             plan_id = plan.get("id")
             if type(plan_id) is not int or plan_id <= 0:

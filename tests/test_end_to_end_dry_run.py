@@ -210,7 +210,7 @@ def test_source_to_approval_to_dry_run_without_external_writes(agent_and_fakes):
     assert fakes["x_client"].engagement_writes == []
 
 
-def test_bilingual_queue_plans_and_simulates_two_us_posts_restart_safely(tmp_path):
+def test_bilingual_queue_plans_and_simulates_dynamic_us_posts_restart_safely(tmp_path):
     dependencies = dependency_bundle(tmp_path)
     agent = FlexDropinGrowthAgent(dependencies)
     source_id = agent.db.add_content_source(
@@ -264,7 +264,7 @@ def test_bilingual_queue_plans_and_simulates_two_us_posts_restart_safely(tmp_pat
     counts = agent.db.get_queue_counts(NOW.date(), "Europe/Rome")
     assert counts["approved_or_planned"] == 14
     plans = agent.publication_planning_cycle(now=NOW)
-    assert len(plans) == 2
+    assert len(plans) == 3
     assert all(plan["status"] == "planned" for plan in plans)
     due_times = sorted(
         datetime.fromisoformat(plan["scheduled_for"]) for plan in plans
@@ -274,7 +274,7 @@ def test_bilingual_queue_plans_and_simulates_two_us_posts_restart_safely(tmp_pat
     for due in due_times:
         simulated.extend(agent.adaptive_publish_cycle(now=due))
 
-    assert len(simulated) == 2
+    assert len(simulated) == 3
     assert all(plan["status"] == "simulated" for plan in simulated)
     assert dependencies["x_client"].posts == []
     assert all(

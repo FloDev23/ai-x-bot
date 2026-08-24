@@ -14,8 +14,10 @@ from zoneinfo import ZoneInfo
 from config import (
     APPROVED_QUEUE_TARGET,
     AUDIENCE_TIMEZONE,
+    DRAFT_GENERATION_DAILY_CAP,
     DRY_RUN,
     NEWS_TRUSTED_DOMAINS,
+    PENDING_REVIEW_LIMIT,
     POSTS_PER_DAY,
 )
 from modules.media_store import open_verified_media
@@ -279,14 +281,61 @@ class TelegramController:
             paused = self.db.get_state("paused") != "false"
         except Exception:
             paused = True
+        current = self._now()
+        try:
+            audience_date = current.astimezone(
+                ZoneInfo(AUDIENCE_TIMEZONE)
+            ).date()
+            publication_positions = self.db.list_publication_positions(
+                audience_date
+            )
+        except Exception:
+            publication_positions = []
+        target_today = (
+            len(publication_positions)
+            if len(publication_positions) in {2, 3}
+            else POSTS_PER_DAY
+        )
+        cadence_reason = None
+        if publication_positions:
+            reason = publication_positions[0].get("selection_reason")
+            if isinstance(reason, dict) and reason.get("timing_reason") in {
+                "cold_start", "performance_weighted",
+            }:
+                cadence_reason = reason["timing_reason"]
+        approved_count = pending_count = generation_used = 0
+        try:
+            operator_date = current.astimezone(ZoneInfo("Europe/Rome")).date()
+            counts = self.db.get_queue_counts(operator_date, "Europe/Rome")
+            approved_value = counts.get("approved_or_planned")
+            awaiting_translation = counts.get("awaiting_translation")
+            awaiting_review = counts.get("awaiting_review")
+            if all(
+                type(value) is int and value >= 0
+                for value in (
+                    approved_value, awaiting_translation, awaiting_review,
+                )
+            ):
+                approved_count = approved_value
+                pending_count = awaiting_translation + awaiting_review
+            usage = self.db.get_replenishment_usage(operator_date, current)
+            if type(usage) is int and usage >= 0:
+                generation_used = usage
+        except Exception:
+            approved_count = pending_count = generation_used = 0
         lines = [
             "Stato",
             f"dry-run: {'attivo' if self.dry_run else 'disattivo'}",
             f"pausa: {'attiva' if paused else 'disattiva'}",
             f"coda approvata target: {APPROVED_QUEUE_TARGET}",
-            f"pubblicazioni target: {POSTS_PER_DAY} al giorno",
+            f"coda approvata: {approved_count}/{APPROVED_QUEUE_TARGET}",
+            f"in revisione: {pending_count}/{PENDING_REVIEW_LIMIT}",
+            f"generazione oggi: {generation_used}/{DRAFT_GENERATION_DAILY_CAP}",
+            f"pubblicazioni target oggi: {target_today}",
             f"pubblico: Stati Uniti ({AUDIENCE_TIMEZONE})",
         ]
+        if cadence_reason is not None:
+            lines.append(f"cadenza: {cadence_reason}")
         jobs = []
         if callable(self.scheduler_status):
             try:
@@ -305,12 +354,7 @@ class TelegramController:
                 lines.append(f"- {name}: {when}")
         else:
             lines.append("prossimi job: non disponibili")
-        try:
-            local_date = self._now().astimezone(ZoneInfo(AUDIENCE_TIMEZONE)).date()
-            publication_positions = self.db.list_publication_positions(local_date)
-        except Exception:
-            publication_positions = []
-        for plan in publication_positions[:2]:
+        for plan in publication_positions[:3]:
             scheduled = self._clean_text(plan.get("scheduled_for"), 80)
             try:
                 parsed = datetime.fromisoformat(scheduled.replace("Z", "+00:00"))

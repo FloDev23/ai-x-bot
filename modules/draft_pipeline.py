@@ -532,17 +532,21 @@ class DraftPipeline:
         draft, _outcome = self.create_for_slot_with_outcome(intended_slot)
         return draft
 
-    def create_for_queue_with_outcome(self, anchor):
+    def create_for_queue_with_outcome(self, anchor, *, daily_draft_cap: int):
         """Create one queue-enabled draft without sending any notification."""
         anchor_iso = _slot_iso(anchor)
-        if anchor_iso is None:
+        if (
+            anchor_iso is None
+            or type(daily_draft_cap) is not int
+            or daily_draft_cap <= 0
+        ):
             return None, "rejected"
         existing = self.db.get_active_draft_for_slot(anchor_iso)
         if existing:
             queued = self.db.ensure_editorial_queue(existing.get("id"))
             return (queued, "existing") if queued else (None, "rejected")
         try:
-            plan = self.planner.plan(anchor, daily_draft_cap=4)
+            plan = self.planner.plan(anchor, daily_draft_cap=daily_draft_cap)
         except (TypeError, ValueError):
             return None, "rejected"
         if plan is None:

@@ -1291,7 +1291,10 @@ def test_status_exposes_queue_and_us_publication_targets(tmp_path):
 
     rendered = telegram.messages[-1][1]
     assert "coda approvata target: 14" in rendered
-    assert "pubblicazioni target: 2 al giorno" in rendered
+    assert "coda approvata: 0/14" in rendered
+    assert "in revisione: 0/5" in rendered
+    assert "generazione oggi: 0/5" in rendered
+    assert "pubblicazioni target oggi: 2" in rendered
     assert "pubblico: Stati Uniti (America/New_York)" in rendered
 
 
@@ -1301,12 +1304,13 @@ def test_status_and_posts_show_planned_time_in_et_and_rome(tmp_path):
     pipeline = StubPipeline(db)
     assert pipeline.approve_queue(draft["id"], "floriano")
     morning = datetime(2029, 8, 15, 12, 30, tzinfo=timezone.utc)
+    midday = datetime(2029, 8, 15, 18, 0, tzinfo=timezone.utc)
     evening = datetime(2029, 8, 15, 22, 30, tzinfo=timezone.utc)
     positions = db.create_or_get_publication_positions(
         morning.date(),
         DailyTimingDecision(
-            times=(morning, evening),
-            bucket_ids=("morning:0", "evening:1"),
+            times=(morning, midday, evening),
+            bucket_ids=("morning:0", "midday:1", "evening:1"),
             reason="cold_start",
         ),
         datetime(2029, 8, 15, 10, 0, tzinfo=timezone.utc),
@@ -1319,7 +1323,9 @@ def test_status_and_posts_show_planned_time_in_et_and_rome(tmp_path):
         {"score": 88},
     )
     telegram = WorkflowTelegramApi(tmp_path)
-    controller = workflow_controller(db, telegram, pipeline=pipeline)
+    controller = workflow_controller(
+        db, telegram, pipeline=pipeline, now=morning,
+    )
 
     assert controller.process_update(message_update(317, "/status")) == "processed"
     assert controller.process_update(message_update(318, "/posts")) == "processed"
@@ -1327,6 +1333,8 @@ def test_status_and_posts_show_planned_time_in_et_and_rome(tmp_path):
     rendered = "\n".join(message[1] for message in telegram.messages)
     assert "2029-08-15 08:30 EDT" in rendered
     assert "2029-08-15 14:30 CEST" in rendered
+    assert "2029-08-15 18:30 EDT" in rendered
+    assert "2029-08-16 00:30 CEST" in rendered
 
 
 def test_posts_sends_verified_media_stream_before_separate_full_draft_card(tmp_path):

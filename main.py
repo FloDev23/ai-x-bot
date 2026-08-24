@@ -31,12 +31,15 @@ from config import (
     MEDIA_MATCH_THRESHOLD,
     MAX_LINKS_PER_WEEK,
     MIN_POST_GAP_HOURS,
+    MIDDAY_WINDOW,
     MORNING_WINDOW,
     NEWS_TRUSTED_DOMAINS,
     OPPORTUNITY_CYCLE_TIMES,
     PUBLISH_GRACE_SECONDS,
     PUBLICATION_PLAN_GRACE_MINUTES,
     PENDING_REVIEW_LIMIT,
+    THIRD_POST_DAYS_PER_WEEK,
+    THIRD_POST_TIMING_MIN_POSTS,
     SEARCH_TOPICS,
     SEMANTIC_DUPLICATE_THRESHOLD,
     TELEGRAM_BOT_TOKEN,
@@ -64,6 +67,7 @@ from modules.publication_queue import (
     QueueReplenisher,
     QueueReplenishResult,
 )
+from modules.publication_cadence import PublicationCadencePolicy
 from modules.review_translation import ReviewTranslator
 from modules.scoring import TweetScorer
 from modules.source_ingestion import SourceIngestor
@@ -115,6 +119,7 @@ class FlexDropinGrowthAgent:
         "planner",
         "publisher",
         "publication_planner",
+        "publication_cadence",
         "queue_replenisher",
         "review_translator",
         "scheduler",
@@ -231,6 +236,7 @@ class FlexDropinGrowthAgent:
             lambda: AdaptiveTimingPolicy(
                 audience_timezone=AUDIENCE_TIMEZONE,
                 morning_window=MORNING_WINDOW,
+                midday_window=MIDDAY_WINDOW,
                 evening_window=EVENING_WINDOW,
                 minimum_gap_hours=MIN_POST_GAP_HOURS,
                 timing_min_posts=ADAPTIVE_TIMING_MIN_POSTS,
@@ -329,11 +335,20 @@ class FlexDropinGrowthAgent:
             lambda: PerformanceAnalyzer(self.twitter_client, self.db),
         )
         self.analyzer = self.analytics
+        self.publication_cadence = resolve(
+            "publication_cadence",
+            lambda: PublicationCadencePolicy(
+                audience_timezone=AUDIENCE_TIMEZONE,
+                third_days_per_week=THIRD_POST_DAYS_PER_WEEK,
+                learning_min_posts=THIRD_POST_TIMING_MIN_POSTS,
+            ),
+        )
         self.publication_planner = resolve(
             "publication_planner",
             lambda: PublicationPlanner(
                 db=self.db,
                 timing_policy=self.adaptive_timing,
+                cadence_policy=self.publication_cadence,
                 timing_sample_provider=self.analytics.timing_samples,
                 now_fn=self.clock,
                 audience_timezone=AUDIENCE_TIMEZONE,

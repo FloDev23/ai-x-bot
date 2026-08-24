@@ -13,6 +13,7 @@ from modules.adaptive_timing import AdaptiveTimingPolicy, TimingSample
 from modules.analytics import PerformanceAnalyzer
 from modules.database import Database
 from modules.media_processor import MediaProcessor
+from modules.publication_cadence import PublicationCadencePolicy
 from modules.publisher import Publisher
 from modules.twitter_client import XPublicationRejected
 
@@ -301,6 +302,11 @@ def _planner(db, *, now=NOW, dry_run=True, installation_id="install-1"):
     return PublicationPlanner(
         db=db,
         timing_policy=_policy(),
+        cadence_policy=PublicationCadencePolicy(
+            audience_timezone="America/New_York",
+            third_days_per_week=3,
+            learning_min_posts=30,
+        ),
         timing_sample_provider=lambda current: db.get_publication_timing_samples(
             current
         ),
@@ -495,6 +501,11 @@ def test_ensure_day_reuses_persisted_installation_id_without_provider(tmp_path):
     restarted = PublicationPlanner(
         db=Database(str(tmp_path / "installation-restart.db")),
         timing_policy=_policy(),
+        cadence_policy=PublicationCadencePolicy(
+            audience_timezone="America/New_York",
+            third_days_per_week=3,
+            learning_min_posts=30,
+        ),
         timing_sample_provider=lambda _current: [],
         now_fn=lambda: NOW,
         audience_timezone="America/New_York",
@@ -505,6 +516,45 @@ def test_ensure_day_reuses_persisted_installation_id_without_provider(tmp_path):
     )
 
     assert restarted.ensure_day(NOW) == first
+
+
+def test_tuesday_reconcile_plans_three_distinct_approved_drafts(tmp_path):
+    tuesday = datetime(2026, 8, 25, 10, 0, tzinfo=timezone.utc)
+    db = Database(str(tmp_path / "tuesday-three.db"))
+    expected_ids = {
+        _approved_queue_draft(
+            db,
+            text=f"Tuesday approved reserve {index}",
+            category=category,
+            score=90 - index,
+        )
+        for index, category in enumerate(
+            ("gym_strategy", "proof", "shareable_insight")
+        )
+    }
+
+    plans = _planner(db, now=tuesday).reconcile(tuesday)
+
+    assert [plan["position"] for plan in plans] == [1, 2, 3]
+    assert {plan["draft_id"] for plan in plans} == expected_ids
+    assert all(plan["status"] == "planned" for plan in plans)
+
+
+def test_sunday_reconcile_keeps_two_positions(tmp_path):
+    sunday = datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc)
+    db = Database(str(tmp_path / "sunday-two.db"))
+    for index, category in enumerate(("gym_strategy", "proof", "founder_story")):
+        _approved_queue_draft(
+            db,
+            text=f"Sunday approved reserve {index}",
+            category=category,
+            score=90 - index,
+        )
+
+    plans = _planner(db, now=sunday).reconcile(sunday)
+
+    assert [plan["position"] for plan in plans] == [1, 2]
+    assert len({plan["draft_id"] for plan in plans}) == 2
 
 
 def test_reconcile_prefers_valid_expiring_source_then_category_diversity(tmp_path):
@@ -849,6 +899,7 @@ def test_second_dry_run_day_prefers_unsimulated_drafts_without_consuming_queue(
         )
         for index, category in enumerate((
             "gym_strategy", "proof", "shareable_insight", "founder_story",
+            "product_education",
         ))
     ]
     first_planner = _planner(db, now=NOW)
@@ -1280,6 +1331,31 @@ def test_publication_planner_publishes_two_due_positions_in_order(tmp_path):
         plan["id"] for plan in sorted(plans, key=lambda row: row["position"])
     ]
     assert all(call[1] == due for call in publisher.calls)
+
+
+def test_publication_planner_publishes_three_due_positions_in_order(tmp_path):
+    tuesday = datetime(2026, 8, 25, 10, 0, tzinfo=timezone.utc)
+    db = Database(str(tmp_path / "publish-three-due.db"))
+    for index, category in enumerate(
+        ("gym_strategy", "proof", "shareable_insight")
+    ):
+        _approved_queue_draft(
+            db,
+            text=f"Three-position publication {index}",
+            category=category,
+            score=90 - index,
+        )
+    publisher = _RecordingPlanPublisher(["published"] * 3)
+    planner = _planner(db, now=tuesday, dry_run=False)
+    plans = planner.reconcile(tuesday)
+    due = max(datetime.fromisoformat(plan["scheduled_for"]) for plan in plans)
+
+    outcomes = planner.publish_due(due, publisher=publisher)
+
+    assert [outcome["status"] for outcome in outcomes] == ["published"] * 3
+    assert [call[0] for call in publisher.calls] == [
+        plan["id"] for plan in sorted(plans, key=lambda row: row["position"])
+    ]
 
 
 def test_publication_planner_stops_cycle_after_ambiguous_outcome(tmp_path):

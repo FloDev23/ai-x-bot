@@ -812,8 +812,8 @@ class _QueuePipelineFake:
             "evergreen_idea", "Reduce empty capacity without discounting.",
         )
 
-    def create_for_queue_with_outcome(self, anchor):
-        self.calls.append(anchor)
+    def create_for_queue_with_outcome(self, anchor, *, daily_draft_cap):
+        self.calls.append({"anchor": anchor, "daily_draft_cap": daily_draft_cap})
         if self.delay:
             time_module.sleep(self.delay)
         if self.outcome == "raise":
@@ -855,7 +855,9 @@ class _QueueMediaMatcherFake:
         return None
 
 
-def _replenisher(db, pipeline, translator, media_matcher=None):
+def _replenisher(
+    db, pipeline, translator, media_matcher=None, *, daily_generation_cap=4,
+):
     from modules.publication_queue import QueueReplenisher
 
     return QueueReplenisher(
@@ -866,7 +868,7 @@ def _replenisher(db, pipeline, translator, media_matcher=None):
         operator_timezone="Europe/Rome",
         approved_queue_target=7,
         pending_review_limit=3,
-        daily_generation_cap=4,
+        daily_generation_cap=daily_generation_cap,
     )
 
 
@@ -892,6 +894,21 @@ def test_replenisher_creates_translates_completes_and_announces_once(tmp_path):
         ).fetchone())
     assert claim["status"] == "completed"
     assert claim["draft_id"] == result.draft_id
+
+
+def test_replenisher_passes_configured_cap_to_content_pipeline(tmp_path):
+    db = Database(str(tmp_path / "configured-generation-cap.db"))
+    pipeline = _QueuePipelineFake(db)
+
+    result = _replenisher(
+        db,
+        pipeline,
+        _QueueTranslatorFake(),
+        daily_generation_cap=5,
+    ).run(datetime.now(timezone.utc).replace(microsecond=0))
+
+    assert result.outcome == "created"
+    assert pipeline.calls[0]["daily_draft_cap"] == 5
 
 
 def _seed_queue_state(db, count, *, approved):
@@ -1027,7 +1044,7 @@ def test_replenisher_restart_waits_for_expiry_then_reclaims(tmp_path):
         microseconds=claim["ordinal"]
     )
     crashed_draft, crashed_outcome = pipeline.create_for_queue_with_outcome(
-        crashed_anchor
+        crashed_anchor, daily_draft_cap=4,
     )
     assert crashed_outcome == "created"
     pipeline.calls.clear()
@@ -1174,7 +1191,9 @@ def test_pipeline_creates_queue_draft_with_explicit_daily_cap_and_approves(tmp_p
     )
     anchor = datetime(2020, 1, 1, 10, 0, tzinfo=timezone.utc)
 
-    draft, outcome = pipeline.create_for_queue_with_outcome(anchor)
+    draft, outcome = pipeline.create_for_queue_with_outcome(
+        anchor, daily_draft_cap=4,
+    )
 
     assert outcome == "created"
     assert planner.caps == [4]
@@ -1200,7 +1219,8 @@ def test_queue_edit_replacement_starts_without_translation_or_approval(tmp_path)
         now_fn=lambda: datetime.now(timezone.utc),
     )
     prior, _outcome = pipeline.create_for_queue_with_outcome(
-        datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
+        datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc),
+        daily_draft_cap=4,
     )
     assert db.save_review_translation(
         prior["id"], prior["revision"], "Traduzione precedente.",
