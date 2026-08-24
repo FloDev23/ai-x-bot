@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from modules.database import Database
+from modules.adaptive_timing import DailyTimingDecision
 from modules.draft_pipeline import DraftPipeline
 from modules.fact_guard import FactCheckResult
 from modules.media_processor import MediaProcessor
@@ -1292,6 +1293,40 @@ def test_status_exposes_queue_and_us_publication_targets(tmp_path):
     assert "coda approvata target: 7" in rendered
     assert "pubblicazioni target: 2 al giorno" in rendered
     assert "pubblico: Stati Uniti (America/New_York)" in rendered
+
+
+def test_status_and_posts_show_planned_time_in_et_and_rome(tmp_path):
+    db = Database(str(tmp_path / "planned-display.db"))
+    draft = ready_queue_draft(db, text="Planned English copy")
+    pipeline = StubPipeline(db)
+    assert pipeline.approve_queue(draft["id"], "floriano")
+    morning = datetime(2029, 8, 15, 12, 30, tzinfo=timezone.utc)
+    evening = datetime(2029, 8, 15, 22, 30, tzinfo=timezone.utc)
+    positions = db.create_or_get_publication_positions(
+        morning.date(),
+        DailyTimingDecision(
+            times=(morning, evening),
+            bucket_ids=("morning:0", "evening:1"),
+            reason="cold_start",
+        ),
+        datetime(2029, 8, 15, 10, 0, tzinfo=timezone.utc),
+    )
+    queued = db.get_queue_draft(draft["id"])
+    assert db.assign_publication_plan_atomic(
+        positions[0]["id"],
+        draft["id"],
+        queued["revision"],
+        {"score": 88},
+    )
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=pipeline)
+
+    assert controller.process_update(message_update(317, "/status")) == "processed"
+    assert controller.process_update(message_update(318, "/posts")) == "processed"
+
+    rendered = "\n".join(message[1] for message in telegram.messages)
+    assert "2029-08-15 08:30 EDT" in rendered
+    assert "2029-08-15 14:30 CEST" in rendered
 
 
 def test_posts_sends_verified_media_stream_before_separate_full_draft_card(tmp_path):

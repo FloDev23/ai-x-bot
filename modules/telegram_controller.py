@@ -305,6 +305,26 @@ class TelegramController:
                 lines.append(f"- {name}: {when}")
         else:
             lines.append("prossimi job: non disponibili")
+        try:
+            local_date = self._now().astimezone(ZoneInfo(AUDIENCE_TIMEZONE)).date()
+            publication_positions = self.db.list_publication_positions(local_date)
+        except Exception:
+            publication_positions = []
+        for plan in publication_positions[:2]:
+            scheduled = self._clean_text(plan.get("scheduled_for"), 80)
+            try:
+                parsed = datetime.fromisoformat(scheduled.replace("Z", "+00:00"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if parsed.tzinfo is None:
+                continue
+            et = parsed.astimezone(ZoneInfo(AUDIENCE_TIMEZONE))
+            rome = parsed.astimezone(ZoneInfo("Europe/Rome"))
+            lines.append(
+                f"pubblicazione {plan.get('position')}: "
+                f"{et.strftime('%Y-%m-%d %H:%M %Z')} / "
+                f"{rome.strftime('%Y-%m-%d %H:%M %Z')}"
+            )
         self._send(chat_id, "\n".join(lines))
         return "status"
 
@@ -552,12 +572,44 @@ class TelegramController:
         self._send(chat_id, summary)
         details = []
         seen = set()
+        try:
+            active_plans = self.db.list_publication_positions(
+                statuses=["planned", "publishing", "unknown"]
+            )
+        except Exception:
+            active_plans = []
+        plans_by_draft = {
+            plan.get("draft_id"): plan
+            for plan in active_plans
+            if type(plan.get("draft_id")) is int
+        }
+        try:
+            queue_positions = {
+                draft.get("id"): index
+                for index, draft in enumerate(
+                    self.db.list_approved_queue(self._now()), start=1,
+                )
+            }
+        except Exception:
+            queue_positions = {}
         for draft in pending + approved + scheduled + published:
             draft_id = draft.get("id") if isinstance(draft, dict) else None
             if type(draft_id) is not int or draft_id in seen:
                 continue
             seen.add(draft_id)
-            details.append(self.db.get_queue_draft(draft_id) or draft)
+            display = self.db.get_queue_draft(draft_id) or draft
+            plan = plans_by_draft.get(draft_id)
+            if isinstance(plan, dict):
+                display = {
+                    **display,
+                    "scheduled_for": plan.get("scheduled_for"),
+                }
+            elif draft_id in queue_positions:
+                display = {
+                    **display,
+                    "queue_position": queue_positions[draft_id],
+                }
+            details.append(display)
             if len(details) >= 50:
                 break
         for draft in details:

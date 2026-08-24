@@ -212,6 +212,13 @@ class PerformanceAnalyzer:
         """Compatibility wrapper for existing read-only Telegram consumers."""
         return self.build_weekly_report(datetime.now(timezone.utc))
 
+    def timing_samples(self, now: datetime):
+        current_time = self._aware_datetime(now, "now")
+        return self.db.get_publication_timing_samples(
+            current_time,
+            min_age_hours=24,
+        )
+
     def refresh_own_tweet_metrics(self, max_tweets: int = 20):
         """
         Legge le metriche pubbliche dei propri ultimi tweet (owned read,

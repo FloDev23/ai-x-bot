@@ -648,8 +648,8 @@ def test_publication_plan_creation_is_stable_and_simulated_is_revision_cas(tmp_p
     assert [row["position"] for row in first] == [1, 2]
     assert [row["status"] for row in first] == ["open", "open"]
     assert first[0]["selection_reason"] == {
-        "bucket_id": "morning:0",
-        "reason": "cold_start",
+        "timing_bucket": "morning:0",
+        "timing_reason": "cold_start",
     }
     assert not db.mark_publication_plan_simulated(first[0]["id"], 99)
     assert not db.mark_publication_plan_simulated(
@@ -720,13 +720,13 @@ def test_plan_assignment_is_exact_revision_and_one_draft_per_plan(tmp_path):
     )
 
     assert not db.assign_publication_plan_atomic(
-        plans[0]["id"], draft_id, approved["revision"] + 1, {"rank": 1},
+        plans[0]["id"], draft_id, approved["revision"] + 1, {"score": 80},
     )
     assert db.assign_publication_plan_atomic(
-        plans[0]["id"], draft_id, approved["revision"], {"rank": 1},
+        plans[0]["id"], draft_id, approved["revision"], {"score": 80},
     )
     assert not db.assign_publication_plan_atomic(
-        plans[1]["id"], draft_id, approved["revision"], {"rank": 2},
+        plans[1]["id"], draft_id, approved["revision"], {"score": 80},
     )
     available = db.list_approved_queue(datetime.now(timezone.utc))
     assert available == []
@@ -739,9 +739,9 @@ def test_plan_assignment_is_exact_revision_and_one_draft_per_plan(tmp_path):
     assert plan["draft_revision"] == approved["revision"]
     stored_reason = json.loads(plan["selection_reason_json"])
     assert stored_reason == {
-        "bucket_id": "morning:0",
-        "rank": 1,
-        "reason": "cold_start",
+        "score": 80,
+        "timing_bucket": "morning:0",
+        "timing_reason": "cold_start",
     }
     counts = db.get_queue_counts(date(2026, 8, 24), "Europe/Rome")
     assert counts["planned_today"] == 1

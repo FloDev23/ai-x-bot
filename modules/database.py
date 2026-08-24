@@ -2350,18 +2350,20 @@ class Database:
         except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
             return None
         allowed_reason_keys = {
-            "reason", "bucket_id", "sample_count", "score",
-            "rank", "urgency", "category_balance", "format_diversity",
-            "source_expiry",
+            "source_urgency", "score", "category_diversity",
+            "format_diversity", "approval_age", "timing_reason",
+            "timing_bucket",
         }
         if (
             type(reason) is not dict
             or not reason
             or not set(reason).issubset(allowed_reason_keys)
-            or reason.get("reason") not in {"cold_start", "performance_weighted"}
-            or type(reason.get("bucket_id")) is not str
+            or reason.get("timing_reason") not in {
+                "cold_start", "performance_weighted",
+            }
+            or type(reason.get("timing_bucket")) is not str
             or re.fullmatch(
-                r"(?:morning|evening):[0-9]{1,2}", reason["bucket_id"]
+                r"(?:morning|evening):[0-9]{1,2}", reason["timing_bucket"]
             ) is None
             or record.get("status") not in {
                 "open", "planned", "publishing", "published",
@@ -2372,6 +2374,19 @@ class Database:
             or cls._strict_aware_datetime(record.get("scheduled_for")) is None
         ):
             return None
+        numeric_contract = {
+            "source_urgency": (0, 1_000_000),
+            "score": (0, 100),
+            "category_diversity": (0, 1),
+            "format_diversity": (0, 1),
+            "approval_age": (0, 31_536_000),
+        }
+        for key, (minimum, maximum) in numeric_contract.items():
+            if key in reason and (
+                type(reason[key]) is not int
+                or not minimum <= reason[key] <= maximum
+            ):
+                return None
         record["selection_reason"] = reason
         return record
 
@@ -2408,7 +2423,10 @@ class Database:
             ):
                 return []
             reason = json.dumps(
-                {"bucket_id": bucket_id, "reason": decision.reason},
+                {
+                    "timing_bucket": bucket_id,
+                    "timing_reason": decision.reason,
+                },
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -2445,6 +2463,43 @@ class Database:
             ).fetchall()
             decoded = [self._decode_publication_plan(row) for row in rows]
             return decoded if len(decoded) == 2 and all(decoded) else []
+
+    def list_publication_positions(
+        self,
+        local_date: Optional[date] = None,
+        statuses: Optional[List[str]] = None,
+    ) -> List[Dict]:
+        allowed = {
+            "open", "planned", "publishing", "published",
+            "simulated", "skipped", "unknown",
+        }
+        if local_date is not None and type(local_date) is not date:
+            return []
+        if statuses is not None and (
+            type(statuses) is not list
+            or not statuses
+            or any(type(status) is not str or status not in allowed for status in statuses)
+        ):
+            return []
+        clauses = []
+        parameters = []
+        if local_date is not None:
+            clauses.append("local_date = ?")
+            parameters.append(local_date.isoformat())
+        if statuses is not None:
+            clauses.append("status IN (" + ",".join("?" for _ in statuses) + ")")
+            parameters.extend(statuses)
+        sql = "SELECT * FROM publication_plans"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY local_date, position"
+        with self._conn() as conn:
+            rows = conn.execute(sql, parameters).fetchall()
+        return [
+            decoded
+            for row in rows
+            if (decoded := self._decode_publication_plan(row)) is not None
+        ]
 
     def list_approved_queue(self, now: datetime) -> List[Dict]:
         current = self._strict_aware_datetime(now)
@@ -2485,20 +2540,27 @@ class Database:
 
     @staticmethod
     def _safe_plan_reason(reason: Any) -> Optional[str]:
-        if type(reason) is not dict or len(reason) > 8:
+        if type(reason) is not dict or not reason or len(reason) > 5:
             return None
         allowed = {
-            "rank", "urgency", "score", "category_balance",
-            "format_diversity", "source_expiry",
+            "source_urgency", "score", "category_diversity",
+            "format_diversity", "approval_age",
+        }
+        if not set(reason).issubset(allowed):
+            return None
+        numeric_contract = {
+            "source_urgency": (0, 1_000_000),
+            "score": (0, 100),
+            "category_diversity": (0, 1),
+            "format_diversity": (0, 1),
+            "approval_age": (0, 31_536_000),
         }
         projected = {}
         for key, value in reason.items():
-            if key not in allowed or type(key) is not str:
-                continue
-            if value is None or type(value) in (bool, int, float):
-                projected[key] = value
-            elif type(value) is str and len(value) <= 128:
-                projected[key] = value
+            minimum, maximum = numeric_contract[key]
+            if type(value) is not int or not minimum <= value <= maximum:
+                return None
+            projected[key] = value
         try:
             encoded = json.dumps(
                 projected,
@@ -2516,13 +2578,25 @@ class Database:
         draft_id: int,
         expected_draft_revision: int,
         reason: Dict,
+        source_valid_at: Optional[datetime] = None,
+        max_links_per_week: Optional[int] = None,
     ) -> bool:
         reason_json = self._safe_plan_reason(reason)
+        requested_source_validation = (
+            self._strict_aware_datetime(source_valid_at)
+            if source_valid_at is not None
+            else None
+        )
         if (
             not self._exact_positive_identifier(plan_id)
             or not self._exact_positive_identifier(draft_id)
             or not self._exact_nonnegative_revision(expected_draft_revision)
             or reason_json is None
+            or (source_valid_at is not None and requested_source_validation is None)
+            or (
+                max_links_per_week is not None
+                and (type(max_links_per_week) is not int or max_links_per_week < 0)
+            )
         ):
             return False
         try:
@@ -2547,6 +2621,9 @@ class Database:
                 scheduled = self._strict_aware_datetime(plan["scheduled_for"])
                 if scheduled is None:
                     return False
+                source_validation_time = requested_source_validation or scheduled
+                if source_validation_time < scheduled:
+                    return False
                 not_before = self._strict_aware_datetime(current["not_before"])
                 if current["not_before"] is not None and (
                     not_before is None or not_before > scheduled
@@ -2554,11 +2631,47 @@ class Database:
                     return False
                 source_ids = self._decode_source_ids(current["source_ids_json"])
                 if source_ids is None or not self._eligible_content_sources_in_conn(
-                    conn, source_ids, scheduled
+                    conn, source_ids, source_validation_time
                 ):
                     return False
                 if not self._queue_media_binding_valid_in_conn(conn, current):
                     return False
+                if (
+                    max_links_per_week is not None
+                    and re.search(r"https?://", current["text"])
+                ):
+                    since = scheduled - timedelta(days=7)
+                    link_count = 0
+                    posted_links = conn.execute("""
+                        SELECT created_at FROM posted_tweets WHERE has_link = 1
+                    """).fetchall()
+                    for row in posted_links:
+                        created = self._strict_aware_datetime(row["created_at"])
+                        if created is None:
+                            link_count += 1
+                        elif since <= created <= scheduled:
+                            link_count += 1
+                    planned_links = conn.execute("""
+                        SELECT p.scheduled_for, d.text
+                        FROM publication_plans p
+                        JOIN post_drafts d ON d.id = p.draft_id
+                        WHERE p.id != ?
+                          AND p.status IN ('planned', 'publishing', 'unknown')
+                    """, (plan_id,)).fetchall()
+                    for row in planned_links:
+                        planned_at = self._strict_aware_datetime(row["scheduled_for"])
+                        if (
+                            planned_at is None
+                            or not isinstance(row["text"], str)
+                        ):
+                            link_count += 1
+                        elif (
+                            since <= planned_at <= scheduled + timedelta(days=7)
+                            and re.search(r"https?://", row["text"])
+                        ):
+                            link_count += 1
+                    if link_count >= max_links_per_week:
+                        return False
                 try:
                     timing_reason = json.loads(plan["selection_reason_json"])
                     ranking_reason = json.loads(reason_json)
@@ -2573,7 +2686,7 @@ class Database:
                     return False
                 merged_reason = {
                     key: timing_reason[key]
-                    for key in ("bucket_id", "reason")
+                    for key in ("timing_bucket", "timing_reason")
                     if key in timing_reason
                 }
                 merged_reason.update(ranking_reason)
@@ -2626,6 +2739,18 @@ class Database:
                 WHERE id = ? AND revision = ? AND status = 'planned'
             """, (self._now_iso(), plan_id, expected_revision))
             return cursor.rowcount == 1
+
+    def get_simulated_draft_ids(self) -> Set[int]:
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT draft_id FROM publication_plans
+                WHERE status = 'simulated' AND draft_id IS NOT NULL
+            """).fetchall()
+        return {
+            row["draft_id"]
+            for row in rows
+            if self._exact_positive_identifier(row["draft_id"])
+        }
 
     def get_recent_content_texts(
         self,
@@ -3582,6 +3707,12 @@ class Database:
 
     def save_tweet_metrics(self, tweet_id: str, impressions: int, likes: int,
                            retweets: int, replies: int, bookmarks: int = 0):
+        metrics = (impressions, likes, retweets, replies, bookmarks)
+        if (
+            not self._canonical_x_tweet_id(tweet_id)
+            or any(type(value) is not int or value < 0 for value in metrics)
+        ):
+            return False
         with self._conn() as conn:
             conn.execute("""
                 INSERT INTO tweet_metrics (tweet_id, impressions, likes, retweets, replies, bookmarks, checked_at)
@@ -3590,8 +3721,93 @@ class Database:
                     impressions=excluded.impressions, likes=excluded.likes,
                     retweets=excluded.retweets, replies=excluded.replies,
                     bookmarks=excluded.bookmarks, checked_at=excluded.checked_at
-            """, (tweet_id, impressions, likes, retweets, replies, bookmarks,
-                  datetime.now().isoformat()))
+            """, (
+                tweet_id,
+                impressions,
+                likes,
+                retweets,
+                replies,
+                bookmarks,
+                self._now_iso(),
+            ))
+        return True
+
+    @staticmethod
+    def _canonical_x_tweet_id(value: Any) -> bool:
+        return (
+            type(value) is str
+            and re.fullmatch(r"[1-9][0-9]{0,19}", value) is not None
+            and int(value) <= (1 << 64) - 1
+        )
+
+    def get_publication_timing_samples(
+        self,
+        now: datetime,
+        min_age_hours: int = 24,
+    ) -> List:
+        """Project only mature, canonical owned-post performance samples."""
+        from modules.adaptive_timing import TimingSample
+
+        current = self._strict_aware_datetime(now)
+        if (
+            current is None
+            or type(min_age_hours) is not int
+            or min_age_hours <= 0
+            or min_age_hours > 24 * 365
+        ):
+            return []
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT p.tweet_id, p.created_at, m.checked_at,
+                       m.impressions, m.likes, m.retweets, m.replies,
+                       m.bookmarks,
+                       (
+                           SELECT COUNT(*) FROM posted_tweets duplicate
+                           WHERE duplicate.tweet_id = p.tweet_id
+                       ) AS posted_count
+                FROM posted_tweets p
+                JOIN tweet_metrics m ON m.tweet_id = p.tweet_id
+            """).fetchall()
+        samples = []
+        minimum_age = timedelta(hours=min_age_hours)
+        for row in rows:
+            if (
+                not self._canonical_x_tweet_id(row["tweet_id"])
+                or row["posted_count"] != 1
+            ):
+                continue
+            scheduled = self._strict_aware_datetime(row["created_at"])
+            measured = self._strict_aware_datetime(row["checked_at"])
+            metrics = [
+                row["impressions"],
+                row["likes"],
+                row["retweets"],
+                row["replies"],
+                row["bookmarks"],
+            ]
+            if (
+                scheduled is None
+                or measured is None
+                or scheduled > current
+                or measured > current
+                or measured < scheduled + minimum_age
+                or any(type(value) is not int or value < 0 for value in metrics)
+            ):
+                continue
+            engagements = sum(metrics[1:])
+            if engagements > metrics[0]:
+                continue
+            samples.append(TimingSample(
+                scheduled_for=scheduled,
+                measured_at=measured,
+                impressions=metrics[0],
+                engagements=engagements,
+            ))
+        samples.sort(key=lambda sample: (
+            sample.scheduled_for,
+            sample.measured_at,
+        ))
+        return samples
 
     def get_first_posted_at(self) -> Optional[str]:
         with self._conn() as conn:
@@ -5544,6 +5760,27 @@ class Database:
                 "SELECT value FROM bot_state WHERE key = ?", (key,)
             ).fetchone()
         return row["value"] if row else default
+
+    def get_or_create_state(self, key: str, value: str) -> Optional[str]:
+        if (
+            type(key) is not str
+            or not key
+            or len(key) > 128
+            or type(value) is not str
+            or not value
+            or len(value) > 128
+        ):
+            return None
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                INSERT OR IGNORE INTO bot_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+            """, (key, value, self._now_iso()))
+            row = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (key,)
+            ).fetchone()
+            return row["value"] if row else None
 
     def compare_and_set_state(
         self,
