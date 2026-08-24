@@ -38,7 +38,10 @@ from modules.fact_guard import (
     normalize_incident_subtype,
     valid_source_id,
 )
-from modules.source_validation import is_complete_verified_news
+from modules.source_validation import (
+    is_complete_owned_blog_article,
+    is_complete_verified_news,
+)
 from typing import BinaryIO, Dict, Optional, List
 
 logger = logging.getLogger(__name__)
@@ -88,7 +91,15 @@ def _category_agents(category: str) -> List[str]:
     return character_module.get_category_agents(category, _CHARACTER)
 
 
-def _get_link() -> str:
+def _get_link(sources: Optional[List[Dict]] = None) -> str:
+    if isinstance(sources, list):
+        owned_urls = [
+            source.get("url")
+            for source in sources
+            if is_complete_owned_blog_article(source)
+        ]
+        if len(owned_urls) == 1:
+            return owned_urls[0]
     return FLEXDROPIN_WEBSITE
 
 
@@ -114,6 +125,7 @@ def _category_instruction(category: Optional[str]) -> str:
 
 
 def _source_instruction(sources: List[Dict], candidate_index=None) -> str:
+    instructions = []
     if isinstance(sources, list) and any(
         is_complete_verified_news(source) for source in sources
     ):
@@ -124,7 +136,7 @@ def _source_instruction(sources: List[Dict], candidate_index=None) -> str:
             if candidate_index is None
             else ""
         )
-        return (
+        instructions.append(
             "When SOURCE_BUNDLE contains verified_news, use at least one exact "
             "concrete fact from the most recent verified_news and attribute it "
             f"to its source_name. {angle_selection_instruction}Do not prescribe "
@@ -133,6 +145,19 @@ def _source_instruction(sources: List[Dict], candidate_index=None) -> str:
             "or commercial outcomes. Make usefulness come from what operators "
             "should notice, measure or question, not an invented tactic."
         )
+    if isinstance(sources, list) and any(
+        is_complete_owned_blog_article(source) for source in sources
+    ):
+        instructions.append(
+            "When SOURCE_BUNDLE contains owned_blog_article, every factual "
+            "assertion must be a literal paraphrase of the article title or "
+            "summary. Never assert a FlexDropin product capability, benefit, "
+            "customer result or first-person experience. Do not introduce any "
+            "number absent from the title or summary. Build the takeaway as a "
+            "question or imperative grounded in those exact article details."
+        )
+    if instructions:
+        return " ".join(instructions)
     return "Use only the source details needed for one focused idea."
 
 
@@ -215,7 +240,7 @@ class AIGenerator:
             return None
         agent_name = _category_agents(category)[0]
         link_instruction = (
-            f"You may include {_get_link()} as the call to action."
+            f"You may include {_get_link(sources)} as the call to action."
             if include_link
             else "Do not include a link or download call to action."
         )

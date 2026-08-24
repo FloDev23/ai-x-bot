@@ -1,3 +1,4 @@
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -381,6 +382,77 @@ def test_verified_news_must_anchor_generation_and_rewrite(fake_ai):
         assert "use at least one exact concrete fact" in prompt
         assert "attribute it to its source_name" in prompt
         assert "Do not extrapolate causal or commercial outcomes" in prompt
+
+
+def test_owned_blog_generation_and_rewrite_forbid_unsourced_product_claims(
+    fake_ai,
+):
+    prompts = []
+
+    def complete(_system_prompt, user_prompt, **_kwargs):
+        prompts.append(" ".join(user_prompt.split()))
+        if len(prompts) == 1:
+            return "Long blog post. " * 30
+        return "Ask which class rule removes the most booking friction."
+
+    fake_ai._complete = complete
+    public_item = {
+        "slug": "gym-drop-ins-test-demand",
+        "url": "https://flexdropin.com/blog/gym-drop-ins-test-demand",
+        "title": "Gym drop-ins: test demand",
+        "summary": "Start with one class and clear rules.",
+        "published_at": "2026-08-20",
+    }
+    content_hash = hashlib.sha256(json.dumps(
+        public_item,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    sources = [{
+        "id": 42,
+        "source_type": "owned_blog_article",
+        "trust_state": "verified",
+        "verified_by": "flexdropin_editorial_feed",
+        "text": "Gym drop-ins: test demand\nStart with one class and clear rules.",
+        "url": public_item["url"],
+        "metadata": {
+            "title": public_item["title"],
+            "summary": public_item["summary"],
+            "published_at": public_item["published_at"],
+            "source_name": "FlexDropin Blog",
+            "slug": public_item["slug"],
+            "feed_version": 1,
+            "content_hash": content_hash,
+        },
+    }]
+
+    candidate = fake_ai.generate_grounded_tweet(
+        "gym_strategy",
+        sources,
+        include_link=True,
+        candidate_index=0,
+    )
+    rewritten = fake_ai.rewrite_to_limit(
+        candidate["text"],
+        sources,
+        category="gym_strategy",
+        candidate_index=0,
+    )
+
+    assert rewritten == "Ask which class rule removes the most booking friction."
+    assert len(prompts) == 2
+    assert (
+        "you may include https://flexdropin.com/blog/"
+        "gym-drop-ins-test-demand as the call to action"
+    ) in prompts[0].lower()
+    for prompt in prompts:
+        normalized = prompt.lower()
+        assert "owned_blog_article" in normalized
+        assert "never assert a flexdropin product capability" in normalized
+        assert "do not introduce any number absent from the title or summary" in normalized
+        assert "literal paraphrase of the article title or summary" in normalized
 
 
 def test_incomplete_verified_news_does_not_force_invented_attribution(fake_ai):
