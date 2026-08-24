@@ -149,15 +149,20 @@ def _canonical_number(sign, value, scale, percent):
     if "." in value:
         value = value.rstrip("0").rstrip(".")
     suffix = _NUMBER_SCALES.get((scale or "").lower(), "")
-    prefix = "-" if sign in {"-", "\u2212"} else ""
+    if sign in {"-", "\u2212"}:
+        prefix = "-"
+    elif sign == "+":
+        prefix = "+"
+    else:
+        prefix = ""
     return prefix + value + suffix + ("%" if percent else "")
 
 
-def _numeric_tokens(value):
+def numeric_occurrences(value):
     if not isinstance(value, str):
-        return set()
+        return ()
     matches = list(_NUMBER_RE.finditer(value))
-    tokens = set()
+    tokens = []
     for index, match in enumerate(matches):
         scale = match.group("scale")
         percent = match.group("percent")
@@ -167,13 +172,21 @@ def _numeric_tokens(value):
             if _RANGE_SEPARATOR_RE.fullmatch(between):
                 scale = scale or following.group("scale")
                 percent = percent or following.group("percent")
-        tokens.add(_canonical_number(
+        tokens.append(_canonical_number(
             match.group("sign"),
             match.group("value"),
             scale,
             percent,
         ))
-    return tokens
+    return tuple(tokens)
+
+
+def numeric_tokens(value):
+    """Return canonical signed numeric facts found in English or Italian text."""
+    return set(numeric_occurrences(value))
+
+
+_numeric_tokens = numeric_tokens
 
 
 def _metadata_numeric_tokens(value):
