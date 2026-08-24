@@ -81,6 +81,16 @@ class FakeNewsFetcher:
         return list(self.articles)
 
 
+class FakeEditorialFeedClient:
+    def __init__(self):
+        self.records = []
+        self.calls = 0
+
+    def fetch(self):
+        self.calls += 1
+        return list(self.records)
+
+
 class FakeXClient:
     """No-network X boundary for orchestration tests."""
 

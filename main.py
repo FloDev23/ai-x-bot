@@ -36,6 +36,7 @@ from modules.analytics import PerformanceAnalyzer
 from modules.content_planner import ContentPlanner
 from modules.database import Database
 from modules.draft_pipeline import DraftPipeline
+from modules.editorial_feed import FlexDropinEditorialFeedClient
 from modules.fact_guard import FactGuard
 from modules.growth_discovery import GrowthDiscovery
 from modules.lead_finder import LeadFinder
@@ -46,6 +47,11 @@ from modules.notifier import TelegramNotifier
 from modules.publisher import PublishResult, Publisher
 from modules.scoring import TweetScorer
 from modules.source_ingestion import SourceIngestor
+from modules.source_refresh import (
+    SourceRefreshChannel,
+    SourceRefreshCoordinator,
+    SourceRefreshResult,
+)
 from modules.telegram_api import TELEGRAM_POLL_TIMEOUT, TelegramApi
 from modules.telegram_controller import TelegramController
 from modules.twitter_client import TwitterClient
@@ -72,6 +78,7 @@ class FlexDropinGrowthAgent:
         "draft_lead_minutes",
         "draft_pipeline",
         "dry_run",
+        "editorial_feed_client",
         "fact_guard",
         "generator",
         "growth_discovery",
@@ -89,6 +96,7 @@ class FlexDropinGrowthAgent:
         "scheduler",
         "scorer",
         "source_ingestor",
+        "source_refresh",
         "telegram_api",
         "telegram_bot_token",
         "telegram_controller",
@@ -98,6 +106,7 @@ class FlexDropinGrowthAgent:
     })
     _REQUIRED_INJECTED_BOUNDARIES = frozenset({
         "db",
+        "editorial_feed_client",
         "generator",
         "lead_finder",
         "news_fetcher",
@@ -184,6 +193,10 @@ class FlexDropinGrowthAgent:
         )
 
         self.news_fetcher = resolve("news_fetcher", NewsFetcher)
+        self.editorial_feed_client = resolve(
+            "editorial_feed_client",
+            self._build_editorial_feed_client,
+        )
         self.ai_generator = resolve("generator", AIGenerator)
         self.twitter_client = resolve("x_client", TwitterClient)
         self.scorer = resolve(
@@ -207,6 +220,14 @@ class FlexDropinGrowthAgent:
                 self.db,
                 self.news_fetcher,
                 trusted_domains=trusted_domains,
+            ),
+        )
+        self.source_refresh = resolve(
+            "source_refresh",
+            lambda: SourceRefreshCoordinator(
+                self.db,
+                self.editorial_feed_client,
+                self.source_ingestor,
             ),
         )
         self.fact_guard = resolve(
@@ -298,6 +319,12 @@ class FlexDropinGrowthAgent:
         self._scheduler_started = False
 
     @staticmethod
+    def _build_editorial_feed_client():
+        import requests
+
+        return FlexDropinEditorialFeedClient(requests)
+
+    @staticmethod
     def _slot_parts(slot_time):
         if not isinstance(slot_time, str):
             raise ValueError("slot time must use HH:MM")
@@ -334,15 +361,50 @@ class FlexDropinGrowthAgent:
         logger.error("%s failed: %s", operation, type(error).__name__)
         self.notifier.notify_error(operation, error)
 
-    def refresh_verified_news_cycle(self):
+    def refresh_sources_cycle(self):
         try:
-            return self.source_ingestor.refresh_verified_news(
+            result = self.source_refresh.refresh(
                 SEARCH_TOPICS,
                 per_topic=1,
             )
-        except Exception as error:
-            self._notify_error("cycle", error)
-            return 0
+            if (
+                type(result) is not SourceRefreshResult
+                or type(result.blog) is not SourceRefreshChannel
+                or type(result.news) is not SourceRefreshChannel
+                or result.blog.error_code not in {"", "blog_refresh_failed"}
+                or result.news.error_code
+                not in {"", "external_news_refresh_failed"}
+                or any(
+                    type(value) is not int or value < 0 or value > 1_000_000
+                    for channel in (result.blog, result.news)
+                    for value in (
+                        channel.inserted,
+                        channel.updated,
+                        channel.unchanged,
+                    )
+                )
+            ):
+                raise ValueError("invalid source refresh result")
+        except Exception:
+            safe_error = RuntimeError("source_refresh_failed")
+            self._notify_error("source_refresh_cycle", safe_error)
+            return SourceRefreshResult(
+                blog=SourceRefreshChannel(error_code="blog_refresh_failed"),
+                news=SourceRefreshChannel(
+                    error_code="external_news_refresh_failed",
+                ),
+            )
+
+        for channel, operation in (
+            (result.blog, "blog_source_refresh"),
+            (result.news, "external_news_source_refresh"),
+        ):
+            if channel.error_code:
+                self._notify_error(
+                    operation,
+                    RuntimeError(channel.error_code),
+                )
+        return result
 
     def create_draft_cycle(self, intended_slot_time, now=None):
         try:
@@ -468,9 +530,9 @@ class FlexDropinGrowthAgent:
     def register_jobs(self):
         """Register the complete allowlisted schedule, and nothing else."""
         self._add_cron_job(
-            self.refresh_verified_news_cycle,
-            job_id="verified_news_refresh",
-            name="Verified news refresh",
+            self.refresh_sources_cycle,
+            job_id="source_refresh",
+            name="Editorial source refresh",
             hour=10,
             minute=30,
         )

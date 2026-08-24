@@ -9,8 +9,10 @@ import config
 import main
 from main import FlexDropinGrowthAgent
 from modules.database import Database
+from modules.source_refresh import SourceRefreshChannel, SourceRefreshResult
 from tests.fakes import (
     FakeEditorialScorer,
+    FakeEditorialFeedClient,
     FakeGroundedGenerator,
     FakeNewsFetcher,
     FakeScheduler,
@@ -45,6 +47,24 @@ class FalseyProxy:
 
     def __getattr__(self, name):
         return getattr(self.target, name)
+
+
+class FakeSourceRefresh:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def refresh(self, topics, per_topic=1):
+        self.calls.append((list(topics), per_topic))
+        return self.result
+
+
+class RecordingNotifier:
+    def __init__(self):
+        self.errors = []
+
+    def notify_error(self, operation, error):
+        self.errors.append((operation, str(error)))
 
 
 class CandidateGenerator(FakeGroundedGenerator):
@@ -107,6 +127,7 @@ def dependency_bundle(tmp_path, **overrides):
         "generator": FakeGroundedGenerator(),
         "scorer": FakeEditorialScorer(),
         "news_fetcher": FakeNewsFetcher(),
+        "editorial_feed_client": FakeEditorialFeedClient(),
         "scheduler": FakeScheduler(),
         "lead_finder": NoopLeadFinder(),
         "lead_cycle_times": ("10:00", "16:00"),
@@ -376,7 +397,7 @@ def test_register_jobs_uses_rome_timezone_and_only_safe_jobs(agent_and_fakes):
     jobs = agent.register_jobs()
 
     assert {job.id for job in jobs} == {
-        "verified_news_refresh",
+        "source_refresh",
         "draft_14:00",
         "draft_20:00",
         "publish_14:00",
@@ -396,7 +417,7 @@ def test_register_jobs_uses_rome_timezone_and_only_safe_jobs(agent_and_fakes):
         for job in jobs
     }
     assert schedule == {
-        "verified_news_refresh": ("*", "10", "30"),
+        "source_refresh": ("*", "10", "30"),
         "draft_14:00": ("*", "12", "0"),
         "draft_20:00": ("*", "18", "0"),
         "publish_14:00": ("*", "14", "0"),
@@ -410,6 +431,109 @@ def test_register_jobs_uses_rome_timezone_and_only_safe_jobs(agent_and_fakes):
         ("engagement_", "follow_", "unfollow_", "human_", "build_")
     ) for job in jobs)
     assert fakes["scheduler"].get_jobs() == jobs
+    source_job = next(job for job in jobs if job.id == "source_refresh")
+    assert source_job.name == "Editorial source refresh"
+    assert str(source_job.trigger.timezone) == "Europe/Rome"
+    assert source_job.trigger.fields[5].expressions[0].first == 10
+    assert source_job.trigger.fields[6].expressions[0].first == 30
+    assert not any(job.id == "verified_news_refresh" for job in jobs)
+
+
+@pytest.mark.parametrize(
+    ("blog_error", "news_error", "expected"),
+    [
+        ("", "", []),
+        ("blog_refresh_failed", "", ["blog_source_refresh"]),
+        ("", "external_news_refresh_failed", ["external_news_source_refresh"]),
+        (
+            "blog_refresh_failed",
+            "external_news_refresh_failed",
+            ["blog_source_refresh", "external_news_source_refresh"],
+        ),
+    ],
+)
+def test_source_refresh_cycle_is_quiet_on_success_and_notifies_per_failed_channel(
+    tmp_path,
+    blog_error,
+    news_error,
+    expected,
+):
+    result = SourceRefreshResult(
+        blog=SourceRefreshChannel(
+            inserted=1 if not blog_error else 0,
+            error_code=blog_error,
+        ),
+        news=SourceRefreshChannel(
+            inserted=2 if not news_error else 0,
+            error_code=news_error,
+        ),
+    )
+    refresh = FakeSourceRefresh(result)
+    notifier = RecordingNotifier()
+    dependencies = dependency_bundle(
+        tmp_path,
+        source_refresh=refresh,
+        notifier=notifier,
+    )
+    agent = FlexDropinGrowthAgent(dependencies)
+    messages_before = list(dependencies["telegram_api"].messages)
+
+    returned = agent.refresh_sources_cycle()
+
+    assert returned is result
+    assert refresh.calls == [(list(main.SEARCH_TOPICS), 1)]
+    assert [operation for operation, _message in notifier.errors] == expected
+    assert all(
+        message in {"blog_refresh_failed", "external_news_refresh_failed"}
+        for _operation, message in notifier.errors
+    )
+    assert dependencies["telegram_api"].messages == messages_before
+    assert agent.db.list_post_drafts() == []
+    assert dependencies["x_client"].posts == []
+
+
+def test_source_refresh_cycle_sanitizes_malformed_component_result(tmp_path):
+    refresh = FakeSourceRefresh({"payload": "SECRET_SOURCE_BODY"})
+    notifier = RecordingNotifier()
+    agent = FlexDropinGrowthAgent(dependency_bundle(
+        tmp_path,
+        source_refresh=refresh,
+        notifier=notifier,
+    ))
+
+    result = agent.refresh_sources_cycle()
+
+    assert result.blog.error_code == "blog_refresh_failed"
+    assert result.news.error_code == "external_news_refresh_failed"
+    assert notifier.errors == [
+        ("source_refresh_cycle", "source_refresh_failed"),
+    ]
+    assert "SECRET_SOURCE_BODY" not in repr(result)
+    assert "SECRET_SOURCE_BODY" not in repr(notifier.errors)
+
+
+def test_injected_agent_requires_editorial_feed_client_without_real_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    dependencies = dependency_bundle(tmp_path)
+    del dependencies["editorial_feed_client"]
+    constructed = []
+
+    def forbidden_client(*_args, **_kwargs):
+        constructed.append(True)
+        raise AssertionError("real HTTP client constructed")
+
+    monkeypatch.setattr(
+        main,
+        "FlexDropinEditorialFeedClient",
+        forbidden_client,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="editorial_feed_client"):
+        FlexDropinGrowthAgent(dependencies)
+    assert constructed == []
 
 
 def test_status_renders_scheduler_next_run_contract(agent_and_fakes):
@@ -423,7 +547,7 @@ def test_status_renders_scheduler_next_run_contract(agent_and_fakes):
     }) == "processed"
 
     rendered = fakes["telegram_api"].messages[-1][1]
-    assert "- Verified news refresh: 2026-08-11T10:30:00+02:00" in rendered
+    assert "- Editorial source refresh: 2026-08-11T10:30:00+02:00" in rendered
 
 
 def test_lead_jobs_are_registered_only_when_explicitly_enabled(tmp_path):
@@ -563,6 +687,7 @@ def test_partial_dependency_injection_fails_without_real_client_fallback(
         ("db", "db"),
         ("telegram_api", "telegram_api"),
         ("news_fetcher", "news_fetcher"),
+        ("editorial_feed_client", "editorial_feed_client"),
         ("generator", "ai_generator"),
         ("x_client", "twitter_client"),
         ("scorer", "scorer"),
@@ -587,6 +712,7 @@ def test_falsey_required_boundary_is_used_without_production_fallback(
         "Database",
         "TelegramApi",
         "NewsFetcher",
+        "FlexDropinEditorialFeedClient",
         "AIGenerator",
         "TwitterClient",
         "TweetScorer",
@@ -606,6 +732,7 @@ def test_falsey_required_boundary_is_used_without_production_fallback(
         ("notifier", "notifier"),
         ("planner", "content_planner"),
         ("source_ingestor", "source_ingestor"),
+        ("source_refresh", "source_refresh"),
         ("fact_guard", "fact_guard"),
         ("draft_pipeline", "draft_pipeline"),
         ("media_processor", "media_processor"),
