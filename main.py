@@ -22,6 +22,7 @@ from config import (
     LEAD_NOTIFY_MIN_SCORE,
     MEDIA_LIBRARY_DIR,
     MEDIA_MATCH_THRESHOLD,
+    MAX_LINKS_PER_WEEK,
     NEWS_TRUSTED_DOMAINS,
     OPPORTUNITY_CYCLE_TIMES,
     PUBLISH_GRACE_SECONDS,
@@ -212,6 +213,7 @@ class FlexDropinGrowthAgent:
             lambda: ContentPlanner(
                 self.db,
                 timezone_name=self.timezone_name,
+                max_links_per_week=MAX_LINKS_PER_WEEK,
             ),
         )
         self.source_ingestor = resolve(

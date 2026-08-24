@@ -11,6 +11,7 @@ class FakeDatabase:
         self.sources = []
         self.drafts_today = 0
         self.links_last_days = 0
+        self.source_usage = {}
         self.added_sources = []
         self.telegram_updates = {}
         self.operational_mutations = []
@@ -23,9 +24,24 @@ class FakeDatabase:
         assert days == 30
         return dict(self.content_counts)
 
-    def count_links_last_days(self, days=7):
+    def count_links_last_days(self, days=7, now=None):
         assert days == 7
+        del now
         return self.links_last_days
+
+    def get_content_source_usage(self, source_ids, now=None):
+        del now
+        if self.source_usage is None:
+            return None
+        return {
+            source_id: {
+                "bound_to_live_draft": False,
+                "last_published_at": None,
+                "last_linked_at": None,
+                **self.source_usage.get(source_id, {}),
+            }
+            for source_id in source_ids
+        }
 
     def count_drafts_for_local_date(self, local_date, timezone_name):
         assert isinstance(local_date, date)

@@ -710,3 +710,112 @@ def test_regenerate_rejects_a_source_that_is_no_longer_eligible(
     assert json.loads(evaluation["details_json"]) == {
         "source_ids": [source_id]
     }
+
+
+def _insert_usage_draft(
+    db,
+    source_ids,
+    status,
+    key,
+    *,
+    published_tweet_id=None,
+):
+    with db._conn() as connection:
+        connection.execute("""
+            INSERT INTO post_drafts (
+                publication_key, text, category, source_ids_json,
+                score_json, intended_slot, status, published_tweet_id,
+                created_at, updated_at
+            ) VALUES (?, 'Draft.', 'gym_strategy', ?, '{}', ?, ?, ?, ?, ?)
+        """, (
+            key,
+            json.dumps(source_ids),
+            f"2026-09-{source_ids[0]:02d}T12:00:00+00:00",
+            status,
+            published_tweet_id,
+            "2026-07-01T09:00:00+00:00",
+            "2026-07-01T09:00:00+00:00",
+        ))
+
+
+def test_source_usage_tracks_live_bindings_and_canonical_publications(tmp_path):
+    database = Database(tmp_path / "usage.db")
+    source_ids = [_source(database) for _index in range(9)]
+    live_statuses = (
+        "pending_approval",
+        "approved",
+        "publishing",
+        "publication_unknown",
+    )
+    for index, status in enumerate(live_statuses):
+        _insert_usage_draft(database, [source_ids[index]], status, f"live-{index}")
+    for offset, status in enumerate(
+        ("rejected", "expired", "discarded", "publication_failed"),
+        start=4,
+    ):
+        _insert_usage_draft(database, [source_ids[offset]], status, f"old-{offset}")
+    _insert_usage_draft(
+        database,
+        [source_ids[8]],
+        "published",
+        "published",
+        published_tweet_id="9001",
+    )
+    with database._conn() as connection:
+        connection.execute("""
+            INSERT INTO posted_tweets (
+                tweet_id, text, category, topic, has_link, created_at
+            ) VALUES ('9001', 'Published.', 'gym_strategy', '', 1, ?)
+        """, ("2026-07-01T10:00:00+00:00",))
+
+    usage = database.get_content_source_usage(
+        source_ids,
+        now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    )
+
+    for source_id in source_ids[:4]:
+        assert usage[source_id]["bound_to_live_draft"] is True
+    for source_id in source_ids[4:]:
+        assert usage[source_id]["bound_to_live_draft"] is False
+    assert usage[source_ids[8]] == {
+        "bound_to_live_draft": False,
+        "last_published_at": "2026-07-01T10:00:00+00:00",
+        "last_linked_at": "2026-07-01T10:00:00+00:00",
+    }
+    assert usage[source_ids[4]] == {
+        "bound_to_live_draft": False,
+        "last_published_at": None,
+        "last_linked_at": None,
+    }
+
+
+def test_source_usage_fails_closed_on_malformed_source_ids_json(tmp_path):
+    database = Database(tmp_path / "malformed-usage.db")
+    source_id = _source(database)
+    _insert_usage_draft(database, [source_id], "rejected", "malformed")
+    with database._conn() as connection:
+        connection.execute(
+            "UPDATE post_drafts SET source_ids_json = '[true]' "
+            "WHERE publication_key = 'malformed'"
+        )
+
+    assert database.get_content_source_usage([source_id]) is None
+
+
+def test_count_links_last_days_uses_injected_clock(tmp_path):
+    database = Database(tmp_path / "link-count.db")
+    with database._conn() as connection:
+        for tweet_id, created_at in (
+            ("old", "2026-08-16T12:00:00+00:00"),
+            ("recent", "2026-08-18T12:00:00+00:00"),
+        ):
+            connection.execute("""
+                INSERT INTO posted_tweets (
+                    tweet_id, text, category, topic, has_link, created_at
+                ) VALUES (?, 'Published.', 'gym_strategy', '', 1, ?)
+            """, (tweet_id, created_at))
+
+    assert database.count_links_last_days(
+        7,
+        now=datetime(2026, 8, 24, 12, tzinfo=timezone.utc),
+    ) == 1

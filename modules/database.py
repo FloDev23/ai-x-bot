@@ -679,13 +679,29 @@ class Database:
             """, (since, limit)).fetchall()
             return [f"{r['category']}: {r['topic'] or r['text'][:60]}" for r in rows]
 
-    def count_links_last_days(self, days: int = 7) -> int:
-        since = (datetime.now() - timedelta(days=days)).isoformat()
+    def count_links_last_days(
+        self,
+        days: int = 7,
+        now: Optional[datetime] = None,
+    ) -> int:
+        if type(days) is not int or days <= 0:
+            return 0
+        current = self._as_utc(now or datetime.now(timezone.utc))
+        since = current - timedelta(days=days)
         with self._conn() as conn:
-            row = conn.execute("""
-                SELECT COUNT(*) as c FROM posted_tweets WHERE has_link = 1 AND created_at >= ?
-            """, (since,)).fetchone()
-            return row['c'] if row else 0
+            rows = conn.execute("""
+                SELECT created_at FROM posted_tweets WHERE has_link = 1
+            """).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                created_at = self._parse_datetime(row["created_at"])
+            except (TypeError, ValueError):
+                count += 1
+                continue
+            if created_at >= since:
+                count += 1
+        return count
 
     def last_post_had_link(self) -> bool:
         with self._conn() as conn:
@@ -1219,6 +1235,116 @@ class Database:
                 "SELECT 1 FROM content_sources WHERE url = ? LIMIT 1", (url,)
             ).fetchone()
             return row is not None
+
+    def get_content_source_usage(
+        self,
+        source_ids: List[int],
+        now: Optional[datetime] = None,
+    ) -> Optional[Dict[int, Dict]]:
+        """Return fail-closed live/publication usage for requested sources."""
+        if (
+            type(source_ids) is not list
+            or any(
+                type(source_id) is not int or source_id <= 0
+                for source_id in source_ids
+            )
+        ):
+            return None
+        unique_source_ids = list(dict.fromkeys(source_ids))
+        current = self._as_utc(now or datetime.now(timezone.utc))
+        usage = {
+            source_id: {
+                "bound_to_live_draft": False,
+                "last_published_at": None,
+                "last_linked_at": None,
+            }
+            for source_id in unique_source_ids
+        }
+        if not usage:
+            return usage
+
+        with self._conn() as conn:
+            drafts = conn.execute("""
+                SELECT source_ids_json, status, published_tweet_id
+                FROM post_drafts
+            """).fetchall()
+            tweets = conn.execute("""
+                SELECT tweet_id, has_link, created_at FROM posted_tweets
+            """).fetchall()
+
+        tweets_by_id = {}
+        for tweet in tweets:
+            tweet_id = tweet["tweet_id"]
+            if not isinstance(tweet_id, str) or not tweet_id.strip():
+                continue
+            if tweet_id in tweets_by_id:
+                return None
+            tweets_by_id[tweet_id] = tweet
+
+        live_statuses = frozenset({
+            "pending_approval",
+            "approved",
+            "publishing",
+            "publication_unknown",
+        })
+        requested = set(unique_source_ids)
+        for draft in drafts:
+            try:
+                decoded_ids = json.loads(draft["source_ids_json"])
+            except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+                return None
+            if (
+                type(decoded_ids) is not list
+                or not decoded_ids
+                or any(
+                    type(source_id) is not int or source_id <= 0
+                    for source_id in decoded_ids
+                )
+                or len(set(decoded_ids)) != len(decoded_ids)
+            ):
+                return None
+            relevant_ids = requested.intersection(decoded_ids)
+            if not relevant_ids:
+                continue
+            status = draft["status"]
+            if status in live_statuses:
+                for source_id in relevant_ids:
+                    usage[source_id]["bound_to_live_draft"] = True
+                continue
+            if status != "published":
+                continue
+
+            published_tweet_id = draft["published_tweet_id"]
+            if (
+                not isinstance(published_tweet_id, str)
+                or not published_tweet_id.strip()
+            ):
+                return None
+            tweet = tweets_by_id.get(published_tweet_id)
+            if tweet is None:
+                return None
+            try:
+                published_at = self._parse_datetime(tweet["created_at"])
+            except (TypeError, ValueError):
+                return None
+            if published_at > current:
+                return None
+            published_iso = published_at.isoformat()
+            for source_id in relevant_ids:
+                prior_published = usage[source_id]["last_published_at"]
+                if (
+                    prior_published is None
+                    or published_at > self._parse_datetime(prior_published)
+                ):
+                    usage[source_id]["last_published_at"] = published_iso
+                if tweet["has_link"] == 1:
+                    prior_linked = usage[source_id]["last_linked_at"]
+                    if (
+                        prior_linked is None
+                        or published_at > self._parse_datetime(prior_linked)
+                    ):
+                        usage[source_id]["last_linked_at"] = published_iso
+        return usage
 
     # ---------- Post drafts ----------
 
