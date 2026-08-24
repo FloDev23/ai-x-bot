@@ -177,16 +177,30 @@ class QueueReplenisher:
         self,
         now: datetime,
         limit: int = 3,
+        draft_id: Optional[int] = None,
     ) -> list[int]:
-        if _aware_utc(now) is None or type(limit) is not int or not 1 <= limit <= 20:
+        if (
+            _aware_utc(now) is None
+            or type(limit) is not int
+            or not 1 <= limit <= 20
+            or (
+                draft_id is not None
+                and (type(draft_id) is not int or draft_id <= 0)
+            )
+        ):
             return []
+        requested_draft_id = draft_id
         ready_ids = []
         attempts = 0
         try:
-            drafts = self.db.list_post_drafts(
-                ["pending_approval", "approved"],
-                limit=100,
-            )
+            if requested_draft_id is not None:
+                requested = self.db.get_queue_draft(requested_draft_id)
+                drafts = [requested] if requested is not None else []
+            else:
+                drafts = self.db.list_post_drafts(
+                    ["pending_approval", "approved"],
+                    limit=100,
+                )
         except Exception as error:
             logger.error(
                 "translation_retry_list_failed error_type=%s",
@@ -197,6 +211,11 @@ class QueueReplenisher:
             if attempts >= limit:
                 break
             draft_id = draft.get("id") if isinstance(draft, dict) else None
+            if (
+                requested_draft_id is not None
+                and draft_id != requested_draft_id
+            ):
+                continue
             queued = self.db.get_queue_draft(draft_id) if type(draft_id) is int else None
             if not queued or queued.get("translation_status") not in {
                 "pending", "failed", "invalidated",

@@ -9,8 +9,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
-from config import DRY_RUN, NEWS_TRUSTED_DOMAINS
+from config import (
+    APPROVED_QUEUE_TARGET,
+    AUDIENCE_TIMEZONE,
+    DRY_RUN,
+    NEWS_TRUSTED_DOMAINS,
+    POSTS_PER_DAY,
+)
 from modules.media_store import open_verified_media
 from modules.telegram_api import (
     TELEGRAM_CAPTION_MAX_CHARS,
@@ -71,6 +78,7 @@ class TelegramController:
         media_matcher=None,
         analytics=None,
         scheduler_status=None,
+        queue_service=None,
         dry_run: Optional[bool] = None,
         now_fn=None,
         news_trusted_domains=None,
@@ -86,6 +94,7 @@ class TelegramController:
         self.media_matcher = media_matcher
         self.analytics = analytics
         self.scheduler_status = scheduler_status
+        self.queue_service = queue_service
         self.dry_run = DRY_RUN if dry_run is None else bool(dry_run)
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         domains = NEWS_TRUSTED_DOMAINS if news_trusted_domains is None else news_trusted_domains
@@ -274,6 +283,9 @@ class TelegramController:
             "Stato",
             f"dry-run: {'attivo' if self.dry_run else 'disattivo'}",
             f"pausa: {'attiva' if paused else 'disattiva'}",
+            f"coda approvata target: {APPROVED_QUEUE_TARGET}",
+            f"pubblicazioni target: {POSTS_PER_DAY} al giorno",
+            f"pubblico: Stati Uniti ({AUDIENCE_TIMEZONE})",
         ]
         jobs = []
         if callable(self.scheduler_status):
@@ -296,8 +308,38 @@ class TelegramController:
         self._send(chat_id, "\n".join(lines))
         return "status"
 
-    def _draft_markup(self, draft_id: int):
+    def _draft_markup(
+        self,
+        draft_id: int,
+        *,
+        queue_status: Optional[str] = None,
+    ):
         prefix = str(draft_id)
+        if queue_status is not None and queue_status != "ready":
+            return self._callback_markup([
+                [self._callback_button(
+                    "Riprova traduzione",
+                    f"draft:retry_translation:{prefix}",
+                )],
+                [
+                    self._callback_button("Modifica", f"draft:edit:{prefix}"),
+                    self._callback_button("Rigenera", f"draft:regen:{prefix}"),
+                ],
+                [self._callback_button("Scarta", f"draft:discard:{prefix}")],
+            ])
+        if queue_status == "ready":
+            return self._callback_markup([
+                [
+                    self._callback_button("Approva", f"draft:approve:{prefix}"),
+                    self._callback_button("Rigenera", f"draft:regen:{prefix}"),
+                ],
+                [
+                    self._callback_button("Modifica", f"draft:edit:{prefix}"),
+                    self._callback_button("Scegli media", f"draft:media:{prefix}"),
+                ],
+                [self._callback_button("Solo testo", f"draft:textonly:{prefix}")],
+                [self._callback_button("Scarta", f"draft:discard:{prefix}")],
+            ])
         return self._callback_markup([
             [
                 self._callback_button("Approva", f"draft:approve:{prefix}"),
@@ -331,6 +373,8 @@ class TelegramController:
                 if detail:
                     label += f" ({detail})"
             source_labels.append(label)
+            if len(source_labels) >= 3:
+                break
         score = draft.get("score_data") or {}
         score_parts = []
         if isinstance(score, dict):
@@ -348,27 +392,72 @@ class TelegramController:
                 description = self._clean_text(media.get("ai_description"), 240)
                 if description:
                     media_label += f" — {description}"
-        text = draft.get("text") if isinstance(draft.get("text"), str) else ""
+        scheduled_for = draft.get("scheduled_for")
+        planning_label = "non ancora pianificato"
+        if isinstance(scheduled_for, str):
+            try:
+                scheduled = datetime.fromisoformat(scheduled_for.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                scheduled = None
+            if scheduled is not None and scheduled.tzinfo is not None:
+                et = scheduled.astimezone(ZoneInfo(AUDIENCE_TIMEZONE))
+                rome = scheduled.astimezone(ZoneInfo("Europe/Rome"))
+                planning_label = (
+                    f"{et.strftime('%Y-%m-%d %H:%M %Z')} / "
+                    f"{rome.strftime('%Y-%m-%d %H:%M %Z')}"
+                )
+        elif type(draft.get("queue_position")) is int:
+            planning_label = f"in coda, posizione {draft['queue_position']}"
         fields = [
             ("Bozza #", draft.get("id")),
             ("stato: ", self._clean_text(draft.get("status"), 40) or "sconosciuto"),
             ("categoria: ", self._clean_text(draft.get("category"), 100) or "n/d"),
-            ("slot: ", self._clean_text(draft.get("intended_slot"), 100) or "n/d"),
-            ("fonti: ", ", ".join(source_labels) if source_labels else "nessuna"),
+            ("pianificazione: ", planning_label),
+            ("fonti: ", ", ".join(source_labels[:3]) if source_labels else "nessuna"),
             ("score: ", ", ".join(score_parts) if score_parts else "n/d"),
             ("media: ", media_label),
         ]
-        post_section = "\n\n" + text
-        metadata = self._fit_labeled_lines(
-            fields,
-            TELEGRAM_MESSAGE_MAX_CHARS - len(post_section),
-        )
-        return metadata + post_section
+        return self._fit_labeled_lines(fields, TELEGRAM_MESSAGE_MAX_CHARS)
+
+    def _send_complete_section(self, chat_id: str, label: str, body: str):
+        if not isinstance(body, str) or not body:
+            return
+        prefix = label + "\n\n"
+        first_size = TELEGRAM_MESSAGE_MAX_CHARS - len(prefix)
+        self._send(chat_id, prefix + body[:first_size])
+        offset = first_size
+        while offset < len(body):
+            self._send(chat_id, body[offset:offset + TELEGRAM_MESSAGE_MAX_CHARS])
+            offset += TELEGRAM_MESSAGE_MAX_CHARS
 
     def _send_draft_card(self, chat_id: str, draft: Dict[str, Any]):
         draft_id = draft.get("id")
-        markup = self._draft_markup(draft_id) if type(draft_id) is int else None
+        queue_status = (
+            draft.get("translation_status")
+            if "translation_status" in draft
+            else None
+        )
+        markup = (
+            self._draft_markup(draft_id, queue_status=queue_status)
+            if type(draft_id) is int
+            else None
+        )
         self._send_draft_preview(chat_id, draft)
+        text = draft.get("text") if isinstance(draft.get("text"), str) else ""
+        self._send_complete_section(chat_id, "Tweet da pubblicare", text)
+        translation = draft.get("translation_it")
+        if queue_status == "ready" and isinstance(translation, str):
+            self._send_complete_section(
+                chat_id,
+                "Traduzione italiana — solo per revisione",
+                translation,
+            )
+        elif queue_status is not None:
+            self._send(
+                chat_id,
+                "Traduzione italiana — solo per revisione\n\n"
+                "Non ancora disponibile.",
+            )
         self._send(chat_id, self._draft_card_text(draft), reply_markup=markup)
 
     @staticmethod
@@ -437,15 +526,41 @@ class TelegramController:
         approved = self.db.list_post_drafts(["approved"], limit=50)
         scheduled = self.db.list_post_drafts(["publishing"], limit=50)
         published = self.db.list_post_drafts(["published"], limit=5)
-        self._send(
-            chat_id,
-            "Post\n"
-            f"in attesa: {len(pending)}\n"
-            f"approvati: {len(approved)}\n"
-            f"programmati: {len(scheduled)}\n"
-            f"pubblicati recenti: {len(published)}",
-        )
+        try:
+            local_date = self._now().astimezone(ZoneInfo("Europe/Rome")).date()
+            counts = self.db.get_queue_counts(local_date, "Europe/Rome")
+        except Exception:
+            counts = None
+        if isinstance(counts, dict):
+            summary = (
+                "Post\n"
+                f"traduzione in attesa: {counts.get('awaiting_translation', 0)}\n"
+                f"revisione in attesa: {counts.get('awaiting_review', 0)}\n"
+                f"approvati disponibili: {counts.get('approved_available', 0)}\n"
+                f"pianificati oggi: {counts.get('planned_today', 0)}\n"
+                f"bloccati: {counts.get('blocked', 0)}\n"
+                f"pubblicati recenti: {len(published)}"
+            )
+        else:
+            summary = (
+                "Post\n"
+                f"in attesa: {len(pending)}\n"
+                f"approvati: {len(approved)}\n"
+                f"programmati: {len(scheduled)}\n"
+                f"pubblicati recenti: {len(published)}"
+            )
+        self._send(chat_id, summary)
+        details = []
+        seen = set()
         for draft in pending + approved + scheduled + published:
+            draft_id = draft.get("id") if isinstance(draft, dict) else None
+            if type(draft_id) is not int or draft_id in seen:
+                continue
+            seen.add(draft_id)
+            details.append(self.db.get_queue_draft(draft_id) or draft)
+            if len(details) >= 50:
+                break
+        for draft in details:
             self._send_draft_card(chat_id, draft)
         return "posts"
 
@@ -947,6 +1062,24 @@ class TelegramController:
             if not isinstance(replacement, dict):
                 self._send(chat_id, "Modifica respinta dai controlli editoriali.")
                 return "draft_edit_rejected"
+            replacement = self.db.get_queue_draft(replacement.get("id")) or replacement
+            if (
+                replacement.get("translation_status") not in {None, "ready"}
+                and self.queue_service is not None
+            ):
+                try:
+                    self.queue_service.retry_pending_translations(
+                        self._now(), limit=1, draft_id=replacement.get("id"),
+                    )
+                except Exception:
+                    pass
+                replacement = self.db.get_queue_draft(replacement.get("id")) or replacement
+            if replacement.get("translation_status") not in {None, "ready"}:
+                self._send(
+                    chat_id,
+                    "Modifica validata; traduzione ancora in preparazione.",
+                )
+                return "draft_edited"
             self._send(chat_id, "Modifica validata; nuova bozza in approvazione.")
             self._send_draft_card(chat_id, replacement)
             return "draft_edited"
@@ -1026,10 +1159,21 @@ class TelegramController:
             self._send(chat_id, "Pipeline bozze non disponibile.")
             return "draft_unavailable"
         if action == "approve":
-            approved = self.draft_pipeline.approve(draft_id, "floriano")
-            draft = self.db.get_post_draft(draft_id)
+            queued = self.db.get_queue_draft(draft_id)
+            if queued is not None:
+                approve_queue = getattr(self.draft_pipeline, "approve_queue", None)
+                approved = bool(
+                    callable(approve_queue)
+                    and approve_queue(draft_id, "floriano")
+                )
+            else:
+                approved = self.draft_pipeline.approve(draft_id, "floriano")
+            draft = self.db.get_queue_draft(draft_id) or self.db.get_post_draft(draft_id)
             if approved:
-                self._send(chat_id, "Bozza approvata per lo slot previsto.")
+                self._send(
+                    chat_id,
+                    "Bozza approvata: entrerà nella pianificazione automatica.",
+                )
                 return "draft_approved"
             if draft and draft.get("status") == "expired":
                 self._send(
@@ -1044,11 +1188,53 @@ class TelegramController:
                 return "draft_expired"
             self._send(chat_id, "Approvazione non disponibile.")
             return "draft_approve_rejected"
+        if action == "retry_translation":
+            if self.queue_service is None:
+                self._send(chat_id, "Servizio traduzione non disponibile.")
+                return "translation_unavailable"
+            queued = self.db.get_queue_draft(draft_id)
+            if not queued or queued.get("status") not in {
+                "pending_approval", "approved",
+            }:
+                self._send(chat_id, "Bozza non traducibile.")
+                return "translation_rejected"
+            try:
+                self.queue_service.retry_pending_translations(
+                    self._now(), limit=1, draft_id=draft_id,
+                )
+            except Exception:
+                self._send(chat_id, "Traduzione non riuscita. Riprova più tardi.")
+                return "translation_failed"
+            refreshed = self.db.get_queue_draft(draft_id)
+            if not refreshed or refreshed.get("translation_status") != "ready":
+                self._send(chat_id, "Traduzione non riuscita. Riprova più tardi.")
+                return "translation_failed"
+            self._send(chat_id, "Traduzione pronta per la revisione.")
+            self._send_draft_card(chat_id, refreshed)
+            return "translation_ready"
         if action == "regen":
             replacement = self.draft_pipeline.regenerate(draft_id)
             if not isinstance(replacement, dict):
                 self._send(chat_id, "Rigenerazione non riuscita.")
                 return "draft_regen_rejected"
+            replacement = self.db.get_queue_draft(replacement.get("id")) or replacement
+            if (
+                replacement.get("translation_status") not in {None, "ready"}
+                and self.queue_service is not None
+            ):
+                try:
+                    self.queue_service.retry_pending_translations(
+                        self._now(), limit=1, draft_id=replacement.get("id"),
+                    )
+                except Exception:
+                    pass
+                replacement = self.db.get_queue_draft(replacement.get("id")) or replacement
+            if replacement.get("translation_status") not in {None, "ready"}:
+                self._send(
+                    chat_id,
+                    "Nuova bozza generata; traduzione ancora in preparazione.",
+                )
+                return "draft_regenerated"
             self._send(chat_id, "Nuova bozza generata.")
             self._send_draft_card(chat_id, replacement)
             return "draft_regenerated"

@@ -243,7 +243,10 @@ def test_automatic_sources_create_one_grounded_card_without_x_write(tmp_path):
         if source["source_type"] == "owned_blog_article"
     )]
     assert draft["score_data"]["total"] >= 70
-    assert len(dependencies["telegram_api"].messages) == 1
+    assert sum(
+        message[2].get("reply_markup") is not None
+        for message in dependencies["telegram_api"].messages
+    ) == 1
     assert dependencies["x_client"].posts == []
     assert dependencies["x_client"].engagement_writes == []
 
@@ -253,7 +256,10 @@ def test_automatic_sources_create_one_grounded_card_without_x_write(tmp_path):
     assert second.news.inserted == 0
     assert len(agent.db.get_eligible_sources()) == 2
     assert len(agent.db.list_post_drafts()) == before_drafts
-    assert len(dependencies["telegram_api"].messages) == 1
+    assert sum(
+        message[2].get("reply_markup") is not None
+        for message in dependencies["telegram_api"].messages
+    ) == 1
     assert dependencies["x_client"].posts == []
 
 
@@ -338,7 +344,10 @@ def test_two_agents_refresh_and_draft_once_on_shared_sqlite(tmp_path):
     assert not [thread for thread in draft_threads if thread.is_alive()]
     assert len(draft_results) == 2
     assert len({draft["id"] for draft in draft_results}) == 1
-    assert len(telegram.messages) == 1
+    assert sum(
+        message[2].get("reply_markup") is not None
+        for message in telegram.messages
+    ) == 1
     assert all(client.posts == [] for client in x_clients)
 
 
@@ -364,8 +373,11 @@ def test_candidate_tournament_sends_one_winner_card_without_x_write(tmp_path):
     assert draft["text"] == winner_texts[1]
     assert draft["score_data"] == {"total": 94}
     assert winner_generator.candidate_indices == [0, 1, 2]
-    assert len(winner_messages) == 1
-    assert winner_texts[1] in winner_messages[0][1]
+    assert sum(
+        message[2].get("reply_markup") is not None
+        for message in winner_messages
+    ) == 1
+    assert any(winner_texts[1] in message[1] for message in winner_messages)
     assert winner_dependencies["x_client"].posts == []
 
 
@@ -422,10 +434,16 @@ def test_concurrent_agents_and_replay_send_one_card_for_shared_sqlite_draft(
     assert len(results) == 2
     assert all(result is not None for result in results)
     assert len({result["id"] for result in results}) == 1
-    assert len(telegram.messages) == 1
-    assert text in telegram.messages[0][1]
+    assert sum(
+        message[2].get("reply_markup") is not None
+        for message in telegram.messages
+    ) == 1
+    assert any(text in message[1] for message in telegram.messages)
     assert agents[0].create_draft_cycle("14:00", now=NOW)["id"] == results[0]["id"]
-    assert len(telegram.messages) == 1
+    assert sum(
+        message[2].get("reply_markup") is not None
+        for message in telegram.messages
+    ) == 1
     assert all(bundle["x_client"].posts == [] for bundle in dependencies)
     with setup._conn() as conn:
         assert conn.execute(
@@ -457,8 +475,14 @@ def test_candidate_tournament_accepts_exact_threshold_and_sends_one_card(
     assert draft["score_data"] == {"total": 70}
     assert draft["status"] == "pending_approval"
     assert generator.candidate_indices == [0, 1, 2]
-    assert len(dependencies["telegram_api"].messages) == 1
-    assert texts[1] in dependencies["telegram_api"].messages[0][1]
+    assert sum(
+        message[2].get("reply_markup") is not None
+        for message in dependencies["telegram_api"].messages
+    ) == 1
+    assert any(
+        texts[1] in message[1]
+        for message in dependencies["telegram_api"].messages
+    )
     assert dependencies["x_client"].posts == []
 
 

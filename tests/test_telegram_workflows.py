@@ -16,7 +16,11 @@ from modules.draft_pipeline import DraftPipeline
 from modules.fact_guard import FactCheckResult
 from modules.media_processor import MediaProcessor
 from modules.media_store import media_store_lock
-from modules.telegram_api import TelegramApi, telegram_media_metadata
+from modules.telegram_api import (
+    TELEGRAM_MESSAGE_MAX_CHARS,
+    TelegramApi,
+    telegram_media_metadata,
+)
 from modules.telegram_controller import TelegramController
 
 
@@ -105,6 +109,19 @@ class StubPipeline:
             draft_id, ["pending_approval"], "approved", approved_by=approved_by,
         )
 
+    def approve_queue(self, draft_id, approved_by):
+        self.calls.append(("approve_queue", draft_id, approved_by))
+        draft = self.db.get_queue_draft(draft_id)
+        if not draft:
+            return False
+        return self.db.approve_queued_draft_atomic(
+            draft_id,
+            draft["revision"],
+            draft["queue_revision"],
+            approved_by,
+            datetime.now(timezone.utc).isoformat(),
+        )
+
     def regenerate(self, draft_id):
         self.calls.append(("regen", draft_id))
         return self.db.get_post_draft(draft_id)
@@ -159,6 +176,29 @@ class StubAnalytics:
         }
 
 
+class StubQueueService:
+    def __init__(self, db, translation="Traduzione italiana pronta."):
+        self.db = db
+        self.translation = translation
+        self.calls = []
+
+    def retry_pending_translations(self, now, limit=3, draft_id=None):
+        self.calls.append((now, limit, draft_id))
+        ready = []
+        for draft in self.db.list_post_drafts(["pending_approval"], limit=50):
+            if draft_id is not None and draft["id"] != draft_id:
+                continue
+            queued = self.db.get_queue_draft(draft["id"])
+            if queued and queued["translation_status"] != "ready":
+                if self.db.save_review_translation(
+                    draft["id"], draft["revision"], self.translation,
+                ):
+                    ready.append(draft["id"])
+            if len(ready) >= limit:
+                break
+        return ready
+
+
 def message_update(update_id, text, chat_id=42):
     return {
         "update_id": update_id,
@@ -187,6 +227,7 @@ def workflow_controller(
     now=None,
     scheduler_status=None,
     trusted_domains=None,
+    queue_service=None,
 ):
     return TelegramController(
         telegram_api=telegram,
@@ -199,6 +240,7 @@ def workflow_controller(
         dry_run=True,
         now_fn=lambda: now or datetime(2029, 8, 15, tzinfo=timezone.utc),
         scheduler_status=scheduler_status,
+        queue_service=queue_service,
         news_trusted_domains=(
             {"news.example"} if trusted_domains is None else trusted_domains
         ),
@@ -220,6 +262,18 @@ def add_pending_draft(db, *, slot=FUTURE_SLOT, text="Old pending copy"):
         publication_key=f"telegram-test:{slot}:{text}",
     )
     return source_id, draft_id
+
+
+def ready_queue_draft(db, *, text="ENGLISH_SENTINEL"):
+    _source_id, draft_id = add_pending_draft(db, text=text)
+    queued = db.ensure_editorial_queue(draft_id)
+    assert queued is not None
+    assert db.save_review_translation(
+        draft_id,
+        queued["revision"],
+        "ITALIAN_SENTINEL",
+    )
+    return db.get_queue_draft(draft_id)
 
 
 _PREVIEW_JPEG = b"\xff\xd8\xff\xe0" + b"telegram-preview"
@@ -1002,11 +1056,14 @@ def test_posts_renders_complete_safe_draft_card_and_latest_published(tmp_path):
     assert "Complete <draft> & copy" in rendered
     assert "Already published" in rendered
     assert "founder_story" in rendered
-    assert FUTURE_SLOT in rendered
+    assert "non ancora pianificato" in rendered
     assert "total: 88" in rendered
     assert "founder_note" in rendered
     assert "studio.jpg" in rendered
-    card_kwargs = next(item[2] for item in telegram.messages if "Complete <draft>" in item[1])
+    card_kwargs = next(
+        item[2] for item in telegram.messages
+        if item[2].get("reply_markup") is not None
+    )
     assert card_kwargs["parse_mode"] is None
     callback_data = [
         button["callback_data"]
@@ -1022,6 +1079,219 @@ def test_posts_renders_complete_safe_draft_card_and_latest_published(tmp_path):
         f"draft:postpone:{draft_id}",
         f"draft:discard:{draft_id}",
     }
+
+
+def _callback_values(message):
+    markup = message[2].get("reply_markup") or {"inline_keyboard": []}
+    return {
+        button["callback_data"]
+        for row in markup["inline_keyboard"]
+        for button in row
+    }
+
+
+def test_queue_card_sends_complete_bilingual_copy_and_ready_controls(tmp_path):
+    db = Database(str(tmp_path / "bilingual-card.db"))
+    draft = ready_queue_draft(db)
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    controller._send_draft_card("42", draft)
+
+    joined = "\n".join(message[1] for message in telegram.messages)
+    assert "Tweet da pubblicare" in joined
+    assert "ENGLISH_SENTINEL" in joined
+    assert "Traduzione italiana — solo per revisione" in joined
+    assert "ITALIAN_SENTINEL" in joined
+    assert "non ancora pianificato" in joined
+    assert _callback_values(telegram.messages[-1]) == {
+        f"draft:approve:{draft['id']}",
+        f"draft:regen:{draft['id']}",
+        f"draft:edit:{draft['id']}",
+        f"draft:media:{draft['id']}",
+        f"draft:textonly:{draft['id']}",
+        f"draft:discard:{draft['id']}",
+    }
+
+
+@pytest.mark.parametrize("translation_status", ["pending", "failed"])
+def test_queue_card_without_translation_has_no_approval(
+    tmp_path, translation_status,
+):
+    db = Database(str(tmp_path / f"queue-{translation_status}.db"))
+    _source_id, draft_id = add_pending_draft(db, text="Complete English copy")
+    draft = db.ensure_editorial_queue(draft_id)
+    if translation_status == "failed":
+        with db._conn() as conn:
+            conn.execute(
+                "UPDATE editorial_queue SET translation_status = 'failed' "
+                "WHERE draft_id = ?",
+                (draft_id,),
+            )
+        draft = db.get_queue_draft(draft_id)
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    controller._send_draft_card("42", draft)
+
+    callbacks = _callback_values(telegram.messages[-1])
+    assert f"draft:approve:{draft_id}" not in callbacks
+    assert callbacks == {
+        f"draft:retry_translation:{draft_id}",
+        f"draft:regen:{draft_id}",
+        f"draft:edit:{draft_id}",
+        f"draft:discard:{draft_id}",
+    }
+    assert "Complete English copy" in "\n".join(
+        message[1] for message in telegram.messages
+    )
+
+
+def test_queue_retry_translation_and_approval_use_queue_boundaries(tmp_path):
+    db = Database(str(tmp_path / "queue-callbacks.db"))
+    _source_id, draft_id = add_pending_draft(db, text="English callback copy")
+    db.ensure_editorial_queue(draft_id)
+    pipeline = StubPipeline(db)
+    queue_service = StubQueueService(db, "Traduzione callback pronta.")
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(
+        db,
+        telegram,
+        pipeline=pipeline,
+        queue_service=queue_service,
+    )
+
+    assert controller.process_update(callback_update(
+        313, f"draft:retry_translation:{draft_id}",
+    )) == "processed"
+    assert len(queue_service.calls) == 1
+    assert queue_service.calls[0][1:] == (1, draft_id)
+    assert "Traduzione callback pronta." in "\n".join(
+        message[1] for message in telegram.messages
+    )
+    assert controller.process_update(callback_update(
+        314, f"draft:approve:{draft_id}",
+    )) == "processed"
+
+    assert ("approve_queue", draft_id, "floriano") in pipeline.calls
+    assert not any(call[0] == "approve" for call in pipeline.calls)
+    assert db.get_queue_draft(draft_id)["status"] == "approved"
+    with db._conn() as conn:
+        source_payload = "\n".join(
+            row[0] for row in conn.execute("SELECT text FROM content_sources")
+        )
+        evaluation_payload = "\n".join(
+            row[0] for row in conn.execute(
+                "SELECT details_json FROM draft_evaluations"
+            )
+        )
+    assert "Traduzione callback pronta." not in source_payload
+    assert "Traduzione callback pronta." not in evaluation_payload
+
+
+def test_forged_queue_approval_without_ready_translation_fails_closed(tmp_path):
+    db = Database(str(tmp_path / "queue-forged-approve.db"))
+    _source_id, draft_id = add_pending_draft(db, text="English only")
+    db.ensure_editorial_queue(draft_id)
+    pipeline = StubPipeline(db)
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=pipeline)
+
+    assert controller.process_update(callback_update(
+        316, f"draft:approve:{draft_id}",
+    )) == "processed"
+
+    assert db.get_queue_draft(draft_id)["status"] == "pending_approval"
+    assert telegram.messages[-1][1] == "Approvazione non disponibile."
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "content", "telegram_type"),
+    (
+        ("queue-photo.jpg", "image/jpeg", _PREVIEW_JPEG, "photo"),
+        ("queue-video.mp4", "video/mp4", _PREVIEW_MP4, "video"),
+        (
+            _PREVIEW_DOCUMENT_FILENAME,
+            "image/jpeg",
+            _PREVIEW_JPEG,
+            "document",
+        ),
+    ),
+)
+def test_bilingual_queue_card_sends_verified_media_before_both_texts(
+    tmp_path, filename, mime_type, content, telegram_type,
+):
+    db = Database(str(tmp_path / f"bilingual-{telegram_type}.db"))
+    draft = ready_queue_draft(db)
+    attach_verified_preview(
+        db,
+        tmp_path,
+        draft["id"],
+        content=content,
+        filename=filename,
+        mime_type=mime_type,
+    )
+    draft = db.get_queue_draft(draft["id"])
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    controller._send_draft_card("42", draft)
+
+    assert telegram.media_messages[0][2] == telegram_type
+    assert telegram.media_messages[0][3] == {
+        "caption": f"Anteprima media bozza #{draft['id']}"
+    }
+    assert telegram.events[0][0] == "media"
+    joined = "\n".join(message[1] for message in telegram.messages)
+    assert "ENGLISH_SENTINEL" in joined
+    assert "ITALIAN_SENTINEL" in joined
+
+
+def test_bilingual_card_keeps_complete_texts_under_metadata_pressure(tmp_path):
+    db = Database(str(tmp_path / "bilingual-pressure.db"))
+    source_ids = [
+        db.add_content_source(
+            "founder_note",
+            f"Source {index}",
+            metadata={"title": "x" * 200},
+            verified_by="floriano",
+        )
+        for index in range(50)
+    ]
+    english = "English body " + "E" * 250
+    italian = "Testo italiano " + "I" * 3980
+    draft_id = db.create_post_draft(
+        english,
+        "founder_story",
+        source_ids,
+        {f"axis_{index}": index for index in range(50)},
+        FUTURE_SLOT,
+        "bilingual-pressure",
+    )
+    queued = db.ensure_editorial_queue(draft_id)
+    assert db.save_review_translation(draft_id, queued["revision"], italian)
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    controller._send_draft_card("42", db.get_queue_draft(draft_id))
+
+    joined = "\n".join(message[1] for message in telegram.messages)
+    assert english in joined
+    assert italian in joined
+    assert all(len(message[1]) <= TELEGRAM_MESSAGE_MAX_CHARS for message in telegram.messages)
+
+
+def test_status_exposes_queue_and_us_publication_targets(tmp_path):
+    db = Database(str(tmp_path / "queue-status.db"))
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram)
+
+    assert controller.process_update(message_update(315, "/status")) == "processed"
+
+    rendered = telegram.messages[-1][1]
+    assert "coda approvata target: 7" in rendered
+    assert "pubblicazioni target: 2 al giorno" in rendered
+    assert "pubblico: Stati Uniti (America/New_York)" in rendered
 
 
 def test_posts_sends_verified_media_stream_before_separate_full_draft_card(tmp_path):
@@ -1053,7 +1323,11 @@ def test_posts_sends_verified_media_stream_before_separate_full_draft_card(tmp_p
     assert media_event_index < card_event_index
     card = telegram.events[card_event_index]
     assert "Complete preview draft <literal> & safe" in card[2]
-    assert card[3]["reply_markup"]["inline_keyboard"]
+    metadata_card = next(
+        event for event in telegram.events
+        if event[0] == "message" and event[3].get("reply_markup") is not None
+    )
+    assert metadata_card[3]["reply_markup"]["inline_keyboard"]
 
 
 def test_posts_dispatches_verified_video_and_document_previews(tmp_path):
@@ -1851,13 +2125,14 @@ def test_draft_card_preserves_complete_text_when_metadata_exceeds_message_limit(
 
     assert controller.process_update(message_update(31, "/posts")) == "processed"
 
-    card = next(
+    rendered = "\n".join(message[1] for message in telegram.messages)
+    assert complete_text in rendered
+    assert all(len(message[1]) <= 4096 for message in telegram.messages)
+    metadata_card = next(
         message for message in telegram.messages
         if message[2].get("reply_markup") is not None
     )
-    assert complete_text in card[1]
-    assert len(card[1]) <= 4096
-    assert card[2]["reply_markup"]["inline_keyboard"]
+    assert metadata_card[2]["reply_markup"]["inline_keyboard"]
 
 
 def test_errors_uses_sanitized_rows_and_stats_uses_read_only_analytics(tmp_path):
