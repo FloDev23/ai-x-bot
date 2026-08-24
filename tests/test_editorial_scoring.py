@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from modules.ai_generator import AIGenerator
 from modules.character import get_category_agents
 from modules.scoring import SCORE_AXES, TweetScorer, semantic_similarity
@@ -140,6 +142,108 @@ def test_grounded_generation_targets_the_editorial_score_axes(fake_ai):
         "worth following",
     ):
         assert requirement in normalized_prompt
+
+
+@pytest.mark.parametrize(
+    ("candidate_index", "expected"),
+    [
+        (0, "build the post around one sharp sourced contrast"),
+        (1, "build the post around one overlooked sourced trend or metric"),
+        (2, "build the post around one operator-relevant question"),
+    ],
+)
+def test_grounded_candidate_index_selects_closed_angle(
+    fake_ai, candidate_index, expected
+):
+    captured = {}
+
+    def complete(_system, user, **_kwargs):
+        captured["user"] = user
+        return "Grounded post."
+
+    fake_ai._complete = complete
+    fake_ai.generate_grounded_tweet(
+        "gym_strategy",
+        [{
+            "id": 8,
+            "source_type": "verified_news",
+            "trust_state": "verified",
+            "text": "Membership reached 81 million in 2025.",
+            "url": "https://industry.example/report",
+            "metadata": {
+                "title": "Industry report",
+                "summary": "Membership reached 81 million in 2025.",
+                "published_at": "2026-08-23",
+                "source_name": "Industry Association",
+            },
+        }],
+        False,
+        candidate_index=candidate_index,
+    )
+    assert expected in captured["user"].lower()
+
+
+@pytest.mark.parametrize("candidate_index", [True, -1, 3, "contrast"])
+def test_grounded_candidate_index_rejects_invalid_values_before_completion(
+    fake_ai, candidate_index
+):
+    calls = 0
+
+    def complete(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return "Grounded post."
+
+    fake_ai._complete = complete
+
+    result = fake_ai.generate_grounded_tweet(
+        "gym_strategy",
+        [],
+        include_link=False,
+        candidate_index=candidate_index,
+    )
+
+    assert result is None
+    assert calls == 0
+
+
+def test_grounded_candidate_index_is_preserved_during_overflow_rewrite(fake_ai):
+    prompts = []
+
+    def complete(_system, user, **_kwargs):
+        prompts.append(user.lower())
+        if len(prompts) == 1:
+            return "Long sourced sentence. " * 30
+        return "A concise sourced question."
+
+    fake_ai._complete = complete
+
+    result = fake_ai.generate_grounded_tweet(
+        "gym_strategy",
+        [{
+            "id": 8,
+            "source_type": "verified_news",
+            "trust_state": "verified",
+            "text": "Membership reached 81 million in 2025.",
+            "url": "https://industry.example/report",
+            "metadata": {
+                "title": "Industry report",
+                "summary": "Membership reached 81 million in 2025.",
+                "published_at": "2026-08-23",
+                "source_name": "Industry Association",
+            },
+        }],
+        include_link=False,
+        candidate_index=2,
+    )
+
+    assert result["text"] == "A concise sourced question."
+    assert len(prompts) == 2
+    assert all(
+        "build the post around one operator-relevant question" in prompt
+        for prompt in prompts
+    )
+    assert all("compare three distinct grounded angles" not in prompt for prompt in prompts)
 
 
 def test_grounded_generation_excludes_unsourced_character_knowledge(fake_ai):

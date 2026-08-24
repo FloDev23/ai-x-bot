@@ -144,8 +144,12 @@ class _InvalidatingGenerator:
         self.db = db
         self.source_id = source_id
         self.invalidity = invalidity
+        self.candidate_indices = []
 
-    def generate_grounded_tweet(self, *_args):
+    def generate_grounded_tweet(
+        self, _category, _sources, _include_link, candidate_index=None
+    ):
+        self.candidate_indices.append(candidate_index)
         with self.db._conn() as conn:
             if self.invalidity == "revoked":
                 conn.execute(
@@ -464,9 +468,13 @@ class _NeverPlanner:
 class _TrackingGenerator:
     def __init__(self):
         self.calls = 0
+        self.candidate_indices = []
 
-    def generate_grounded_tweet(self, *_args):
+    def generate_grounded_tweet(
+        self, _category, _sources, _include_link, candidate_index=None
+    ):
         self.calls += 1
+        self.candidate_indices.append(candidate_index)
         return {"text": "Generated."}
 
 

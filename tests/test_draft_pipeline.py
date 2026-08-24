@@ -265,8 +265,10 @@ class FakeGenerator:
         self.generated = []
         self.rewrites = []
 
-    def generate_grounded_tweet(self, category, sources, include_link):
-        self.generated.append((category, sources, include_link))
+    def generate_grounded_tweet(
+        self, category, sources, include_link, candidate_index=None
+    ):
+        self.generated.append((category, sources, include_link, candidate_index))
         if self.raise_generate:
             raise RuntimeError("Bearer sensitive-token-must-not-be-stored")
         if self.text is None:

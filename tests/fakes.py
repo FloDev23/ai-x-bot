@@ -113,11 +113,15 @@ class FakeGroundedGenerator:
     def __init__(self):
         self.client = SimpleNamespace()
         self.model = "fake-model"
+        self.candidate_indices = []
         self.text = (
             "I decided to reduce posting frequency so every post earns attention."
         )
 
-    def generate_grounded_tweet(self, _category, _sources, _include_link):
+    def generate_grounded_tweet(
+        self, _category, _sources, _include_link, candidate_index=None
+    ):
+        self.candidate_indices.append(candidate_index)
         return {"text": self.text}
 
     def rewrite_to_limit(self, _text, _sources, limit=280, category=None):
