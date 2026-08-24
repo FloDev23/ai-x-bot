@@ -263,6 +263,7 @@ class FakeGenerator:
         self.text = "Fill empty class places with flexible drop-in access."
         self.results = None
         self.rewrite_result = None
+        self.rewrite_results = None
         self.raise_generate = False
         self.raise_rewrite = False
         self.generated = []
@@ -277,7 +278,10 @@ class FakeGenerator:
         if self.raise_generate:
             raise RuntimeError("Bearer sensitive-token-must-not-be-stored")
         if self.results is not None:
-            return self.results.pop(0)
+            result = self.results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         if self.text is None:
             return None
         return {
@@ -290,6 +294,11 @@ class FakeGenerator:
         self.rewrites.append((text, sources, limit, category))
         if self.raise_rewrite:
             raise RuntimeError("private model payload")
+        if self.rewrite_results is not None:
+            result = self.rewrite_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         return self.rewrite_result
 
 
@@ -306,7 +315,10 @@ class FakeGuard:
         if self.raise_check:
             raise RuntimeError("raw analyzer response")
         if self.results is not None:
-            return self.results.pop(0)
+            result = self.results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         return FactCheckResult(self.approved, self.reasons)
 
 
@@ -324,7 +336,10 @@ class FakeScorer:
         if self.raise_score:
             raise RuntimeError("secret scoring payload")
         if self.results is not None:
-            return self.results.pop(0)
+            result = self.results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         return self.result
 
 
@@ -402,12 +417,13 @@ def test_candidate_tournament_reuses_source_and_recent_snapshot(pipeline_parts):
     assert generator.candidate_indices == [0, 1, 2]
     assert len(guard.calls) == 3
     assert len(scorer.contexts) == 3
+    sources = generator.generated[0][1]
     assert all(
-        call[1] is generator.generated[0][1]
+        call[1] is sources
         for call in generator.generated
     )
-    assert all(call[1] is guard.calls[0][1] for call in guard.calls)
-    assert all(context[0] is scorer.contexts[0][0] for context in scorer.contexts)
+    assert all(call[1] is sources for call in guard.calls)
+    assert all(context[0] is sources for context in scorer.contexts)
     assert all(context[1] is scorer.contexts[0][1] for context in scorer.contexts)
 
 
@@ -667,6 +683,111 @@ def test_candidate_tournament_scorer_failure_aborts_first_attempt(
     assert "private scoring response" not in audit
 
 
+@pytest.mark.parametrize(
+    ("failure", "outcome", "expected_details", "call_counts"),
+    [
+        (
+            "generator_exception",
+            "generation_failed",
+            {"reason_codes": ["generation_unavailable"]},
+            (2, 1, 1),
+        ),
+        (
+            "generator_none",
+            "generation_failed",
+            {"reason_codes": ["generation_unavailable"]},
+            (2, 1, 1),
+        ),
+        (
+            "fact_exception",
+            "rejected_fact",
+            {"reason_codes": ["fact_check_unavailable"]},
+            (2, 2, 1),
+        ),
+        (
+            "claim_analysis_unavailable",
+            "rejected_fact",
+            {"reason_codes": ["claim_analysis_unavailable"]},
+            (2, 2, 1),
+        ),
+        (
+            "scorer_exception",
+            "rejected_score",
+            {"reason_codes": ["scoring_unavailable"]},
+            (2, 2, 2),
+        ),
+        (
+            "scorer_malformed",
+            "rejected_score",
+            {"scores": {}},
+            (2, 2, 2),
+        ),
+    ],
+)
+def test_candidate_tournament_later_systemic_failure_discards_eligible_first(
+    pipeline_parts, failure, outcome, expected_details, call_counts
+):
+    pipeline, database, _, generator, guard, scorer = pipeline_parts
+    generator.results = [
+        {"text": "Eligible first candidate."},
+        {"text": "Systemic second candidate."},
+        {"text": "Third candidate must not run."},
+    ]
+    guard.results = [
+        FactCheckResult(True, []),
+        FactCheckResult(True, []),
+        FactCheckResult(True, []),
+    ]
+    scorer.results = [
+        {"total": 82},
+        {"total": 81},
+        {"total": 80},
+    ]
+
+    if failure == "generator_exception":
+        generator.results[1] = RuntimeError("private generator failure")
+    elif failure == "generator_none":
+        generator.results[1] = None
+    elif failure == "fact_exception":
+        guard.results[1] = RuntimeError("private fact failure")
+    elif failure == "claim_analysis_unavailable":
+        guard.results[1] = FactCheckResult(
+            False,
+            ["claim_analysis_unavailable"],
+        )
+    elif failure == "scorer_exception":
+        scorer.results[1] = RuntimeError("private scorer failure")
+    else:
+        scorer.results[1] = {
+            "total": "private malformed total",
+            "reasoning": "private scorer reasoning",
+        }
+
+    assert pipeline.create_for_slot(database.next_slot) is None
+
+    generator_calls, guard_calls, scorer_calls = call_counts
+    assert len(generator.generated) == generator_calls
+    assert generator.candidate_indices == [0, 1]
+    assert len(guard.calls) == guard_calls
+    assert len(scorer.calls) == scorer_calls
+    assert database.created_drafts == []
+    assert database.evaluations == [
+        {
+            "intended_slot": database.next_slot.isoformat(),
+            "category": "gym_strategy",
+            "outcome": outcome,
+            "details": {
+                "attempt": 2,
+                "source_ids": [7],
+                **expected_details,
+            },
+        }
+    ]
+    audit = repr(database.evaluations)
+    assert "Eligible first candidate." not in audit
+    assert "private" not in audit
+
+
 def test_candidate_tournament_invalid_source_stops_before_generation(
     pipeline_parts,
 ):
@@ -898,17 +1019,38 @@ def test_overlong_copy_is_completely_rewritten_before_fact_gate(pipeline_parts):
 
 
 @pytest.mark.parametrize("rewritten", [None, "", "x" * 281])
-def test_failed_or_still_overlong_rewrite_skips_slot(
+def test_candidate_tournament_invalid_rewrite_continues_to_safe_winner(
     pipeline_parts, rewritten
 ):
-    pipeline, database, _, generator, guard, _ = pipeline_parts
-    generator.text = "x" * 281
-    generator.rewrite_result = rewritten
+    pipeline, database, _, generator, guard, scorer = pipeline_parts
+    generator.results = [
+        {"text": "x" * 281},
+        {"text": "Safe winner after invalid rewrite."},
+        {"text": "Safe lower final candidate."},
+    ]
+    generator.rewrite_results = [rewritten]
+    scorer.results = [
+        {"total": 81},
+        {"total": 79},
+    ]
 
-    assert pipeline.create_for_slot(database.next_slot) is None
+    draft = pipeline.create_for_slot(database.next_slot)
 
-    assert guard.calls == []
-    assert database.evaluations[-1]["outcome"] == "rewrite_failed"
+    assert draft["text"] == "Safe winner after invalid rewrite."
+    assert generator.candidate_indices == [0, 1, 2]
+    assert len(generator.rewrites) == 1
+    assert [call[0] for call in guard.calls] == [
+        "Safe winner after invalid rewrite.",
+        "Safe lower final candidate.",
+    ]
+    assert scorer.calls == [
+        "Safe winner after invalid rewrite.",
+        "Safe lower final candidate.",
+    ]
+    assert len(database.created_drafts) == 1
+    assert [evaluation["outcome"] for evaluation in database.evaluations] == [
+        "pending_approval"
+    ]
 
 
 def test_gate_order_stops_before_later_services(pipeline_parts):
