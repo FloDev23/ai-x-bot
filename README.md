@@ -25,7 +25,7 @@ python -c "from config import validate_config; validate_config()"
 python main.py
 ```
 
-Lasciare `APPROVAL_REQUIRED=true`, `DRY_RUN=true` ed `ENABLE_LEAD_DISCOVERY=false` durante il rollout iniziale. `APPROVAL_REQUIRED=false` viene rifiutato all'avvio. NewsAPI è facoltativa finché `NEWS_TRUSTED_DOMAINS` resta vuota.
+Lasciare `APPROVAL_REQUIRED=true`, `DRY_RUN=true` ed `ENABLE_LEAD_DISCOVERY=false` durante il rollout iniziale. `APPROVAL_REQUIRED=false` viene rifiutato all'avvio. Il feed ufficiale FlexDropin non richiede chiavi o variabili; NewsAPI è facoltativa finché `NEWS_TRUSTED_DOMAINS` resta vuota.
 
 La configurazione completa e la procedura VPS sono in [SETUP.md](SETUP.md).
 
@@ -33,7 +33,7 @@ La configurazione completa e la procedura VPS sono in [SETUP.md](SETUP.md).
 
 Tutti i trigger usano `Europe/Rome` (o `BOT_TIMEZONE`) e il processo registra solo:
 
-- refresh news verificate alle 10:30;
+- refresh indipendente del blog FlexDropin e delle news allowlisted alle 10:30;
 - creazione bozze alle 12:00 e 18:00 per gli slot 14:00 e 20:00;
 - tentativi di pubblicazione approvata alle 14:00 e 20:00;
 - discovery growth read-only alle 11:00;
@@ -55,7 +55,13 @@ Telegram long polling gira in un thread daemon nominato. Scheduler e polling con
 6. Allo slot esatto `Publisher` verifica stato, pausa, scadenza e idempotenza.
 7. In dry-run restituisce `dry_run` senza invocare X.
 
-I comandi Telegram includono `/status`, `/posts`, `/growth`, `/stats`, `/ideas`, `/pause`, `/resume`, `/errors` e `/help`.
+I comandi Telegram includono `/status`, `/posts`, `/growth`, `/stats`, `/ideas`, `/pause`, `/resume`, `/errors` e `/help`. Il refresh riuscito o senza novità è silenzioso; `/errors` mostra solo codici di errore sistemici sanitizzati.
+
+## Fonti automatiche
+
+Ogni giorno il bot legge il feed fisso `https://flexdropin.com/api/editorial-feed` e, se configurata, NewsAPI. Gli articoli del blog vengono salvati come `owned_blog_article`: non sono product fact e possono sostenere soltanto testo generale, numeri esatti e named entity realmente presenti nel titolo o nel sommario.
+
+Il planner ruota fonti mai usate o meno recenti, esclude quelle già legate a bozze live e seleziona sempre un solo record. Un link al blog consuma la quota globale `MAX_LINKS_PER_WEEK` e lo stesso articolo non viene linkato di nuovo prima di 30 giorni.
 
 ## Verifica
 
@@ -78,3 +84,5 @@ Il test end-to-end è in `tests/test_end_to_end_dry_run.py` e prova fonte → bo
 - `modules/growth_discovery.py`: discovery follower read-only.
 - `modules/analytics.py`: snapshot, metriche proprie e report settimanale.
 - `modules/database.py`: persistenza SQLite concorrente e restart-safe.
+- `modules/editorial_feed.py`: client fixed-host e validazione del feed ufficiale.
+- `modules/source_refresh.py`: isolamento del refresh blog/NewsAPI.

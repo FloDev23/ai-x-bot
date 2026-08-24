@@ -11,6 +11,8 @@ Questa release usa Telegram come control plane obbligatorio. Non abilita pubblic
 - NewsAPI solo se si abilita una allowlist `NEWS_TRUSTED_DOMAINS`;
 - `ffmpeg` per l'analisi dei video caricati.
 
+Il feed ufficiale `https://flexdropin.com/api/editorial-feed` è fisso nel codice e non richiede credenziali.
+
 ## 2. Installazione
 
 ```bash
@@ -49,6 +51,8 @@ NEWSAPI_KEY=
 ```
 
 Con `NEWS_TRUSTED_DOMAINS=` la fetch news è disabilitata e `NEWSAPI_KEY` non è richiesta.
+
+Il canale NewsAPI riguarda solo fonti esterne. Non modifica né disabilita il refresh quotidiano degli articoli del blog FlexDropin.
 
 ## 4. Switch iniziali esatti
 
@@ -91,7 +95,16 @@ git diff --check
 
 I test usano dependency injection esplicita e boundary fake: non contattano X, Telegram, Groq o NewsAPI.
 
-## 6. Dry-run sul VPS
+## 6. Aggiornamento automatico delle fonti
+
+Alle 10:30 `Europe/Rome` il job `source_refresh` aggiorna separatamente:
+
+- gli articoli inglesi canonici del blog, come `owned_blog_article`;
+- le news esterne, solo dai domini in `NEWS_TRUSTED_DOMAINS`.
+
+Un guasto di un canale non annulla l'altro. Successo e assenza di novità non generano messaggi Telegram; gli errori sistemici vengono sanitizzati e sono consultabili con `/errors`. Un articolo blog non viene trattato come product fact. I suoi link rispettano `MAX_LINKS_PER_WEEK=1` e un cooldown di 30 giorni sullo stesso articolo.
+
+## 7. Dry-run sul VPS
 
 Avviare il servizio con `DRY_RUN=true`:
 
@@ -118,7 +131,7 @@ Controllare inoltre `/status`, `/posts`, `/errors` e `bot.log`. L'allowlist sche
 
 Cambiare `DRY_RUN=false` soltanto dopo che l'intera checklist ha superato il test sul VPS. Non cambiare `APPROVAL_REQUIRED=true`.
 
-## 7. Esecuzione persistente
+## 8. Esecuzione persistente
 
 Usare un service manager con working directory del repository, utente non privilegiato, restart controllato e accesso in scrittura a database/log/media. Esempio systemd:
 
@@ -147,6 +160,7 @@ Alla ricezione di `Ctrl+C` il processo segnala lo stesso `threading.Event` al po
 - `Variabili d'ambiente mancanti`: verificare tutte le credenziali obbligatorie; se sono configurati domini news, aggiungere `NEWSAPI_KEY`.
 - `APPROVAL_REQUIRED must be true`: ripristinare `APPROVAL_REQUIRED=true`.
 - Nessun draft: aggiungere una fonte ammissibile e controllare outcome/errori in SQLite e `/errors`.
+- Fonti automatiche assenti: verificare `/api/editorial-feed`, il job `source_refresh` delle 10:30 e `/errors`; `NEWSAPI_KEY` serve soltanto se l'allowlist esterna non è vuota.
 - Draft non pubblicato: verificare approvazione, `/pause`, slot esatto, grace window e `DRY_RUN`.
 - Media rifiutato: verificare MIME reale, dimensione, permessi della directory e disponibilità di `ffmpeg` per i video.
 - Polling Telegram fermo: verificare token, chat ID, timeout e log sanitizzati; non stampare mai token o URL bot completi.

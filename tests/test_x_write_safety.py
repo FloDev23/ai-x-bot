@@ -139,3 +139,29 @@ def test_character_contains_no_invented_bug_example():
     character_text = open("character.json", encoding="utf-8").read().lower()
     prohibited = ("absurd bugs", "stripe webhook", "bugs fixed", "rough day")
     assert all(term not in character_text for term in prohibited)
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "modules.editorial_feed",
+        "modules.source_ingestion",
+        "modules.source_refresh",
+        "modules.content_planner",
+    ],
+)
+def test_source_refresh_modules_have_no_x_write_capability(module_name):
+    source = inspect.getsource(importlib.import_module(module_name)).lower()
+    prohibited = (
+        "post_tweet",
+        "create_tweet",
+        "like_tweet",
+        "follow_user",
+        "unfollow_user",
+        "reply_to_tweet",
+        "retweet",
+        "send_dm",
+        "upload_media",
+        "media_upload",
+    )
+    assert all(capability not in source for capability in prohibited)

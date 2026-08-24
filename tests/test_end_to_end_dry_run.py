@@ -1,6 +1,6 @@
 import json
 import threading
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -9,6 +9,7 @@ import config
 import main
 from main import FlexDropinGrowthAgent
 from modules.database import Database
+from modules.editorial_feed import validate_editorial_feed
 from modules.source_refresh import SourceRefreshChannel, SourceRefreshResult
 from tests.fakes import (
     FakeEditorialScorer,
@@ -86,6 +87,33 @@ class CandidateScorer:
     def score_draft(self, text, sources=None, recent_texts=None):
         del sources, recent_texts
         return {"total": self.scores[text]}
+
+
+def _official_feed_records():
+    return validate_editorial_feed({
+        "version": 1,
+        "language": "en",
+        "items": [{
+            "slug": "gym-drop-ins-sell-single-classes",
+            "url": (
+                "https://flexdropin.com/blog/"
+                "gym-drop-ins-sell-single-classes"
+            ),
+            "title": "Gym drop-ins: how to test demand",
+            "summary": "A bounded operating guide for gym owners.",
+            "published_at": "2026-08-20",
+        }],
+    }, date(2026, 8, 24))
+
+
+def _external_article():
+    return {
+        "title": "Operators rethink class capacity",
+        "description": "A concrete reported change.",
+        "url": "https://industry.example/report",
+        "publishedAt": "2026-08-10T08:00:00Z",
+        "source": {"name": "Industry Example"},
+    }
 
 
 class BarrierDraftDatabase(Database):
@@ -180,6 +208,138 @@ def test_source_to_approval_to_dry_run_without_external_writes(agent_and_fakes):
     assert result.status == "dry_run"
     assert fakes["x_client"].posts == []
     assert fakes["x_client"].engagement_writes == []
+
+
+def test_automatic_sources_create_one_grounded_card_without_x_write(tmp_path):
+    feed = FakeEditorialFeedClient()
+    feed.records = _official_feed_records()
+    news = FakeNewsFetcher()
+    news.articles = [_external_article()]
+    generator = FakeGroundedGenerator()
+    generator.text = "Unused class capacity deserves a measured operating test."
+    dependencies = dependency_bundle(
+        tmp_path,
+        editorial_feed_client=feed,
+        news_fetcher=news,
+        generator=generator,
+        news_trusted_domains={"industry.example"},
+    )
+    agent = FlexDropinGrowthAgent(dependencies)
+
+    refresh = agent.refresh_sources_cycle()
+
+    assert refresh.blog.inserted == 1
+    assert refresh.news.inserted == 1
+    sources = agent.db.get_eligible_sources()
+    assert {source["source_type"] for source in sources} == {
+        "owned_blog_article",
+        "verified_news",
+    }
+
+    draft = agent.create_draft_cycle("14:00", now=NOW)
+    assert draft["source_ids"] == [next(
+        source["id"]
+        for source in sources
+        if source["source_type"] == "owned_blog_article"
+    )]
+    assert draft["score_data"]["total"] >= 75
+    assert len(dependencies["telegram_api"].messages) == 1
+    assert dependencies["x_client"].posts == []
+    assert dependencies["x_client"].engagement_writes == []
+
+    before_drafts = len(agent.db.list_post_drafts())
+    second = agent.refresh_sources_cycle()
+    assert second.blog.unchanged == 1
+    assert second.news.inserted == 0
+    assert len(agent.db.get_eligible_sources()) == 2
+    assert len(agent.db.list_post_drafts()) == before_drafts
+    assert len(dependencies["telegram_api"].messages) == 1
+    assert dependencies["x_client"].posts == []
+
+
+def test_two_agents_refresh_and_draft_once_on_shared_sqlite(tmp_path):
+    shared_path = str(tmp_path / "automatic-shared.db")
+    setup = Database(shared_path)
+    setup.set_state("paused", "false")
+    draft_barrier = threading.Barrier(2)
+    telegram_root = tmp_path / "automatic-shared-media"
+    telegram_root.mkdir(mode=0o700)
+    telegram = FakeTelegramApi(telegram_root)
+    agents = []
+    x_clients = []
+    for index in range(2):
+        database = BarrierDraftDatabase(shared_path, draft_barrier)
+        feed = FakeEditorialFeedClient()
+        feed.records = _official_feed_records()
+        news = FakeNewsFetcher()
+        news.articles = [_external_article()]
+        generator = FakeGroundedGenerator()
+        generator.text = "Unused class capacity deserves a measured operating test."
+        bundle = dependency_bundle(
+            tmp_path / f"automatic-agent-{index}",
+            db=database,
+            telegram_api=telegram,
+            editorial_feed_client=feed,
+            news_fetcher=news,
+            generator=generator,
+            news_trusted_domains={"industry.example"},
+        )
+        x_clients.append(bundle["x_client"])
+        agents.append(FlexDropinGrowthAgent(bundle))
+
+    refresh_results = []
+    refresh_errors = []
+
+    def refresh_worker(agent):
+        try:
+            refresh_results.append(agent.refresh_sources_cycle())
+        except BaseException as error:
+            refresh_errors.append(error)
+
+    refresh_threads = [
+        threading.Thread(target=refresh_worker, args=(agent,), daemon=True)
+        for agent in agents
+    ]
+    for thread in refresh_threads:
+        thread.start()
+    for thread in refresh_threads:
+        thread.join(timeout=10)
+
+    assert refresh_errors == []
+    assert not [thread for thread in refresh_threads if thread.is_alive()]
+    assert len(refresh_results) == 2
+    with setup._conn() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_sources"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT url) FROM content_sources"
+        ).fetchone()[0] == 2
+
+    draft_results = []
+    draft_errors = []
+
+    def draft_worker(agent):
+        try:
+            draft_results.append(agent.create_draft_cycle("14:00", now=NOW))
+        except BaseException as error:
+            draft_errors.append(error)
+
+    draft_threads = [
+        threading.Thread(target=draft_worker, args=(agent,), daemon=True)
+        for agent in agents
+    ]
+    for thread in draft_threads:
+        thread.start()
+    for thread in draft_threads:
+        thread.join(timeout=10)
+
+    assert draft_errors == []
+    assert not [thread for thread in draft_threads if thread.is_alive()]
+    assert len(draft_results) == 2
+    assert len({draft["id"] for draft in draft_results}) == 1
+    assert len(telegram.messages) == 1
+    assert all(client.posts == [] for client in x_clients)
 
 
 def test_candidate_tournament_sends_one_winner_card_without_x_write(tmp_path):
