@@ -75,6 +75,8 @@ git diff --check
 
 Il test end-to-end è in `tests/test_end_to_end_dry_run.py` e prova fonte → bozza → approvazione Telegram → publish dry-run con zero scritture X/engagement, oltre all'upload media senza creazione bozza.
 
+Prima di ogni riavvio sul VPS, `deploy.sh` esegue un preflight in sola lettura che richiede `APPROVAL_REQUIRED=true`, `DRY_RUN=true`, configurazione valida e `PRAGMA integrity_check=ok`. Una singola pubblicazione reale non richiede di modificare `.env`: usa `scripts/publish_once.py`, una fingerprint immutabile della bozza approvata e un override `DRY_RUN=false` limitato a quel solo processo. La procedura completa è in [SETUP.md](SETUP.md#9-prima-pubblicazione-reale-controllata).
+
 ## Componenti principali
 
 - `main.py`: dependency injection, job allowlist, cicli e shutdown.

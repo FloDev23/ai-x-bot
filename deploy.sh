@@ -7,9 +7,10 @@
 #   2. git pull del branch corrente
 #   3. Aggiorna le dipendenze del bot (requirements.txt, nel venv se presente)
 #   4. Aggiorna le dipendenze della dashboard (dashboard/requirements.txt)
-#   5. Installa/aggiorna il servizio systemd della dashboard (se cambiato)
-#   6. Verifica/aggiunge i permessi per leggere i log (gruppo systemd-journal)
-#   7. Riavvia bot e dashboard, e controlla che siano davvero attivi
+#   5. Esegue il preflight fail-closed con DRY_RUN=true
+#   6. Installa/aggiorna il servizio systemd della dashboard (se cambiato)
+#   7. Verifica/aggiunge i permessi per leggere i log (gruppo systemd-journal)
+#   8. Riavvia bot e dashboard, e controlla che siano davvero attivi
 #
 # Uso:
 #   cd ~/ai-x-bot
@@ -39,7 +40,7 @@ fail() { echo -e "\033[1;31m❌ $1\033[0m"; exit 1; }
 cd "$REPO_DIR"
 
 # ---- 1. Modifiche locali non committate ----
-step "1/7 · Controllo modifiche locali non committate"
+step "1/8 · Controllo modifiche locali non committate"
 if [[ -n "$(git status --porcelain)" ]]; then
   git status --short
   fail "Ci sono modifiche locali non committate in $REPO_DIR. Fai commit o 'git stash' prima di eseguire il deploy."
@@ -47,13 +48,13 @@ fi
 ok "Nessuna modifica locale in sospeso"
 
 # ---- 2. git pull ----
-step "2/7 · git pull"
+step "2/8 · git pull"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 git pull origin "$BRANCH" || fail "git pull fallito. Risolvi eventuali conflitti manualmente e rilancia lo script."
 ok "Codice aggiornato (branch: $BRANCH)"
 
 # ---- 3. Dipendenze bot ----
-step "3/7 · Dipendenze bot"
+step "3/8 · Dipendenze bot"
 if [[ -d "$VENV_DIR" ]]; then
   # shellcheck disable=SC1091
   source "$VENV_DIR/bin/activate"
@@ -66,7 +67,7 @@ else
 fi
 
 # ---- 4. Dipendenze dashboard ----
-step "4/7 · Dipendenze dashboard"
+step "4/8 · Dipendenze dashboard"
 if [[ -d "$VENV_DIR" ]]; then
   # shellcheck disable=SC1091
   source "$VENV_DIR/bin/activate"
@@ -77,8 +78,19 @@ else
 fi
 ok "Dipendenze dashboard aggiornate"
 
-# ---- 5. Servizio systemd della dashboard ----
-step "5/7 · Servizio systemd della dashboard"
+# ---- 5. Preflight fail-closed ----
+step "5/8 · Preflight produzione in dry-run"
+if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+  fail "Python del virtualenv non disponibile: $VENV_DIR/bin/python"
+fi
+"$VENV_DIR/bin/python" "$REPO_DIR/scripts/preflight_production.py" \
+  --require-dry-run \
+  --db-path "$REPO_DIR/bot_data.db" \
+  || fail "Preflight fallito: nessun servizio è stato riavviato"
+ok "Preflight superato: approval-only, dry-run e database integri"
+
+# ---- 6. Servizio systemd della dashboard ----
+step "6/8 · Servizio systemd della dashboard"
 if [[ ! -f "$SYSTEMD_DIR/$DASHBOARD_SERVICE.service" ]] || ! cmp -s "$DASHBOARD_SERVICE_FILE" "$SYSTEMD_DIR/$DASHBOARD_SERVICE.service"; then
   sudo cp "$DASHBOARD_SERVICE_FILE" "$SYSTEMD_DIR/$DASHBOARD_SERVICE.service"
   sudo systemctl daemon-reload
@@ -88,8 +100,8 @@ else
   ok "Servizio $DASHBOARD_SERVICE già installato e aggiornato, nessuna modifica necessaria"
 fi
 
-# ---- 6. Permessi lettura log ----
-step "6/7 · Permessi lettura log (gruppo systemd-journal)"
+# ---- 7. Permessi lettura log ----
+step "7/8 · Permessi lettura log (gruppo systemd-journal)"
 NEEDS_RELOGIN=0
 if ! groups "$USER" | grep -qw systemd-journal; then
   sudo usermod -aG systemd-journal "$USER"
@@ -99,8 +111,8 @@ else
   ok "Permessi journal già presenti per '$USER'"
 fi
 
-# ---- 7. Riavvio servizi ----
-step "7/7 · Riavvio bot e dashboard"
+# ---- 8. Riavvio servizi ----
+step "8/8 · Riavvio bot e dashboard"
 # daemon-reload incondizionato: qualunque unit file sia cambiato su disco
 # (dashboard copiato allo step 5, bot modificato manualmente in passato, o
 # qualsiasi altra causa) la cache di systemd viene sempre riallineata prima

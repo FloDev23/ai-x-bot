@@ -129,7 +129,17 @@ Completare e annotare tutta la checklist:
 
 Controllare inoltre `/status`, `/posts`, `/errors` e `bot.log`. L'allowlist scheduler deve contenere soltanto i job documentati nel README; la discovery lead deve essere assente.
 
-Cambiare `DRY_RUN=false` soltanto dopo che l'intera checklist ha superato il test sul VPS. Non cambiare `APPROVAL_REQUIRED=true`.
+Usare `DRY_RUN=false` soltanto come override del singolo processo one-shot descritto sotto, dopo che l'intera checklist ha superato il test sul VPS. Non modificare questi valori nel `.env` persistente e non cambiare `APPROVAL_REQUIRED=true`.
+
+Prima di un deploy o riavvio, con il database già presente, eseguire il controllo fail-closed:
+
+```bash
+venv/bin/python scripts/preflight_production.py \
+  --require-dry-run \
+  --db-path ./bot_data.db
+```
+
+Il comando restituisce soltanto stato di configurazione, booleani, conteggio domini e integrità del database. Non stampa credenziali. `./deploy.sh` esegue lo stesso controllo automaticamente prima di toccare i servizi e si ferma se non passa.
 
 ## 8. Esecuzione persistente
 
@@ -154,6 +164,43 @@ WantedBy=multi-user.target
 ```
 
 Alla ricezione di `Ctrl+C` il processo segnala lo stesso `threading.Event` al polling Telegram, ferma lo scheduler e attende il thread entro un timeout limitato.
+
+## 9. Prima pubblicazione reale controllata
+
+La configurazione persistente deve rimanere:
+
+```dotenv
+APPROVAL_REQUIRED=true
+DRY_RUN=true
+```
+
+1. Attendere il refresh automatico delle 10:30 oppure avviare il ciclo di refresh previsto dall'applicazione. Verificare `/errors` e che il feed `https://flexdropin.com/api/editorial-feed` risponda con la versione attesa.
+2. Far creare una bozza per uno slot configurato. Deve avere score almeno 75 ed essere ancora entro la grace window quando verrà pubblicata.
+3. Leggere testo e media su Telegram e premere `Approva` dalla chat autorizzata.
+4. Sul VPS acquisire la fingerprint senza cambiare stato:
+
+```bash
+venv/bin/python scripts/publish_once.py inspect --draft-id <DRAFT_ID>
+```
+
+5. Confrontare ID, revisione, slot, score, presenza media e fingerprint con la bozza appena approvata. Ottenere una seconda autorizzazione umana esplicita per quella fingerprint.
+6. Fermare il servizio per evitare concorrenti, pubblicare una sola volta con override limitato al processo e riavviare sempre il servizio:
+
+```bash
+restart_bot() { sudo systemctl restart flexdropin-bot; }
+trap restart_bot EXIT INT TERM
+sudo systemctl stop flexdropin-bot
+DRY_RUN=false venv/bin/python scripts/publish_once.py publish \
+  --draft-id <DRAFT_ID> \
+  --fingerprint <FINGERPRINT> \
+  --confirm PUBLISH_ONE_APPROVED_FLEXDROPIN_DRAFT
+restart_bot
+trap - EXIT INT TERM
+```
+
+Il comando rilegge la stessa bozza e revision, ricontrolla approvazione, pausa, slot, grace window, media e idempotenza. `published` è successo; `rejected` o `snapshot_changed` non scrivono; `publication_unknown` richiede riconciliazione manuale su X e non deve essere ritentato. Al termine rieseguire il preflight in dry-run e verificare che `flexdropin-bot` sia attivo.
+
+Non modificare `.env` a `DRY_RUN=false`, non lanciare il comando una seconda volta e non usare il percorso normale dello scheduler per il primo post reale.
 
 ## Troubleshooting
 
