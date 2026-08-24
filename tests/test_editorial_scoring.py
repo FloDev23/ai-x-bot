@@ -388,17 +388,21 @@ def test_owned_blog_generation_and_rewrite_forbid_unsourced_product_claims(
     fake_ai,
 ):
     prompts = []
+    article_url = "https://flexdropin.com/blog/gym-drop-ins-test-demand"
 
     def complete(_system_prompt, user_prompt, **_kwargs):
         prompts.append(" ".join(user_prompt.split()))
         if len(prompts) == 1:
-            return "Long blog post. " * 30
-        return "Ask which class rule removes the most booking friction."
+            return ("Long blog post. " * 30) + article_url
+        return (
+            "Ask which class rule removes the most booking friction. "
+            + article_url
+        )
 
     fake_ai._complete = complete
     public_item = {
         "slug": "gym-drop-ins-test-demand",
-        "url": "https://flexdropin.com/blog/gym-drop-ins-test-demand",
+        "url": article_url,
         "title": "Gym drop-ins: test demand",
         "summary": "Start with one class and clear rules.",
         "published_at": "2026-08-20",
@@ -441,12 +445,17 @@ def test_owned_blog_generation_and_rewrite_forbid_unsourced_product_claims(
         candidate_index=0,
     )
 
-    assert rewritten == "Ask which class rule removes the most booking friction."
+    assert rewritten == (
+        "Ask which class rule removes the most booking friction. " + article_url
+    )
     assert len(prompts) == 2
     assert (
-        "you may include https://flexdropin.com/blog/"
-        "gym-drop-ins-test-demand as the call to action"
+        "include exactly https://flexdropin.com/blog/"
+        "gym-drop-ins-test-demand once"
     ) in prompts[0].lower()
+    assert "keep all other copy at most 227 characters" in prompts[0].lower()
+    assert "preserve exactly https://flexdropin.com/blog/" in prompts[1].lower()
+    assert "keep all other copy at most 227 characters" in prompts[1].lower()
     for prompt in prompts:
         normalized = prompt.lower()
         assert "owned_blog_article" in normalized

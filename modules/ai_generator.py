@@ -103,6 +103,17 @@ def _get_link(sources: Optional[List[Dict]] = None) -> str:
     return FLEXDROPIN_WEBSITE
 
 
+def _required_link_instruction(link: str, limit: int, *, rewrite=False) -> str:
+    body_limit = limit - len(link) - 1
+    if body_limit <= 0:
+        return "The required link cannot fit within the post limit."
+    verb = "Preserve exactly" if rewrite else "Include exactly"
+    return (
+        f"{verb} {link} once. It counts toward the {limit}-character limit. "
+        f"Keep all other copy at most {body_limit} characters."
+    )
+
+
 def _category_instruction(category: Optional[str]) -> str:
     if category == "product_proof":
         return (
@@ -242,8 +253,9 @@ class AIGenerator:
         if candidate_angle_instruction is None:
             return None
         agent_name = _category_agents(category)[0]
+        grounded_link = _get_link(sources)
         link_instruction = (
-            f"You may include {_get_link(sources)} as the call to action."
+            _required_link_instruction(grounded_link, 280)
             if include_link
             else "Do not include a link or download call to action."
         )
@@ -287,9 +299,17 @@ Reply only with the post text, without quotes or explanation."""
         candidate_angle_instruction = _candidate_angle_instruction(candidate_index)
         if candidate_angle_instruction is None:
             return None
+        grounded_link = _get_link(sources)
+        required_link = grounded_link if grounded_link in text else None
+        link_instruction = (
+            _required_link_instruction(required_link, limit, rewrite=True)
+            if required_link
+            else "Do not add a link that was absent from POST."
+        )
         prompt = f"""Rewrite the full post below into one complete English X post of at
 most {limit} characters. Preserve only claims supported by SOURCE_BUNDLE.
 Do not slice, abbreviate into a fragment, or end with an ellipsis.
+{link_instruction}
 {_category_instruction(category)}
 {_source_instruction(sources, candidate_index=candidate_index)}
 {candidate_angle_instruction}
@@ -312,7 +332,16 @@ Reply only with the complete rewritten post."""
         if not isinstance(rewritten, str):
             return None
         rewritten = rewritten.strip()
-        if len(rewritten) > limit or not self._is_complete_sentence(rewritten):
+        if len(rewritten) > limit:
+            return None
+        sentence_text = rewritten
+        if required_link:
+            if rewritten.count(required_link) != 1:
+                return None
+            sentence_text = rewritten.replace(required_link, "").strip()
+            if len(sentence_text) > limit - len(required_link) - 1:
+                return None
+        if not self._is_complete_sentence(sentence_text):
             return None
         return rewritten
 
