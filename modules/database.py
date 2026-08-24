@@ -598,7 +598,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS publication_plans (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     local_date TEXT NOT NULL,
-                    position INTEGER NOT NULL CHECK (position IN (1, 2)),
+                    position INTEGER NOT NULL CHECK (position IN (1, 2, 3)),
                     scheduled_for TEXT NOT NULL UNIQUE,
                     draft_id INTEGER REFERENCES post_drafts(id),
                     draft_revision INTEGER,
@@ -617,6 +617,59 @@ class Database:
                     UNIQUE(local_date, position)
                 )
             """)
+            publication_plans_schema = c.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'publication_plans'"
+            ).fetchone()
+            legacy_position_check = re.search(
+                r"position\s+INTEGER\s+NOT\s+NULL\s+CHECK\s*\(\s*"
+                r"position\s+IN\s*\(\s*1\s*,\s*2\s*\)\s*\)",
+                publication_plans_schema["sql"] if publication_plans_schema else "",
+                flags=re.IGNORECASE,
+            )
+            if legacy_position_check is not None:
+                c.execute("DROP INDEX IF EXISTS uq_publication_plans_active_draft")
+                c.execute("""
+                    CREATE TABLE publication_plans_v3 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        local_date TEXT NOT NULL,
+                        position INTEGER NOT NULL CHECK (position IN (1, 2, 3)),
+                        scheduled_for TEXT NOT NULL UNIQUE,
+                        draft_id INTEGER REFERENCES post_drafts(id),
+                        draft_revision INTEGER,
+                        status TEXT NOT NULL CHECK (
+                            status IN (
+                                'open', 'planned', 'publishing', 'published',
+                                'simulated', 'skipped', 'unknown'
+                            )
+                        ),
+                        selection_reason_json TEXT NOT NULL DEFAULT '{}',
+                        claim_token TEXT,
+                        published_tweet_id TEXT,
+                        revision INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(local_date, position)
+                    )
+                """)
+                c.execute("""
+                    INSERT INTO publication_plans_v3 (
+                        id, local_date, position, scheduled_for, draft_id,
+                        draft_revision, status, selection_reason_json,
+                        claim_token, published_tweet_id, revision,
+                        created_at, updated_at
+                    )
+                    SELECT
+                        id, local_date, position, scheduled_for, draft_id,
+                        draft_revision, status, selection_reason_json,
+                        claim_token, published_tweet_id, revision,
+                        created_at, updated_at
+                    FROM publication_plans
+                """)
+                c.execute("DROP TABLE publication_plans")
+                c.execute(
+                    "ALTER TABLE publication_plans_v3 RENAME TO publication_plans"
+                )
             c.execute("""
                 CREATE TABLE IF NOT EXISTS draft_replenishment_claims (
                     token TEXT PRIMARY KEY,
@@ -2363,7 +2416,8 @@ class Database:
             }
             or type(reason.get("timing_bucket")) is not str
             or re.fullmatch(
-                r"(?:morning|evening):[0-9]{1,2}", reason["timing_bucket"]
+                r"(?:morning|midday|evening):[0-9]{1,2}",
+                reason["timing_bucket"],
             ) is None
             or record.get("status") not in {
                 "open", "planned", "publishing", "published",
@@ -2404,22 +2458,29 @@ class Database:
             or type(decision) is not DailyTimingDecision
             or current is None
             or type(decision.times) is not tuple
-            or len(decision.times) != 2
+            or len(decision.times) not in {2, 3}
             or type(decision.bucket_ids) is not tuple
-            or len(decision.bucket_ids) != 2
+            or len(decision.bucket_ids) != len(decision.times)
             or decision.reason not in {"cold_start", "performance_weighted"}
         ):
             return []
+        expected_bucket_groups = (
+            ("morning", "evening")
+            if len(decision.times) == 2
+            else ("morning", "midday", "evening")
+        )
         prepared = []
-        for position, (scheduled, bucket_id) in enumerate(
-            zip(decision.times, decision.bucket_ids), start=1
+        for position, (scheduled, bucket_id, expected_group) in enumerate(
+            zip(decision.times, decision.bucket_ids, expected_bucket_groups), start=1
         ):
             normalized = self._strict_aware_datetime(scheduled)
             if (
                 normalized is None
                 or scheduled.date() != local_date
                 or type(bucket_id) is not str
-                or re.fullmatch(r"(?:morning|evening):[0-9]{1,2}", bucket_id) is None
+                or re.fullmatch(
+                    rf"{expected_group}:[0-9]{{1,2}}", bucket_id
+                ) is None
             ):
                 return []
             reason = json.dumps(
@@ -2431,7 +2492,10 @@ class Database:
                 separators=(",", ":"),
             )
             prepared.append((position, scheduled.isoformat(), reason))
-        if decision.times[1] <= decision.times[0]:
+        if any(
+            later <= earlier
+            for earlier, later in zip(decision.times, decision.times[1:])
+        ):
             return []
         now_iso = current.isoformat()
         with self._conn() as conn:
@@ -2442,7 +2506,7 @@ class Database:
             ).fetchall()
             if existing:
                 decoded = [self._decode_publication_plan(row) for row in existing]
-                return decoded if len(decoded) == 2 and all(decoded) else []
+                return decoded if len(decoded) in {2, 3} and all(decoded) else []
             for position, scheduled_for, reason in prepared:
                 conn.execute("""
                     INSERT INTO publication_plans (
@@ -2462,7 +2526,7 @@ class Database:
                 (local_date.isoformat(),),
             ).fetchall()
             decoded = [self._decode_publication_plan(row) for row in rows]
-            return decoded if len(decoded) == 2 and all(decoded) else []
+            return decoded if len(decoded) == len(prepared) and all(decoded) else []
 
     def list_publication_positions(
         self,

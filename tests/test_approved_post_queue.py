@@ -105,7 +105,7 @@ def test_queue_schema_constraints_fail_closed(tmp_path):
                 conn.execute(
                     "INSERT INTO publication_plans "
                     "(local_date, position, scheduled_for, status, created_at, updated_at) "
-                    "VALUES ('2026-08-24', 3, ?, 'open', ?, ?)",
+                    "VALUES ('2026-08-24', 4, ?, 'open', ?, ?)",
                     (now, now, now),
                 )
             with pytest.raises(sqlite3.IntegrityError):

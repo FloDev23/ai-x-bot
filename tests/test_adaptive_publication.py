@@ -1,8 +1,13 @@
 import json
 import multiprocessing
+import os
+import sqlite3
+import subprocess
+import sys
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from modules.adaptive_timing import AdaptiveTimingPolicy, TimingSample
 from modules.analytics import PerformanceAnalyzer
@@ -34,6 +39,15 @@ def _publication_plan_claim_process(
     outcomes.put(claimed is not None)
 
 
+def _database_constructor_process(db_path, barrier, outcomes):
+    try:
+        barrier.wait(timeout=10)
+        Database(db_path)
+        outcomes.put("ok")
+    except Exception as exc:
+        outcomes.put(type(exc).__name__)
+
+
 def _policy():
     return AdaptiveTimingPolicy(
         audience_timezone="America/New_York",
@@ -43,6 +57,70 @@ def _policy():
         timing_min_posts=30,
         weekday_min_posts=90,
     )
+
+
+def _three_timing_decision():
+    from modules.adaptive_timing import DailyTimingDecision
+
+    zone = ZoneInfo("America/New_York")
+    return DailyTimingDecision(
+        times=(
+            datetime(2026, 8, 25, 9, 15, tzinfo=zone),
+            datetime(2026, 8, 25, 14, 0, tzinfo=zone),
+            datetime(2026, 8, 25, 19, 0, tzinfo=zone),
+        ),
+        bucket_ids=("morning:0", "midday:0", "evening:0"),
+        reason="cold_start",
+    )
+
+
+def _replace_publication_plans_with_legacy_schema(path):
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP INDEX IF EXISTS uq_publication_plans_active_draft")
+        conn.execute("DROP TABLE publication_plans")
+        conn.execute("""
+            CREATE TABLE publication_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                local_date TEXT NOT NULL,
+                position INTEGER NOT NULL CHECK (position IN (1, 2)),
+                scheduled_for TEXT NOT NULL UNIQUE,
+                draft_id INTEGER REFERENCES post_drafts(id),
+                draft_revision INTEGER,
+                status TEXT NOT NULL CHECK (
+                    status IN (
+                        'open', 'planned', 'publishing', 'published',
+                        'simulated', 'skipped', 'unknown'
+                    )
+                ),
+                selection_reason_json TEXT NOT NULL DEFAULT '{}',
+                claim_token TEXT,
+                published_tweet_id TEXT,
+                revision INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(local_date, position)
+            )
+        """)
+        for position, hour in ((1, 9), (2, 19)):
+            timestamp = datetime(
+                2026, 8, 24, hour, 0, tzinfo=timezone.utc,
+            ).isoformat()
+            conn.execute("""
+                INSERT INTO publication_plans (
+                    local_date, position, scheduled_for, status,
+                    selection_reason_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'open', ?, ?, ?)
+            """, (
+                "2026-08-24",
+                position,
+                timestamp,
+                json.dumps({
+                    "timing_bucket": "morning:0" if position == 1 else "evening:0",
+                    "timing_reason": "cold_start",
+                }),
+                timestamp,
+                timestamp,
+            ))
 
 
 def _insert_post_and_metrics(
@@ -260,6 +338,149 @@ def test_ensure_day_is_restart_stable_and_concurrent(tmp_path):
     assert len(results[0]) == 2
     assert all(row["status"] == "open" for row in results[0])
     assert _planner(Database(path)).ensure_day(NOW) == results[0]
+
+
+def test_legacy_two_position_database_migrates_and_preserves_existing_plans(tmp_path):
+    path = str(tmp_path / "legacy-two-position.db")
+    Database(path)
+    _replace_publication_plans_with_legacy_schema(path)
+
+    migrated = Database(path)
+    existing = migrated.list_publication_positions()
+
+    assert [row["position"] for row in existing] == [1, 2]
+    with migrated._conn() as conn:
+        schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='publication_plans'"
+        ).fetchone()["sql"]
+        assert "position IN (1, 2, 3)" in schema
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_legacy_publication_plan_migration_is_constructor_safe_and_exact(tmp_path):
+    path = str(tmp_path / "legacy-concurrent.db")
+    Database(path)
+    _replace_publication_plans_with_legacy_schema(path)
+    with sqlite3.connect(path) as conn:
+        before = conn.execute(
+            "SELECT * FROM publication_plans ORDER BY id"
+        ).fetchall()
+
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(12)
+    outcomes = context.Queue()
+    processes = [
+        context.Process(
+            target=_database_constructor_process,
+            args=(path, barrier, outcomes),
+        )
+        for _ in range(12)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=20)
+
+    assert not any(process.is_alive() for process in processes)
+    assert [process.exitcode for process in processes] == [0] * 12
+    assert sorted(outcomes.get(timeout=2) for _ in processes) == ["ok"] * 12
+    with sqlite3.connect(path) as conn:
+        after = conn.execute(
+            "SELECT * FROM publication_plans ORDER BY id"
+        ).fetchall()
+        indexes = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='uq_publication_plans_active_draft'"
+        ).fetchall()
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert after == before
+    assert indexes == [("uq_publication_plans_active_draft",)]
+
+
+def test_legacy_publication_plan_migration_rolls_back_on_hard_crash(tmp_path):
+    path = str(tmp_path / "legacy-crash.db")
+    Database(path)
+    _replace_publication_plans_with_legacy_schema(path)
+    script = r'''
+import os
+import sqlite3
+import sys
+import modules.database as database_module
+
+real_connect = sqlite3.connect
+
+class CrashCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, sql, parameters=()):
+        result = self._cursor.execute(sql, parameters)
+        if "INSERT INTO publication_plans_v3" in sql:
+            os._exit(97)
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+class CrashConnection:
+    def __init__(self, connection):
+        object.__setattr__(self, "_connection", connection)
+
+    def __setattr__(self, name, value):
+        setattr(self._connection, name, value)
+
+    def cursor(self):
+        return CrashCursor(self._connection.cursor())
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+database_module.sqlite3.connect = lambda path: CrashConnection(real_connect(path))
+database_module.Database(sys.argv[1])
+'''
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, path],
+        cwd=os.getcwd(),
+        check=False,
+    )
+    assert crashed.returncode == 97
+    with sqlite3.connect(path) as conn:
+        schema_after_crash = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='publication_plans'"
+        ).fetchone()[0]
+        rows_after_crash = conn.execute(
+            "SELECT position FROM publication_plans ORDER BY position"
+        ).fetchall()
+    assert "position IN (1, 2)" in schema_after_crash
+    assert rows_after_crash == [(1,), (2,)]
+
+    recovered = Database(path)
+    assert [row["position"] for row in recovered.list_publication_positions()] == [1, 2]
+    with recovered._conn() as conn:
+        recovered_schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='publication_plans'"
+        ).fetchone()["sql"]
+        assert "position IN (1, 2, 3)" in recovered_schema
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_new_database_persists_three_publication_positions(tmp_path):
+    db = Database(str(tmp_path / "three-position.db"))
+    now = datetime(2026, 8, 25, 4, 0, tzinfo=timezone.utc)
+
+    positions = db.create_or_get_publication_positions(
+        date(2026, 8, 25), _three_timing_decision(), now,
+    )
+
+    assert [row["position"] for row in positions] == [1, 2, 3]
+    assert [row["selection_reason"]["timing_bucket"] for row in positions] == [
+        "morning:0", "midday:0", "evening:0",
+    ]
 
 
 def test_ensure_day_reuses_persisted_installation_id_without_provider(tmp_path):

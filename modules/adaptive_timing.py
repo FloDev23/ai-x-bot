@@ -50,8 +50,8 @@ class TimingSample:
 
 @dataclass(frozen=True)
 class DailyTimingDecision:
-    times: tuple[datetime, datetime]
-    bucket_ids: tuple[str, str]
+    times: tuple[datetime, ...]
+    bucket_ids: tuple[str, ...]
     reason: str
 
 
@@ -88,6 +88,7 @@ class AdaptiveTimingPolicy:
         audience_timezone: str,
         morning_window: str,
         evening_window: str,
+        midday_window: str = "13:00-15:30",
         minimum_gap_hours: int,
         timing_min_posts: int,
         weekday_min_posts: int,
@@ -106,22 +107,30 @@ class AdaptiveTimingPolicy:
             raise ValueError("weekday_min_posts must cover timing_min_posts")
 
         self._morning = TimeWindow.parse(morning_window)
+        self._midday = TimeWindow.parse(midday_window)
         self._evening = TimeWindow.parse(evening_window)
         morning_start = _minute_of_day(self._morning.start)
         morning_end = _minute_of_day(self._morning.end)
+        midday_start = _minute_of_day(self._midday.start)
+        midday_end = _minute_of_day(self._midday.end)
         evening_start = _minute_of_day(self._evening.start)
         evening_end = _minute_of_day(self._evening.end)
-        if morning_end > evening_start:
+        if morning_end > midday_start or midday_end > evening_start:
             raise ValueError("publication windows must not overlap")
-        if evening_end - morning_start < minimum_gap_hours * 60:
+        gap_minutes = minimum_gap_hours * 60
+        feasible_midday_start = max(midday_start, morning_start + gap_minutes)
+        feasible_midday_end = min(midday_end, evening_end - gap_minutes)
+        if feasible_midday_start > feasible_midday_end:
             raise ValueError("minimum gap cannot fit inside publication windows")
 
         self._minimum_gap = timedelta(hours=minimum_gap_hours)
         self._minimum_gap_minutes = minimum_gap_hours * 60
         self._timing_min_posts = timing_min_posts
         self._weekday_min_posts = weekday_min_posts
+        self._windows = (self._morning, self._midday, self._evening)
         self._buckets = (
             self._window_buckets("morning", self._morning),
+            self._window_buckets("midday", self._midday),
             self._window_buckets("evening", self._evening),
         )
 
@@ -130,29 +139,39 @@ class AdaptiveTimingPolicy:
         local_date: date,
         installation_id: str,
         samples: Iterable[TimingSample],
+        *,
+        post_count: int = 2,
     ) -> DailyTimingDecision:
         if type(local_date) is not date:
             raise ValueError("local_date must be an exact date")
         if type(installation_id) is not str or not installation_id.strip():
             raise ValueError("installation_id must be a non-empty string")
+        if type(post_count) is not int or post_count not in {2, 3}:
+            raise ValueError("post_count must be exactly 2 or 3")
         try:
             supplied_samples = tuple(samples)
         except (TypeError, ValueError) as error:
             raise ValueError("samples must be iterable") from error
 
         mature_samples = self._mature_samples(local_date, supplied_samples)
+        selected_indices = (0, 2) if post_count == 2 else (0, 1, 2)
+        selected_windows = tuple(self._windows[index] for index in selected_indices)
+        selected_bucket_groups = tuple(
+            self._buckets[index] for index in selected_indices
+        )
         learned_buckets = None
         if len(mature_samples) >= self._timing_min_posts:
             learned_buckets = self._learned_buckets(
                 local_date,
                 installation_id,
                 mature_samples,
+                selected_bucket_groups,
             )
 
         if learned_buckets is None:
             minutes = [
                 self._cold_minute(local_date, installation_id, index, window)
-                for index, window in enumerate((self._morning, self._evening))
+                for index, window in enumerate(selected_windows)
             ]
             reason = "cold_start"
         else:
@@ -167,17 +186,20 @@ class AdaptiveTimingPolicy:
             ]
             reason = "performance_weighted"
 
-        minutes = self._enforce_gap(minutes)
+        minutes = self._enforce_gap(minutes, selected_windows)
         times = tuple(self._local_datetime(local_date, minute) for minute in minutes)
-        if times[1] - times[0] < self._minimum_gap:
+        if any(
+            following - prior < self._minimum_gap
+            for prior, following in zip(times, times[1:])
+        ):
             raise ValueError("adaptive timing decision violates minimum gap")
         bucket_ids = tuple(
-            self._bucket_for_minute(index, minute).identifier
-            for index, minute in enumerate(minutes)
+            self._bucket_for_minute(buckets, minute).identifier
+            for buckets, minute in zip(selected_bucket_groups, minutes)
         )
         return DailyTimingDecision(
-            times=(times[0], times[1]),
-            bucket_ids=(bucket_ids[0], bucket_ids[1]),
+            times=times,
+            bucket_ids=bucket_ids,
             reason=reason,
         )
 
@@ -235,9 +257,10 @@ class AdaptiveTimingPolicy:
         local_date: date,
         installation_id: str,
         samples: Sequence[TimingSample],
-    ) -> tuple[_Bucket, _Bucket] | None:
+        selected_bucket_groups: Sequence[Sequence[_Bucket]],
+    ) -> tuple[_Bucket, ...] | None:
         choices = []
-        for position, buckets in enumerate(self._buckets):
+        for position, buckets in enumerate(selected_bucket_groups):
             statistics = []
             for bucket in buckets:
                 matching = []
@@ -270,7 +293,7 @@ class AdaptiveTimingPolicy:
                     statistics,
                 )
             )
-        return choices[0], choices[1]
+        return tuple(choices)
 
     @staticmethod
     def _weighted_bucket(
@@ -346,22 +369,42 @@ class AdaptiveTimingPolicy:
             % (bucket.end_minute - bucket.start_minute + 1)
         )
 
-    def _enforce_gap(self, minutes: list[int]) -> list[int]:
-        morning, evening = minutes
-        if evening - morning >= self._minimum_gap_minutes:
-            return [morning, evening]
-        evening_limit = _minute_of_day(self._evening.end)
-        evening = morning + self._minimum_gap_minutes
-        if evening <= evening_limit:
-            return [morning, evening]
-        evening = evening_limit
-        morning = evening - self._minimum_gap_minutes
-        if morning < _minute_of_day(self._morning.start):
-            raise ValueError("minimum gap cannot fit inside publication windows")
-        return [morning, evening]
+    def _enforce_gap(
+        self,
+        minutes: list[int],
+        windows: Sequence[TimeWindow],
+    ) -> list[int]:
+        if len(minutes) != len(windows) or len(minutes) not in {2, 3}:
+            raise ValueError("invalid publication timing shape")
+        selected = [
+            min(
+                _minute_of_day(window.end),
+                max(_minute_of_day(window.start), minute),
+            )
+            for minute, window in zip(minutes, windows)
+        ]
+        if all(
+            following - prior >= self._minimum_gap_minutes
+            for prior, following in zip(selected, selected[1:])
+        ):
+            return selected
 
-    def _bucket_for_minute(self, position: int, minute: int) -> _Bucket:
-        for bucket in self._buckets[position]:
+        earliest = [_minute_of_day(windows[0].start)]
+        for window in windows[1:]:
+            earliest.append(max(
+                _minute_of_day(window.start),
+                earliest[-1] + self._minimum_gap_minutes,
+            ))
+        if any(
+            minute > _minute_of_day(window.end)
+            for minute, window in zip(earliest, windows)
+        ):
+            raise ValueError("minimum gap cannot fit inside publication windows")
+        return earliest
+
+    @staticmethod
+    def _bucket_for_minute(buckets: Sequence[_Bucket], minute: int) -> _Bucket:
+        for bucket in buckets:
             if bucket.start_minute <= minute <= bucket.end_minute:
                 return bucket
         raise ValueError("selected minute is outside its approved window")

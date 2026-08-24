@@ -149,6 +149,20 @@ def _policy():
     )
 
 
+def _three_position_policy():
+    from modules.adaptive_timing import AdaptiveTimingPolicy
+
+    return AdaptiveTimingPolicy(
+        audience_timezone="America/New_York",
+        morning_window="08:30-10:30",
+        midday_window="13:00-15:30",
+        evening_window="18:00-20:30",
+        minimum_gap_hours=4,
+        timing_min_posts=30,
+        weekday_min_posts=90,
+    )
+
+
 def _assert_inside_approved_windows(decision):
     morning = decision.times[0].timetz().replace(tzinfo=None)
     evening = decision.times[1].timetz().replace(tzinfo=None)
@@ -189,6 +203,50 @@ def test_cold_start_is_stable_inside_two_windows():
     assert len(first.times) == 2
     assert all(value.tzinfo == ZoneInfo("America/New_York") for value in first.times)
     _assert_inside_approved_windows(first)
+
+
+def test_three_post_day_uses_all_three_windows_with_four_hour_gaps():
+    policy = _three_position_policy()
+
+    first = policy.choose(
+        date(2026, 8, 25), "install-three", [], post_count=3,
+    )
+    second = policy.choose(
+        date(2026, 8, 25), "install-three", [], post_count=3,
+    )
+
+    assert first == second
+    assert len(first.times) == 3
+    assert len(first.bucket_ids) == 3
+    local_times = [value.timetz().replace(tzinfo=None) for value in first.times]
+    assert time(8, 30) <= local_times[0] <= time(10, 30)
+    assert time(13, 0) <= local_times[1] <= time(15, 30)
+    assert time(18, 0) <= local_times[2] <= time(20, 30)
+    assert first.times[1] - first.times[0] >= timedelta(hours=4)
+    assert first.times[2] - first.times[1] >= timedelta(hours=4)
+    assert first.bucket_ids[0].startswith("morning:")
+    assert first.bucket_ids[1].startswith("midday:")
+    assert first.bucket_ids[2].startswith("evening:")
+
+
+@pytest.mark.parametrize("post_count", (True, False, 0, 1, 4, "3", 3.0, None))
+def test_timing_rejects_invalid_post_count(post_count):
+    with pytest.raises(ValueError):
+        _three_position_policy().choose(
+            date(2026, 8, 25), "install-invalid-count", [],
+            post_count=post_count,
+        )
+
+
+@pytest.mark.parametrize("local_day", (date(2026, 3, 8), date(2026, 11, 1)))
+def test_three_post_windows_preserve_local_times_across_dst(local_day):
+    decision = _three_position_policy().choose(
+        local_day, "install-three-dst", [], post_count=3,
+    )
+
+    assert len(decision.times) == 3
+    assert all(value.date() == local_day for value in decision.times)
+    assert all(value.tzinfo == ZoneInfo("America/New_York") for value in decision.times)
 
 
 def test_cold_start_changes_deterministically_across_dates():
