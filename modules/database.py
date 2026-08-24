@@ -2092,6 +2092,7 @@ class Database:
             "awaiting_translation": 0,
             "awaiting_review": 0,
             "approved_available": 0,
+            "approved_or_planned": 0,
             "planned_today": 0,
             "blocked": 0,
         }
@@ -2119,6 +2120,7 @@ class Database:
                       AND status IN ('planned', 'publishing', 'unknown')
                 """).fetchall()
             }
+        approved_reserve = set()
         for row in rows:
             if row["blocked_reason"]:
                 counts["blocked"] += 1
@@ -2129,12 +2131,15 @@ class Database:
                 counts["awaiting_translation"] += 1
             elif row["approved_queue_at"] is None:
                 counts["awaiting_review"] += 1
-            elif row["status"] == "approved" and row["id"] not in active_drafts:
-                not_before = self._strict_aware_datetime(row["not_before"])
-                if row["not_before"] is None or (
-                    not_before is not None and not_before <= now
-                ):
-                    counts["approved_available"] += 1
+            elif row["status"] == "approved":
+                approved_reserve.add(row["id"])
+                if row["id"] not in active_drafts:
+                    not_before = self._strict_aware_datetime(row["not_before"])
+                    if row["not_before"] is None or (
+                        not_before is not None and not_before <= now
+                    ):
+                        counts["approved_available"] += 1
+        counts["approved_or_planned"] = len(approved_reserve.union(active_drafts))
         for plan in plans:
             scheduled = self._strict_aware_datetime(plan["scheduled_for"])
             if scheduled and scheduled.astimezone(operator_zone).date() == operator_date:
@@ -2160,6 +2165,7 @@ class Database:
         max_daily: int,
         now: datetime,
         ttl_seconds: int = 1800,
+        cycle_key: Optional[str] = None,
     ) -> Optional[Dict]:
         current = self._strict_aware_datetime(now)
         if (
@@ -2170,18 +2176,46 @@ class Database:
             or type(ttl_seconds) is not int
             or ttl_seconds <= 0
             or ttl_seconds > 86400
+            or (
+                cycle_key is not None
+                and (
+                    type(cycle_key) is not str
+                    or re.fullmatch(r"[A-Za-z0-9:_-]{1,64}", cycle_key) is None
+                )
+            )
         ):
             return None
         now_iso = current.isoformat()
         expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            expired_claims = conn.execute("""
+                    SELECT token, claimed_at, draft_id
+                    FROM draft_replenishment_claims
+                    WHERE operator_date = ? AND status = 'claimed'
+                      AND julianday(expires_at) <= julianday(?)
+                    ORDER BY julianday(claimed_at), token
+                """, (operator_date.isoformat(), now_iso)).fetchall()
+            expired_tokens = [row["token"] for row in expired_claims]
+            reusable_claim = None
+            if cycle_key is not None:
+                reusable_claim = next(
+                    (row for row in expired_claims if row["draft_id"] is None),
+                    None,
+                )
             conn.execute("""
                 UPDATE draft_replenishment_claims
                 SET status = 'released', updated_at = ?
                 WHERE operator_date = ? AND status = 'claimed'
                   AND julianday(expires_at) <= julianday(?)
             """, (now_iso, operator_date.isoformat(), now_iso))
+            if cycle_key is not None and conn.execute("""
+                SELECT 1 FROM draft_replenishment_claims
+                WHERE operator_date = ? AND status = 'claimed'
+                  AND julianday(expires_at) > julianday(?)
+                LIMIT 1
+            """, (operator_date.isoformat(), now_iso)).fetchone() is not None:
+                return None
             count = conn.execute("""
                 SELECT COUNT(*) AS count
                 FROM draft_replenishment_claims
@@ -2196,7 +2230,53 @@ class Database:
             """, (operator_date.isoformat(), now_iso)).fetchone()["count"]
             if count >= max_daily:
                 return None
-            token = secrets.token_urlsafe(24)
+            token = (
+                reusable_claim["token"]
+                if reusable_claim is not None
+                else secrets.token_urlsafe(24)
+            )
+            if cycle_key is not None:
+                for expired_token in expired_tokens:
+                    conn.execute("""
+                        DELETE FROM bot_state
+                        WHERE key LIKE 'replenishment_cycle:%' AND value = ?
+                    """, (expired_token,))
+                cycle_state_key = (
+                    "replenishment_cycle:"
+                    + operator_date.isoformat()
+                    + ":"
+                    + cycle_key
+                )
+                claimed_cycle = conn.execute("""
+                    INSERT OR IGNORE INTO bot_state (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                """, (cycle_state_key, token, now_iso))
+                if claimed_cycle.rowcount != 1:
+                    return None
+            if reusable_claim is not None:
+                cursor = conn.execute("""
+                    UPDATE draft_replenishment_claims
+                    SET status = 'claimed', expires_at = ?, updated_at = ?
+                    WHERE token = ? AND status = 'released' AND draft_id IS NULL
+                """, (expires_at, now_iso, token))
+                if cursor.rowcount != 1:
+                    return None
+                ordinal = conn.execute("""
+                    SELECT COUNT(*) + 1 AS ordinal
+                    FROM draft_replenishment_claims
+                    WHERE operator_date = ? AND status = 'completed'
+                      AND julianday(claimed_at) < julianday(?)
+                """, (
+                    operator_date.isoformat(),
+                    reusable_claim["claimed_at"],
+                )).fetchone()["ordinal"]
+                record = self._decode_replenishment_claim(conn.execute(
+                    "SELECT * FROM draft_replenishment_claims WHERE token = ?",
+                    (token,),
+                ).fetchone())
+                if record is not None:
+                    record["ordinal"] = ordinal
+                return record
             conn.execute("""
                 INSERT INTO draft_replenishment_claims (
                     token, operator_date, status, claimed_at, expires_at,
@@ -2210,10 +2290,13 @@ class Database:
                 now_iso,
                 now_iso,
             ))
-            return self._decode_replenishment_claim(conn.execute(
+            record = self._decode_replenishment_claim(conn.execute(
                 "SELECT * FROM draft_replenishment_claims WHERE token = ?",
                 (token,),
             ).fetchone())
+            if record is not None:
+                record["ordinal"] = count + 1
+            return record
 
     def complete_replenishment_claim(self, token: str, draft_id: int) -> bool:
         if (
@@ -2250,6 +2333,11 @@ class Database:
                 SET status = 'released', updated_at = ?
                 WHERE token = ? AND status = 'claimed'
             """, (self._now_iso(), token))
+            if cursor.rowcount == 1:
+                conn.execute("""
+                    DELETE FROM bot_state
+                    WHERE key LIKE 'replenishment_cycle:%' AND value = ?
+                """, (token,))
             return cursor.rowcount == 1
 
     @classmethod
@@ -2812,6 +2900,11 @@ class Database:
                 now,
             ))
             replacement_id = replacement.lastrowid
+            conn.execute("""
+                INSERT INTO editorial_queue (
+                    draft_id, translation_status, created_at, updated_at
+                ) VALUES (?, 'pending', ?, ?)
+            """, (replacement_id, now, now))
             self._insert_draft_evaluation_in_conn(
                 conn,
                 expected_slot,
@@ -2922,6 +3015,11 @@ class Database:
                 now,
             ))
             replacement_id = replacement.lastrowid
+            conn.execute("""
+                INSERT INTO editorial_queue (
+                    draft_id, translation_status, created_at, updated_at
+                ) VALUES (?, 'pending', ?, ?)
+            """, (replacement_id, now, now))
             self._insert_draft_evaluation_in_conn(
                 conn,
                 expected_slot,

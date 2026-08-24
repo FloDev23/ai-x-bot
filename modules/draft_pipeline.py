@@ -532,6 +532,58 @@ class DraftPipeline:
         draft, _outcome = self.create_for_slot_with_outcome(intended_slot)
         return draft
 
+    def create_for_queue_with_outcome(self, anchor):
+        """Create one queue-enabled draft without sending any notification."""
+        anchor_iso = _slot_iso(anchor)
+        if anchor_iso is None:
+            return None, "rejected"
+        existing = self.db.get_active_draft_for_slot(anchor_iso)
+        if existing:
+            queued = self.db.ensure_editorial_queue(existing.get("id"))
+            return (queued, "existing") if queued else (None, "rejected")
+        try:
+            plan = self.planner.plan(anchor, daily_draft_cap=4)
+        except (TypeError, ValueError):
+            return None, "rejected"
+        if plan is None:
+            self._record(anchor_iso, "unplanned", "no_eligible_source")
+            return None, "rejected"
+        prepared = self._prepare(
+            category=plan.category,
+            source_ids=plan.source_ids,
+            intended_slot=plan.intended_slot,
+            include_link=plan.include_link,
+        )
+        if prepared is None:
+            return None, "rejected"
+        draft, outcome = self._persist(prepared)
+        if draft is None or outcome not in {"created", "existing"}:
+            return None, "rejected"
+        queued = self.db.ensure_editorial_queue(draft.get("id"))
+        return (queued, outcome) if queued else (None, "rejected")
+
+    def approve_queue(self, draft_id, approved_by) -> bool:
+        """Approve an exact translated queue snapshot, ignoring legacy due time."""
+        if not isinstance(approved_by, str) or not approved_by.strip():
+            return False
+        draft = self.db.get_queue_draft(draft_id)
+        if (
+            not draft
+            or draft.get("status") not in {"pending_approval", "approved"}
+            or draft.get("translation_status") != "ready"
+        ):
+            return False
+        now = _aware_datetime(self.now_fn())
+        if now is None:
+            return False
+        return self.db.approve_queued_draft_atomic(
+            draft_id,
+            draft.get("revision"),
+            draft.get("queue_revision"),
+            approved_by.strip(),
+            now.isoformat(),
+        )
+
     def regenerate(self, draft_id) -> Optional[Dict]:
         prior = self.db.get_post_draft(draft_id)
         if not prior or prior.get("status") not in _REGENERATABLE_STATUSES:

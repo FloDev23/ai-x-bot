@@ -65,8 +65,14 @@ class ContentPlanner:
         self.timezone_name = timezone_name
         self.max_links_per_week = max_links_per_week
 
-    def plan(self, intended_slot: datetime) -> Optional[ContentPlan]:
+    def plan(
+        self,
+        intended_slot: datetime,
+        daily_draft_cap: int = 2,
+    ) -> Optional[ContentPlan]:
         """Plan a candidate if the day cap and the source gate both permit it."""
+        if type(daily_draft_cap) is not int or daily_draft_cap <= 0:
+            raise ValueError("daily_draft_cap must be a positive integer")
         local_timezone = ZoneInfo(self.timezone_name)
         local_slot = (
             intended_slot.replace(tzinfo=local_timezone)
@@ -76,7 +82,7 @@ class ContentPlanner:
         if self.database.count_drafts_for_local_date(
             local_slot.date(),
             self.timezone_name,
-        ) >= 2:
+        ) >= daily_draft_cap:
             return None
 
         counts = self.database.get_content_mix_counts(days=30)

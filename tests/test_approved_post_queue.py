@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time as time_module
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -11,6 +12,10 @@ import pytest
 
 from modules.database import Database
 from modules.adaptive_timing import DailyTimingDecision
+from modules.content_planner import ContentPlan
+from modules.draft_pipeline import DraftPipeline
+from modules.fact_guard import FactCheckResult
+from modules.review_translation import ReviewTranslation
 
 
 QUEUE_TABLES = {
@@ -394,6 +399,7 @@ def test_queue_counts_use_operator_timezone_and_allowlisted_states(tmp_path):
         "awaiting_translation": 1,
         "awaiting_review": 0,
         "approved_available": 0,
+        "approved_or_planned": 0,
         "planned_today": 0,
         "blocked": 0,
     }
@@ -612,7 +618,7 @@ database_module.Database(sys.argv[1]).claim_replenishment(now.date(), 4, now)
     with sqlite3.connect(path) as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM draft_replenishment_claims"
-        ).fetchone() == (0,)
+        ).fetchone()[0] == 0
     assert Database(str(path)).claim_replenishment(now.date(), 1, now) is not None
 
 
@@ -794,3 +800,448 @@ def test_plan_assignment_revalidates_source_and_media_binding(tmp_path):
     assert not db.assign_publication_plan_atomic(
         plans[0]["id"], draft_id, rebound["revision"], {},
     )
+
+
+class _QueuePipelineFake:
+    def __init__(self, db, *, outcome="created", delay=0):
+        self.db = db
+        self.outcome = outcome
+        self.delay = delay
+        self.calls = []
+        self.source_id = db.add_content_source(
+            "evergreen_idea", "Reduce empty capacity without discounting.",
+        )
+
+    def create_for_queue_with_outcome(self, anchor):
+        self.calls.append(anchor)
+        if self.delay:
+            time_module.sleep(self.delay)
+        if self.outcome == "raise":
+            raise RuntimeError("raw pipeline failure")
+        if self.outcome == "rejected":
+            return None, "rejected"
+        draft, outcome = self.db.create_or_get_post_draft(
+            text="Empty class capacity expires when class starts.",
+            category="gym_strategy",
+            source_ids=[self.source_id],
+            score_data={"total": 86},
+            intended_slot=anchor.isoformat(),
+            publication_key=f"queue-fake:{anchor.isoformat()}",
+        )
+        if draft is None:
+            return None, "rejected"
+        queued = self.db.ensure_editorial_queue(draft["id"])
+        return queued, outcome
+
+
+class _QueueTranslatorFake:
+    def __init__(self, response="La capacità vuota scade quando inizia la lezione."):
+        self.response = response
+        self.calls = []
+
+    def translate(self, english_text):
+        self.calls.append(english_text)
+        if self.response is None:
+            return None
+        return ReviewTranslation(self.response)
+
+
+class _QueueMediaMatcherFake:
+    def __init__(self):
+        self.calls = []
+
+    def attach_best(self, draft_id):
+        self.calls.append(draft_id)
+        return None
+
+
+def _replenisher(db, pipeline, translator, media_matcher=None):
+    from modules.publication_queue import QueueReplenisher
+
+    return QueueReplenisher(
+        db=db,
+        pipeline=pipeline,
+        translator=translator,
+        media_matcher=media_matcher,
+        operator_timezone="Europe/Rome",
+        approved_queue_target=7,
+        pending_review_limit=3,
+        daily_generation_cap=4,
+    )
+
+
+def test_replenisher_creates_translates_completes_and_announces_once(tmp_path):
+    db = Database(str(tmp_path / "replenish.db"))
+    pipeline = _QueuePipelineFake(db)
+    translator = _QueueTranslatorFake()
+    media = _QueueMediaMatcherFake()
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    result = _replenisher(db, pipeline, translator, media).run(now)
+
+    assert result.outcome == "created"
+    assert result.draft_id is not None
+    assert result.announce is True
+    queued = db.get_queue_draft(result.draft_id)
+    assert queued["translation_status"] == "ready"
+    assert queued["translation_it"] == translator.response
+    assert media.calls == [result.draft_id]
+    with db._conn() as conn:
+        claim = dict(conn.execute(
+            "SELECT * FROM draft_replenishment_claims"
+        ).fetchone())
+    assert claim["status"] == "completed"
+    assert claim["draft_id"] == result.draft_id
+
+
+def _seed_queue_state(db, count, *, approved):
+    source_id = db.add_content_source("evergreen_idea", "Queue seed source")
+    for index in range(count):
+        draft_id = db.create_post_draft(
+            f"Queue seed {index}",
+            "gym_strategy",
+            [source_id],
+            {"total": 80 + index},
+            f"2026-09-{index + 1:02d}T10:00:00+00:00",
+            f"queue-seed:{approved}:{index}",
+        )
+        draft = db.get_post_draft(draft_id)
+        db.ensure_editorial_queue(draft_id)
+        if approved:
+            assert db.save_review_translation(
+                draft_id, draft["revision"], f"Traduzione {index}",
+            )
+            ready = db.get_queue_draft(draft_id)
+            assert db.approve_queued_draft_atomic(
+                draft_id,
+                draft["revision"],
+                ready["queue_revision"],
+                "floriano",
+                datetime.now(timezone.utc).isoformat(),
+            )
+
+
+@pytest.mark.parametrize(
+    ("approved", "count", "expected"),
+    ((True, 7, "queue_full"), (False, 3, "pending_full")),
+)
+def test_replenisher_respects_queue_and_pending_limits(
+    tmp_path, approved, count, expected,
+):
+    db = Database(str(tmp_path / f"limit-{expected}.db"))
+    _seed_queue_state(db, count, approved=approved)
+    pipeline = _QueuePipelineFake(db)
+
+    result = _replenisher(db, pipeline, _QueueTranslatorFake()).run(
+        datetime.now(timezone.utc)
+    )
+
+    assert result.outcome == expected
+    assert result.draft_id is None
+    assert result.announce is False
+    assert pipeline.calls == []
+    with db._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM draft_replenishment_claims"
+        ).fetchone()[0] == 0
+
+
+def test_replenisher_counts_future_not_before_approved_reserve(tmp_path):
+    db = Database(str(tmp_path / "future-reserve.db"))
+    _seed_queue_state(db, 7, approved=True)
+    with db._conn() as conn:
+        conn.execute(
+            "UPDATE editorial_queue SET not_before = ?",
+            ((datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),),
+        )
+    pipeline = _QueuePipelineFake(db)
+
+    result = _replenisher(db, pipeline, _QueueTranslatorFake()).run(
+        datetime.now(timezone.utc)
+    )
+
+    assert result.outcome == "queue_full"
+    assert pipeline.calls == []
+
+
+def test_replenisher_releases_rejected_or_systemic_generation_claim(tmp_path):
+    db = Database(str(tmp_path / "rejected-replenish.db"))
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    rejected = _replenisher(
+        db, _QueuePipelineFake(db, outcome="rejected"), _QueueTranslatorFake(),
+    ).run(now)
+    failed = _replenisher(
+        db, _QueuePipelineFake(db, outcome="raise"), _QueueTranslatorFake(),
+    ).run(now + timedelta(minutes=1))
+
+    assert rejected.outcome == "generation_rejected"
+    assert failed.outcome == "failed"
+    with db._conn() as conn:
+        states = [row[0] for row in conn.execute(
+            "SELECT status FROM draft_replenishment_claims ORDER BY claimed_at"
+        )]
+    assert states == ["released", "released"]
+
+
+def test_replenisher_reports_daily_cap_after_four_completed_drafts(tmp_path):
+    db = Database(str(tmp_path / "service-daily-cap.db"))
+    local_day = datetime.now(ZoneInfo("Europe/Rome")).date()
+    base = datetime.combine(
+        local_day,
+        datetime.min.time(),
+        tzinfo=ZoneInfo("Europe/Rome"),
+    ).astimezone(timezone.utc) + timedelta(hours=10)
+    source_id = db.add_content_source("evergreen_idea", "Daily cap source")
+    for index in range(4):
+        claim = db.claim_replenishment(local_day, 4, base + timedelta(minutes=index))
+        draft_id = db.create_post_draft(
+            f"Daily cap draft {index}", "gym_strategy", [source_id],
+            {"total": 80},
+            (base + timedelta(hours=index)).isoformat(),
+            f"daily-cap-draft:{index}",
+        )
+        assert db.complete_replenishment_claim(claim["token"], draft_id)
+    pipeline = _QueuePipelineFake(db)
+
+    result = _replenisher(db, pipeline, _QueueTranslatorFake()).run(
+        base + timedelta(hours=6)
+    )
+
+    assert result.outcome == "daily_cap"
+    assert pipeline.calls == []
+
+
+def test_replenisher_restart_waits_for_expiry_then_reclaims(tmp_path):
+    db = Database(str(tmp_path / "restart-claim.db"))
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    operator_day = now.astimezone(ZoneInfo("Europe/Rome")).date()
+    claim = db.claim_replenishment(
+        operator_day,
+        4,
+        now,
+        cycle_key="crashed-cycle",
+    )
+    assert claim is not None
+    pipeline = _QueuePipelineFake(db)
+    crashed_anchor = datetime.fromisoformat(claim["claimed_at"]) + timedelta(
+        microseconds=claim["ordinal"]
+    )
+    crashed_draft, crashed_outcome = pipeline.create_for_queue_with_outcome(
+        crashed_anchor
+    )
+    assert crashed_outcome == "created"
+    pipeline.calls.clear()
+    service = _replenisher(db, pipeline, _QueueTranslatorFake())
+
+    before_expiry = service.run(now + timedelta(minutes=1))
+    after_expiry = service.run(now + timedelta(minutes=31))
+
+    assert before_expiry.outcome == "daily_cap"
+    assert after_expiry.outcome == "existing"
+    assert after_expiry.draft_id == crashed_draft["id"]
+    assert after_expiry.announce is False
+    assert len(pipeline.calls) == 1
+    assert len(db.list_post_drafts()) == 1
+
+
+def test_replenisher_translation_failure_keeps_retryable_pending_draft(tmp_path):
+    db = Database(str(tmp_path / "translation-pending.db"))
+    pipeline = _QueuePipelineFake(db)
+    translator = _QueueTranslatorFake(response=None)
+    service = _replenisher(db, pipeline, translator)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    result = service.run(now)
+
+    assert result.outcome == "translation_pending"
+    assert result.draft_id is not None
+    assert result.announce is False
+    assert db.get_queue_draft(result.draft_id)["translation_status"] == "pending"
+    assert service.retry_pending_translations(now + timedelta(minutes=5)) == []
+    translator.response = "Traduzione pronta."
+    assert service.retry_pending_translations(now + timedelta(minutes=6)) == [
+        result.draft_id
+    ]
+    assert len(pipeline.calls) == 1
+    assert db.get_queue_draft(result.draft_id)["translation_status"] == "ready"
+
+
+def test_translation_retry_limit_bounds_attempts_not_only_successes(tmp_path):
+    db = Database(str(tmp_path / "retry-limit.db"))
+    _seed_queue_state(db, 5, approved=False)
+    translator = _QueueTranslatorFake(response=None)
+    service = _replenisher(db, _QueuePipelineFake(db), translator)
+
+    assert service.retry_pending_translations(
+        datetime.now(timezone.utc), limit=3,
+    ) == []
+    assert len(translator.calls) == 3
+
+
+def test_stale_translation_result_cannot_attach_after_draft_revision_change(tmp_path):
+    db = Database(str(tmp_path / "stale-translation.db"))
+    pipeline = _QueuePipelineFake(db)
+
+    class MutatingTranslator:
+        def translate(self, _english_text):
+            draft = db.list_post_drafts(["pending_approval"], limit=1)[0]
+            assert db.transition_post_draft(
+                draft["id"], ["pending_approval"], "pending_approval"
+            )
+            return ReviewTranslation("Traduzione ormai stale.")
+
+    result = _replenisher(db, pipeline, MutatingTranslator()).run(
+        datetime.now(timezone.utc).replace(microsecond=0)
+    )
+
+    assert result.outcome == "translation_pending"
+    queued = db.get_queue_draft(result.draft_id)
+    assert queued["translation_status"] == "pending"
+    assert queued["translation_it"] is None
+
+
+def test_replenisher_concurrent_same_cycle_creates_one_announced_draft(tmp_path):
+    path = tmp_path / "replenish-race.db"
+    Database(str(path))
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def run_worker():
+        db = Database(str(path))
+        service = _replenisher(
+            db,
+            _QueuePipelineFake(db, delay=0.05),
+            _QueueTranslatorFake(),
+        )
+        barrier.wait(timeout=5)
+        results.append(service.run(now))
+
+    threads = [threading.Thread(target=run_worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert sum(result.announce for result in results) == 1
+    assert sum(result.outcome == "created" for result in results) == 1
+    check = Database(str(path))
+    assert len(check.list_post_drafts()) == 1
+
+
+class _PipelinePlanner:
+    def __init__(self, source_id):
+        self.source_id = source_id
+        self.caps = []
+
+    def plan(self, intended_slot, daily_draft_cap=2):
+        self.caps.append(daily_draft_cap)
+        return ContentPlan(
+            category="gym_strategy",
+            source_ids=[self.source_id],
+            intended_slot=intended_slot,
+            include_link=False,
+        )
+
+
+class _PipelineGenerator:
+    def generate_grounded_tweet(self, *_args, **_kwargs):
+        return {"text": "Empty class capacity expires when class starts."}
+
+
+class _PipelineFactGuard:
+    def check(self, _text, _sources):
+        return FactCheckResult(True, [])
+
+
+class _PipelineScorer:
+    def score_draft(self, *_args, **_kwargs):
+        return {"total": 86}
+
+
+def test_pipeline_creates_queue_draft_with_explicit_daily_cap_and_approves(tmp_path):
+    db = Database(str(tmp_path / "queue-pipeline.db"))
+    source_id = db.add_content_source("evergreen_idea", "Queue pipeline source")
+    planner = _PipelinePlanner(source_id)
+    pipeline = DraftPipeline(
+        db,
+        planner,
+        _PipelineGenerator(),
+        _PipelineFactGuard(),
+        _PipelineScorer(),
+        now_fn=lambda: datetime.now(timezone.utc),
+    )
+    anchor = datetime(2020, 1, 1, 10, 0, tzinfo=timezone.utc)
+
+    draft, outcome = pipeline.create_for_queue_with_outcome(anchor)
+
+    assert outcome == "created"
+    assert planner.caps == [4]
+    queued = db.get_queue_draft(draft["id"])
+    assert queued["translation_status"] == "pending"
+    assert db.save_review_translation(
+        draft["id"], draft["revision"], "La capacità vuota scade.",
+    )
+    assert pipeline.approve_queue(draft["id"], "floriano")
+    assert db.get_queue_draft(draft["id"])["status"] == "approved"
+
+
+def test_queue_edit_replacement_starts_without_translation_or_approval(tmp_path):
+    db = Database(str(tmp_path / "queue-edit.db"))
+    source_id = db.add_content_source("evergreen_idea", "Queue edit source")
+    planner = _PipelinePlanner(source_id)
+    pipeline = DraftPipeline(
+        db,
+        planner,
+        _PipelineGenerator(),
+        _PipelineFactGuard(),
+        _PipelineScorer(),
+        now_fn=lambda: datetime.now(timezone.utc),
+    )
+    prior, _outcome = pipeline.create_for_queue_with_outcome(
+        datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
+    )
+    assert db.save_review_translation(
+        prior["id"], prior["revision"], "Traduzione precedente.",
+    )
+
+    replacement = pipeline.edit(
+        prior["id"], "A materially different source-grounded operator insight.",
+    )
+
+    assert replacement is not None
+    old_queue = db.get_queue_draft(prior["id"])
+    new_queue = db.get_queue_draft(replacement["id"])
+    assert old_queue["translation_it"] == "Traduzione precedente."
+    assert old_queue["status"] == "superseded"
+    assert new_queue["translation_status"] == "pending"
+    assert new_queue["translation_it"] is None
+    assert new_queue["approved_queue_at"] is None
+
+
+def test_media_only_attach_and_detach_preserve_translation(tmp_path):
+    db, _source_id, draft_id = _queue_fixture(tmp_path, key="media-preserve")
+    draft = db.get_post_draft(draft_id)
+    db.ensure_editorial_queue(draft_id)
+    assert db.save_review_translation(
+        draft_id, draft["revision"], "Traduzione da preservare.",
+    )
+    media_id = db.add_media("legacy.jpg", "/tmp/legacy-queue.jpg", "image")
+    db.add_content_source(
+        "media_context",
+        "Contesto media",
+        metadata={"media_id": media_id},
+    )
+    before = db.get_queue_draft(draft_id)
+
+    assert db.attach_media_to_draft(media_id, draft_id)
+    attached = db.get_queue_draft(draft_id)
+    assert attached["revision"] == before["revision"] + 1
+    assert attached["translation_it"] == before["translation_it"]
+    assert attached["translation_status"] == "ready"
+    assert db.detach_media_from_draft(draft_id)
+    detached = db.get_queue_draft(draft_id)
+    assert detached["revision"] == attached["revision"] + 1
+    assert detached["translation_it"] == before["translation_it"]
+    assert detached["translation_status"] == "ready"
