@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import math
 import re
 from typing import Dict, List, Optional
@@ -9,6 +10,8 @@ from uuid import uuid4
 
 from modules.scoring import SCORE_AXES, semantic_similarity
 from modules.fact_guard import INCIDENT_SUBTYPES, SUPPORTED_CLAIM_TYPES
+from modules.content_planner import PORTFOLIO, SOURCE_TYPES
+from modules.source_validation import is_safe_https_url
 
 
 _REASON_CODE = re.compile(r"^[a-z0-9_:-]+$")
@@ -148,6 +151,7 @@ class DraftPipeline:
         score_threshold: int = 75,
         duplicate_threshold: float = 0.72,
         now_fn=None,
+        review_translator=None,
     ):
         self.db = db
         self.planner = planner
@@ -157,6 +161,7 @@ class DraftPipeline:
         self.score_threshold = score_threshold
         self.duplicate_threshold = duplicate_threshold
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self.review_translator = review_translator
 
     def _record(self, slot, category, outcome, details=None):
         slot_iso = _slot_iso(slot)
@@ -221,18 +226,28 @@ class DraftPipeline:
         slot_iso: str,
         recent_texts,
         candidate_index=None,
+        allow_rewrite: bool = True,
+        preserve_text: bool = False,
     ) -> _CandidateEvaluation:
         if not isinstance(text, str):
             text = ""
-        text = text.strip()
-        if not text:
+        candidate_text = text if preserve_text else text.strip()
+        if not candidate_text.strip():
             return _CandidateEvaluation(
                 None,
                 "generation_failed",
                 {"source_ids": safe_source_ids},
                 False,
             )
+        text = candidate_text
         if len(text) > 280:
+            if not allow_rewrite:
+                return _CandidateEvaluation(
+                    None,
+                    "rewrite_failed",
+                    {"source_ids": safe_source_ids},
+                    False,
+                )
             rewrite_kwargs = {"category": category}
             if candidate_index is not None:
                 rewrite_kwargs["candidate_index"] = candidate_index
@@ -355,6 +370,8 @@ class DraftPipeline:
         sources,
         slot_iso: str,
         exclude_draft_id: Optional[int] = None,
+        allow_rewrite: bool = True,
+        preserve_text: bool = False,
     ) -> Optional[_PreparedDraft]:
         evaluation = self._evaluate_copy(
             text=text,
@@ -363,6 +380,8 @@ class DraftPipeline:
             sources=sources,
             slot_iso=slot_iso,
             recent_texts=self._recent_texts(exclude_draft_id),
+            allow_rewrite=allow_rewrite,
+            preserve_text=preserve_text,
         )
         prepared = evaluation.prepared
         if prepared is not None:
@@ -565,6 +584,128 @@ class DraftPipeline:
             return None, "rejected"
         queued = self.db.ensure_editorial_queue(draft.get("id"))
         return (queued, outcome) if queued else (None, "rejected")
+
+    def create_manual_from_telegram_session(
+        self,
+        *,
+        text,
+        category,
+        source_ids,
+        media_id,
+        translation_it,
+        state_key,
+        expected_state_value,
+        session_token,
+    ):
+        """Validate exact operator copy and atomically consume its session."""
+        if (
+            type(text) is not str
+            or not text.strip()
+            or len(text) > 280
+            or type(category) is not str
+            or category not in PORTFOLIO
+            or type(source_ids) is not list
+            or not 1 <= len(source_ids) <= 3
+            or any(type(source_id) is not int or source_id <= 0 for source_id in source_ids)
+            or len(set(source_ids)) != len(source_ids)
+            or (media_id is not None and (type(media_id) is not int or media_id <= 0))
+            or type(state_key) is not str
+            or not state_key
+            or len(state_key) > 256
+            or type(expected_state_value) is not str
+            or not expected_state_value
+            or len(expected_state_value.encode("utf-8")) > 8192
+            or type(session_token) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", session_token) is None
+        ):
+            return None, "rejected"
+        current = self.now_fn()
+        if (
+            type(current) is not datetime
+            or current.tzinfo is None
+            or current.utcoffset() is None
+        ):
+            return None, "rejected"
+        current = current.astimezone(timezone.utc)
+        validated_translation = None
+        if translation_it is not None:
+            validate_translation = getattr(self.review_translator, "validate", None)
+            if not callable(validate_translation):
+                return None, "rejected"
+            translated = validate_translation(text, translation_it)
+            if translated is None:
+                return None, "rejected"
+            validated_translation = translated.text_it
+        replay, replay_outcome = self.db.get_manual_queue_replay(
+            session_token=session_token,
+            text=text,
+            category=category,
+            source_ids=source_ids,
+            media_id=media_id,
+            translation_it=validated_translation,
+        )
+        if replay_outcome != "absent":
+            return replay, replay_outcome
+        microsecond = int.from_bytes(
+            hashlib.sha256(session_token.encode("ascii")).digest()[:4],
+            "big",
+        ) % 1_000_000
+        intended_slot = current.replace(microsecond=microsecond)
+        context = self._source_context(
+            category=category,
+            source_ids=source_ids,
+            intended_slot=intended_slot,
+        )
+        if context is None:
+            return None, "no_eligible_source"
+        slot_iso, safe_source_ids, sources = context
+        if any(
+            source.get("source_type") not in SOURCE_TYPES[category]
+            for source in sources
+        ):
+            return None, "rejected"
+        urls = tuple(
+            match.group(0).rstrip(".,!?;:)")
+            for match in re.finditer(
+                r"https?://[^\s<>\[\]{}\"']+",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        selected_urls = {
+            source.get("url")
+            for source in sources
+            if type(source.get("url")) is str
+        }
+        if any(
+            not is_safe_https_url(url) or url not in selected_urls
+            for url in urls
+        ):
+            return None, "rejected"
+        prepared = self._validate_copy(
+            text=text,
+            category=category,
+            safe_source_ids=safe_source_ids,
+            sources=sources,
+            slot_iso=slot_iso,
+            allow_rewrite=False,
+            preserve_text=True,
+        )
+        if prepared is None:
+            return None, "rejected"
+        return self.db.create_manual_queue_draft_consuming_state_atomic(
+            text=prepared.text,
+            category=prepared.category,
+            source_ids=prepared.source_ids,
+            score_data=prepared.score_data,
+            intended_slot=prepared.intended_slot,
+            media_id=media_id,
+            translation_it=validated_translation,
+            state_key=state_key,
+            expected_state_value=expected_state_value,
+            session_token=session_token,
+            validation_time=current,
+        )
 
     def approve_queue(self, draft_id, approved_by) -> bool:
         """Approve an exact translated queue snapshot, ignoring legacy due time."""

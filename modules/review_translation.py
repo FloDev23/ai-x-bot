@@ -75,9 +75,27 @@ class ReviewTranslator:
             return None
         if type(translated) is not str:
             return None
-        text_it = translated.strip()
+        return self.validate(english_text, translated.strip())
+
+    def validate(
+        self,
+        english_text: str,
+        italian_text: str,
+    ) -> Optional[ReviewTranslation]:
+        """Validate operator-supplied Italian copy without calling a provider."""
+        if (
+            type(english_text) is not str
+            or not english_text.strip()
+            or len(english_text) > _MAX_TRANSLATION_CHARACTERS
+            or not _valid_utf8(english_text)
+            or len(english_text.encode("utf-8")) > _MAX_TRANSLATION_BYTES
+            or type(italian_text) is not str
+        ):
+            return None
+        text_it = italian_text
         if (
             not text_it
+            or text_it != text_it.strip()
             or len(text_it) > _MAX_TRANSLATION_CHARACTERS
             or not _valid_utf8(text_it)
             or len(text_it.encode("utf-8")) > _MAX_TRANSLATION_BYTES

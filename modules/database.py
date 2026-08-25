@@ -1618,6 +1618,351 @@ class Database:
             ).fetchone()
             return self._decode_post_draft(row), "created"
 
+    @contextmanager
+    def _manual_queue_transaction(self, media_id: Optional[int]):
+        if media_id is not None:
+            with self._media_store_mutation_lock("media", media_id) as conn:
+                yield conn
+            return
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+
+    def get_manual_queue_replay(
+        self,
+        *,
+        session_token: str,
+        text: str,
+        category: str,
+        source_ids: List[int],
+        media_id: Optional[int],
+        translation_it: Optional[str],
+    ) -> Tuple[Optional[Dict], str]:
+        """Recognize an exact committed manual request without rerunning AI gates."""
+        if (
+            type(session_token) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", session_token) is None
+            or type(text) is not str
+            or type(category) is not str
+            or type(source_ids) is not list
+            or any(type(source_id) is not int or source_id <= 0 for source_id in source_ids)
+            or len(set(source_ids)) != len(source_ids)
+            or (media_id is not None and (type(media_id) is not int or media_id <= 0))
+            or (translation_it is not None and type(translation_it) is not str)
+        ):
+            return None, "rejected"
+        publication_key = "telegram-manual:" + session_token
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM post_drafts WHERE publication_key = ?",
+                (publication_key,),
+            ).fetchone()
+            if row is None:
+                return None, "absent"
+            queue = conn.execute(
+                "SELECT * FROM editorial_queue WHERE draft_id = ?", (row["id"],)
+            ).fetchone()
+            try:
+                stored_source_ids = json.loads(row["source_ids_json"])
+                stored_scores = json.loads(row["score_json"])
+            except (TypeError, ValueError, RecursionError):
+                return None, "rejected"
+            expected_sources = list(source_ids)
+            if media_id is not None:
+                context_ids = []
+                for source_id in stored_source_ids:
+                    if source_id in source_ids:
+                        continue
+                    source = conn.execute(
+                        "SELECT source_type, metadata_json FROM content_sources "
+                        "WHERE id = ?",
+                        (source_id,),
+                    ).fetchone()
+                    if source is None or source["source_type"] != "media_context":
+                        return None, "rejected"
+                    try:
+                        metadata = json.loads(source["metadata_json"])
+                    except (TypeError, ValueError, RecursionError):
+                        return None, "rejected"
+                    if type(metadata) is not dict or metadata.get("media_id") != media_id:
+                        return None, "rejected"
+                    context_ids.append(source_id)
+                if len(context_ids) != 1:
+                    return None, "rejected"
+                expected_sources.extend(context_ids)
+            translation_status = "ready" if translation_it is not None else "pending"
+            audit_matches = False
+            for audit_row in conn.execute("""
+                SELECT details_json FROM draft_evaluations
+                WHERE intended_slot = ? AND category = ?
+                  AND outcome = 'pending_approval'
+                ORDER BY id DESC
+            """, (row["intended_slot"], category)).fetchall():
+                try:
+                    audit = json.loads(audit_row["details_json"])
+                except (TypeError, ValueError, RecursionError):
+                    continue
+                if (
+                    type(audit) is dict
+                    and audit.get("origin") == "manual"
+                    and audit.get("draft_id") == row["id"]
+                    and audit.get("source_ids") == stored_source_ids
+                    and audit.get("scores") == stored_scores
+                ):
+                    audit_matches = True
+                    break
+            exact = (
+                row["text"] == text
+                and row["category"] == category
+                and stored_source_ids == expected_sources
+                and row["media_id"] == media_id
+                and queue is not None
+                and queue["translation_status"] == translation_status
+                and queue["translation_it"] == translation_it
+                and audit_matches
+            )
+            return (
+                (self._decode_post_draft(row), "already_applied")
+                if exact
+                else (None, "rejected")
+            )
+
+    def create_manual_queue_draft_consuming_state_atomic(
+        self,
+        *,
+        text: str,
+        category: str,
+        source_ids: List[int],
+        score_data: Dict,
+        intended_slot: str,
+        media_id: Optional[int],
+        translation_it: Optional[str],
+        state_key: str,
+        expected_state_value: str,
+        session_token: str,
+        validation_time: datetime,
+    ) -> Tuple[Optional[Dict], str]:
+        """Create one exact manual review draft and consume its session."""
+        current = self._strict_aware_datetime(validation_time)
+        try:
+            normalized_slot = self._normalize_datetime_iso(intended_slot)
+            text.encode("utf-8", errors="strict")
+            expected_state_value.encode("utf-8", errors="strict")
+            json.dumps(
+                source_ids,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            score_json = json.dumps(
+                score_data,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (AttributeError, TypeError, ValueError, UnicodeError):
+            return None, "rejected"
+        if (
+            type(text) is not str
+            or not text.strip()
+            or len(text) > 280
+            or type(category) is not str
+            or re.fullmatch(r"[a-z][a-z0-9_]{1,63}", category) is None
+            or type(source_ids) is not list
+            or not 1 <= len(source_ids) <= 3
+            or any(type(source_id) is not int or source_id <= 0 for source_id in source_ids)
+            or len(set(source_ids)) != len(source_ids)
+            or type(score_data) is not dict
+            or not score_data
+            or type(score_data.get("total")) is not int
+            or not 0 <= score_data["total"] <= 100
+            or (media_id is not None and (type(media_id) is not int or media_id <= 0))
+            or (
+                translation_it is not None
+                and (
+                    type(translation_it) is not str
+                    or not translation_it.strip()
+                    or len(translation_it) > 1000
+                )
+            )
+            or type(state_key) is not str
+            or not state_key
+            or len(state_key) > 256
+            or type(expected_state_value) is not str
+            or not expected_state_value
+            or len(expected_state_value.encode("utf-8")) > 8192
+            or type(session_token) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", session_token) is None
+            or current is None
+        ):
+            return None, "rejected"
+
+        publication_key = "telegram-manual:" + session_token
+        translation_status = "ready" if translation_it is not None else "pending"
+        try:
+            with self._manual_queue_transaction(media_id) as conn:
+                media = None
+                final_source_ids = list(source_ids)
+                if media_id is not None:
+                    media = conn.execute(
+                        "SELECT * FROM media_library WHERE id = ?", (media_id,)
+                    ).fetchone()
+                    if media is None or not record_has_media_identity(dict(media)):
+                        return None, "media_unavailable"
+                    context_source_id = None
+                    for context_source in conn.execute("""
+                        SELECT id, metadata_json FROM content_sources
+                        WHERE source_type = 'media_context' ORDER BY id
+                    """).fetchall():
+                        try:
+                            metadata = json.loads(context_source["metadata_json"])
+                        except (TypeError, ValueError, RecursionError):
+                            continue
+                        if type(metadata) is dict and metadata.get("media_id") == media_id:
+                            context_source_id = context_source["id"]
+                            break
+                    if context_source_id is None:
+                        return None, "media_unavailable"
+                    if context_source_id not in final_source_ids:
+                        final_source_ids.append(context_source_id)
+                final_source_json = json.dumps(
+                    final_source_ids,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+
+                existing = conn.execute(
+                    "SELECT * FROM post_drafts WHERE publication_key = ?",
+                    (publication_key,),
+                ).fetchone()
+                if existing is not None:
+                    queue = conn.execute(
+                        "SELECT * FROM editorial_queue WHERE draft_id = ?",
+                        (existing["id"],),
+                    ).fetchone()
+                    audit_rows = conn.execute("""
+                        SELECT details_json FROM draft_evaluations
+                        WHERE intended_slot = ? AND category = ?
+                          AND outcome = 'pending_approval'
+                        ORDER BY id DESC
+                    """, (existing["intended_slot"], category)).fetchall()
+                    try:
+                        stored_scores = json.loads(existing["score_json"])
+                    except (TypeError, ValueError, RecursionError):
+                        return None, "rejected"
+                    audit_matches = False
+                    for audit_row in audit_rows:
+                        try:
+                            audit = json.loads(audit_row["details_json"])
+                        except (TypeError, ValueError, RecursionError):
+                            continue
+                        if (
+                            type(audit) is dict
+                            and audit.get("origin") == "manual"
+                            and audit.get("draft_id") == existing["id"]
+                            and audit.get("source_ids") == final_source_ids
+                            and audit.get("scores") == stored_scores
+                        ):
+                            audit_matches = True
+                            break
+                    exact = (
+                        existing["text"] == text
+                        and existing["category"] == category
+                        and existing["source_ids_json"] == final_source_json
+                        and existing["media_id"] == media_id
+                        and queue is not None
+                        and queue["translation_status"] == translation_status
+                        and queue["translation_it"] == translation_it
+                        and audit_matches
+                    )
+                    return (
+                        (self._decode_post_draft(existing), "already_applied")
+                        if exact
+                        else (None, "rejected")
+                    )
+
+                state = conn.execute(
+                    "SELECT value FROM bot_state WHERE key = ?", (state_key,)
+                ).fetchone()
+                if state is None or state["value"] != expected_state_value:
+                    return None, "session_conflict"
+                if not self._eligible_content_sources_in_conn(
+                    conn, source_ids, current,
+                ):
+                    return None, "no_eligible_source"
+                if conn.execute(
+                    "SELECT 1 FROM post_drafts WHERE intended_slot = ? "
+                    "AND status IN (" + _LIVE_DRAFT_STATUS_SQL + ") LIMIT 1",
+                    (normalized_slot,),
+                ).fetchone() is not None:
+                    return None, "rejected"
+                if media is not None and (
+                    media["lifecycle_state"] != "available"
+                    or media["file_deleted"] != 0
+                    or media["reserved_by_draft_id"] is not None
+                ):
+                    return None, "media_unavailable"
+
+                now_iso = current.isoformat()
+                cursor = conn.execute("""
+                    INSERT INTO post_drafts (
+                        publication_key, text, category, source_ids_json,
+                        score_json, intended_slot, media_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    publication_key, text, category, final_source_json,
+                    score_json, normalized_slot, media_id, now_iso, now_iso,
+                ))
+                draft_id = cursor.lastrowid
+                if media is not None:
+                    reserved = conn.execute("""
+                        UPDATE media_library
+                        SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
+                        WHERE id = ? AND lifecycle_state = 'available'
+                          AND file_deleted = 0 AND reserved_by_draft_id IS NULL
+                    """, (draft_id, media_id))
+                    if reserved.rowcount != 1:
+                        raise sqlite3.IntegrityError("manual media reservation changed")
+                self._insert_draft_evaluation_in_conn(
+                    conn,
+                    normalized_slot,
+                    category,
+                    "pending_approval",
+                    {
+                        "draft_id": draft_id,
+                        "origin": "manual",
+                        "source_ids": final_source_ids,
+                        "scores": score_data,
+                    },
+                    now_iso,
+                )
+                conn.execute("""
+                    INSERT INTO editorial_queue (
+                        draft_id, translation_it, translation_status,
+                        review_ready_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    draft_id,
+                    translation_it,
+                    translation_status,
+                    now_iso if translation_it is not None else None,
+                    now_iso,
+                    now_iso,
+                ))
+                consumed = conn.execute(
+                    "DELETE FROM bot_state WHERE key = ? AND value = ?",
+                    (state_key, expected_state_value),
+                )
+                if consumed.rowcount != 1:
+                    conn.rollback()
+                    return None, "session_conflict"
+                row = conn.execute(
+                    "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
+                ).fetchone()
+                return self._decode_post_draft(row), "created"
+        except (RuntimeError, sqlite3.IntegrityError):
+            raise
+
     def _decode_post_draft(self, row: sqlite3.Row) -> Dict:
         return self._decode_json_fields(row, {
             "source_ids_json": "source_ids",

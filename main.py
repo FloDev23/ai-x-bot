@@ -291,6 +291,7 @@ class FlexDropinGrowthAgent:
                 score_threshold=DRAFT_SCORE_THRESHOLD,
                 duplicate_threshold=SEMANTIC_DUPLICATE_THRESHOLD,
                 now_fn=self.clock,
+                review_translator=self.review_translator,
             ),
         )
         self.media_processor = resolve(
