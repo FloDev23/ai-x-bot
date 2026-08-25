@@ -113,7 +113,7 @@ def available_image(db, root):
     )
 
 
-def test_manual_copy_is_exact_and_bypasses_generation_but_uses_canonical_gates(
+def test_manual_copy_is_exact_and_bypasses_all_editorial_ai_gates(
     tmp_path,
 ):
     db = Database(str(tmp_path / "manual-exact.db"))
@@ -130,11 +130,12 @@ def test_manual_copy_is_exact_and_bypasses_generation_but_uses_canonical_gates(
     assert draft["source_ids"] == [source_id]
     assert draft["score_data"]["total"] == 75
     assert generator.calls == []
-    assert [call[0] for call in guard.calls] == [ENGLISH]
-    assert [call[0] for call in scorer.calls] == [ENGLISH]
+    assert guard.calls == []
+    assert scorer.calls == []
     queued = db.get_queue_draft(draft["id"])
-    assert queued["translation_status"] == "ready"
-    assert queued["translation_it"] == ITALIAN
+    assert queued["translation_status"] == "pending"
+    assert queued["translation_policy"] == "advisory"
+    assert queued["translation_it"] is None
     assert db.get_state(STATE_KEY) is None
 
 
@@ -169,7 +170,7 @@ def test_manual_copy_rejects_overlength_before_any_generator_call(tmp_path):
     assert db.list_post_drafts() == []
 
 
-def test_manual_copy_rejects_category_source_mismatch(tmp_path):
+def test_manual_copy_does_not_apply_generated_category_source_gate(tmp_path):
     db = Database(str(tmp_path / "manual-category-mismatch.db"))
     state, source_id = seed_session_and_source(db)
     pipeline, _generator = manual_pipeline(db)
@@ -178,23 +179,20 @@ def test_manual_copy_rejects_category_source_mismatch(tmp_path):
         pipeline, state, source_id, category="product_proof",
     )
 
-    assert (draft, outcome) == (None, "rejected")
-    assert db.get_state(STATE_KEY) == state
-
-
-def test_manual_copy_score_74_rejects_and_exact_75_accepts(tmp_path):
-    low_db = Database(str(tmp_path / "manual-score-74.db"))
-    low_state, low_source = seed_session_and_source(low_db)
-    low_pipeline, _generator = manual_pipeline(low_db, scorer=FixedScorer(74))
-    assert create_manual(low_pipeline, low_state, low_source) == (None, "rejected")
-    assert low_db.get_state(STATE_KEY) == low_state
-
-    pass_db = Database(str(tmp_path / "manual-score-75.db"))
-    pass_state, pass_source = seed_session_and_source(pass_db)
-    pass_pipeline, _generator = manual_pipeline(pass_db, scorer=FixedScorer(75))
-    draft, outcome = create_manual(pass_pipeline, pass_state, pass_source)
     assert outcome == "created"
-    assert draft["score_data"]["total"] == 75
+    assert draft["category"] == "product_proof"
+    assert db.get_state(STATE_KEY) is None
+
+
+def test_manual_copy_uses_fixed_operator_floor_without_scorer(tmp_path):
+    db = Database(str(tmp_path / "manual-score-floor.db"))
+    state, source = seed_session_and_source(db)
+    scorer = FixedScorer(0)
+    pipeline, _generator = manual_pipeline(db, scorer=scorer)
+    draft, outcome = create_manual(pipeline, state, source)
+    assert outcome == "created"
+    assert draft["score_data"] == {"authority": "operator", "total": 75}
+    assert scorer.calls == []
 
 
 def test_manual_session_replay_is_exact_and_payload_change_is_rejected(tmp_path):
@@ -277,16 +275,16 @@ def test_manual_media_rollback_preserves_session_and_availability(tmp_path):
     assert available["reserved_by_draft_id"] is None
 
 
-def test_manual_fact_rejection_preserves_session(tmp_path):
+def test_manual_operator_authority_bypasses_fact_guard(tmp_path):
     db = Database(str(tmp_path / "manual-fact-reject.db"))
     state, source_id = seed_session_and_source(db)
-    pipeline, _generator = manual_pipeline(
-        db, guard=ApprovingGuard(False, ["unsupported_number"]),
-    )
+    guard = ApprovingGuard(False, ["unsupported_number"])
+    pipeline, _generator = manual_pipeline(db, guard=guard)
 
-    assert create_manual(pipeline, state, source_id) == (None, "rejected")
-    assert db.get_state(STATE_KEY) == state
-    assert db.list_post_drafts() == []
+    draft, outcome = create_manual(pipeline, state, source_id)
+    assert outcome == "created"
+    assert draft["status"] == "approved"
+    assert guard.calls == []
 
 
 def test_manual_revoked_source_fails_closed(tmp_path):
@@ -305,7 +303,7 @@ def test_manual_revoked_source_fails_closed(tmp_path):
     assert db.get_state(STATE_KEY) == state
 
 
-def test_manual_url_must_be_safe_and_match_a_selected_source(tmp_path):
+def test_manual_url_copy_is_preserved_without_claim_analysis(tmp_path):
     for suffix, url in (
         ("http", "http://flexdropin.com/features"),
         ("credentials", "https://user:pass@flexdropin.com/features"),
@@ -323,8 +321,9 @@ def test_manual_url_must_be_safe_and_match_a_selected_source(tmp_path):
             translation_it=None,
         )
 
-        assert (draft, outcome) == (None, "rejected")
-        assert db.get_state(STATE_KEY) == state
+        assert outcome == "created"
+        assert draft["text"] == f"Read the supporting operator note: {url}"
+        assert db.get_state(STATE_KEY) is None
 
 
 def test_manual_safe_selected_source_url_is_preserved_exactly(tmp_path):
@@ -358,7 +357,7 @@ def test_manual_safe_selected_source_url_is_preserved_exactly(tmp_path):
     assert draft["text"] == exact
 
 
-def test_manual_invalid_operator_translation_preserves_session(tmp_path):
+def test_manual_translation_is_advisory_and_not_committed_with_copy(tmp_path):
     db = Database(str(tmp_path / "manual-invalid-translation.db"))
     state, source_id = seed_session_and_source(db)
     pipeline, _generator = manual_pipeline(db)
@@ -371,8 +370,12 @@ def test_manual_invalid_operator_translation_preserves_session(tmp_path):
         translation_it="Esattamente 11 note utili per gli operatori.",
     )
 
-    assert (draft, outcome) == (None, "rejected")
-    assert db.get_state(STATE_KEY) == state
+    assert outcome == "created"
+    assert draft["text"] == "Exactly 10 useful operator notes."
+    queued = db.get_queue_draft(draft["id"])
+    assert queued["translation_policy"] == "advisory"
+    assert queued["translation_status"] == "pending"
+    assert queued["translation_it"] is None
 
 
 def test_two_workers_create_one_exact_manual_draft(tmp_path):
@@ -453,18 +456,17 @@ class CrashConnection:
         return getattr(self._connection, name)
 
 database_module.sqlite3.connect = lambda path: CrashConnection(real_connect(path))
-db.create_manual_queue_draft_consuming_state_atomic(
+db.create_manual_approved_draft_consuming_state_atomic(
     text=sys.argv[4],
     category="founder_journey",
     source_ids=[int(sys.argv[3])],
-    score_data={"total": 75},
     intended_slot="2026-08-24T12:00:00.114616+00:00",
     media_id=None,
-    translation_it=sys.argv[5],
     state_key=sys.argv[2],
     expected_state_value=sys.argv[6],
     session_token=sys.argv[7],
-    validation_time=datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc),
+    operator="floriano",
+    now=datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc),
 )
 '''
 

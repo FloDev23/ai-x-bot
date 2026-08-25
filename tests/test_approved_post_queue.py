@@ -30,6 +30,7 @@ QUEUE_TABLES = {
         "revision",
         "created_at",
         "updated_at",
+        "translation_policy",
     ),
     "publication_plans": (
         "id",
@@ -162,6 +163,57 @@ def test_queue_migration_backfills_pending_and_approved_without_mutation(tmp_pat
         assert queue_rows[draft_id]["translation_status"] == "pending"
         assert queue_rows[draft_id]["translation_it"] is None
         assert queue_rows[draft_id]["approved_queue_at"] is None
+
+
+def test_manual_origin_migration_requires_exact_legacy_audit(tmp_path):
+    path = tmp_path / "legacy-manual-origin.db"
+    db = Database(str(path))
+    source_id = db.add_content_source(
+        "founder_note", "A verified legacy operator observation.",
+        verified_by="floriano",
+    )
+    state_key = "telegram_session:legacy"
+    state = json.dumps(
+        {"token": "legacyManualToken_123456", "v": 1},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    db.set_state(state_key, state)
+    manual, outcome = db.create_manual_queue_draft_consuming_state_atomic(
+        text="Exact legacy operator copy.",
+        category="founder_journey",
+        source_ids=[source_id],
+        score_data={"total": 75},
+        intended_slot="2026-08-20T12:00:00+00:00",
+        media_id=None,
+        translation_it=None,
+        state_key=state_key,
+        expected_state_value=state,
+        session_token="legacyManualToken_123456",
+        validation_time=datetime(2026, 8, 20, 11, 0, tzinfo=timezone.utc),
+    )
+    assert outcome == "created"
+    generated_id = db.create_post_draft(
+        "Generated copy",
+        "gym_strategy",
+        [source_id],
+        {"total": 80},
+        "2026-08-20T13:00:00+00:00",
+        "telegram-manual:not-backed-by-a-manual-audit",
+    )
+    db.ensure_editorial_queue(generated_id)
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE post_drafts DROP COLUMN origin")
+        conn.execute("ALTER TABLE editorial_queue DROP COLUMN translation_policy")
+
+    migrated = Database(str(path))
+    assert migrated.get_post_draft(manual["id"])["origin"] == "manual_operator"
+    assert migrated.get_queue_draft(manual["id"])["translation_policy"] == "advisory"
+    assert migrated.get_post_draft(generated_id)["origin"] == "generated"
+    assert migrated.get_queue_draft(generated_id)["translation_policy"] == "required"
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
 def test_queue_migration_serializes_concurrent_constructors(tmp_path):

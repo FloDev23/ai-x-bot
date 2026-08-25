@@ -450,6 +450,7 @@ class PublicationPlanner:
         text = draft.get("text")
         category = draft.get("category")
         source_ids = draft.get("source_ids")
+        origin = draft.get("origin")
         score_data = draft.get("score_data")
         approval = self._parse_aware(draft.get("approved_queue_at"))
         if (
@@ -461,7 +462,7 @@ class PublicationPlanner:
             or type(category) is not str
             or not category.strip()
             or type(source_ids) is not list
-            or not source_ids
+            or (not source_ids and origin != "manual_operator")
             or any(type(source_id) is not int or source_id <= 0 for source_id in source_ids)
             or type(score_data) is not dict
             or type(score_data.get("total")) is not int

@@ -238,14 +238,13 @@ def test_manual_newpost_enters_approved_reserve_without_x_write(tmp_path):
     for update in updates:
         assert agent.telegram_controller.process_update(update) == "processed"
 
-    pending = agent.db.list_post_drafts(["pending_approval"])
-    assert len(pending) == 1
-    queued = agent.db.get_queue_draft(pending[0]["id"])
-    assert queued["translation_status"] == "ready"
-    assert queued["translation_it"].startswith("Traduzione italiana fedele:")
-    assert agent.telegram_controller.process_update(
-        callback_update(317, f"draft:approve:{queued['id']}")
-    ) == "processed"
+    drafts = agent.db.list_post_drafts(["approved"])
+    assert len(drafts) == 1
+    queued = agent.db.get_queue_draft(drafts[0]["id"])
+    assert queued["origin"] == "manual_operator"
+    assert queued["translation_policy"] == "advisory"
+    assert queued["translation_status"] == "pending"
+    assert queued["translation_it"] is None
     approved = agent.db.get_queue_draft(queued["id"])
     assert approved["status"] == "approved"
     assert dependencies["x_client"].posts == []
