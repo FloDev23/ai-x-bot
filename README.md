@@ -31,9 +31,9 @@ La configurazione completa e la procedura VPS sono in [SETUP.md](SETUP.md).
 
 ## Scheduler sicuro
 
-Lo scheduler gira in `Europe/Rome`; le due ore di pubblicazione vengono invece
-calcolate come orari reali `America/New_York`, quindi seguono automaticamente
-l'ora legale statunitense. Il processo registra soltanto:
+Lo scheduler gira in `Europe/Rome`; le due o tre ore di pubblicazione vengono
+invece calcolate come orari reali `America/New_York`, quindi seguono
+automaticamente l'ora legale statunitense. Il processo registra soltanto:
 
 - refresh indipendente del blog FlexDropin e delle news allowlisted alle 10:30;
 - rifornimento della coda approvabile ogni 30 minuti;
@@ -52,22 +52,28 @@ Telegram long polling gira in un thread daemon nominato. Scheduler e polling con
 ## Flusso quotidiano
 
 1. Il refresh automatico aggiorna il blog FlexDropin e le eventuali news fidate.
-2. Ogni 30 minuti il bot prova a mantenere una riserva di 7 post: massimo 3
-   bozze in revisione e 4 nuove bozze per giorno `Europe/Rome`.
+2. Ogni 30 minuti il bot prova a mantenere una riserva di 14 post: massimo 5
+   bozze in revisione e 5 nuove bozze per giorno `Europe/Rome`.
 3. Fact guard, scorer e duplicate gate rifiutano contenuti non sicuri.
 4. Telegram mostra sempre il tweet inglese completo e sotto la traduzione
    italiana completa, marcata come testo di sola revisione.
 5. Solo il callback `Approva` della chat autorizzata inserisce la bozza nella
    riserva pubblicabile. Una traduzione mancante o stale blocca l'approvazione.
-6. Ogni giorno vengono creati esattamente due piani: uno tra 08:30–11:30 ET e
-   uno tra 16:30–20:30 ET, distanti almeno 6 ore. Dopo 30 post maturi il bot
-   apprende le fasce migliori; il peso del giorno della settimana parte da 90.
+6. Ogni giorno vengono creati almeno due piani. Nel cold start martedì, giovedì
+   e sabato ne vengono creati tre; dopo 30 post maturi il bot può scegliere
+   dinamicamente tre giorni settimanali. Gli slot cadono nelle finestre
+   08:30–10:30, 13:00–15:30 e 18:00–20:30 ET, separati da almeno 4 ore.
 7. Al momento dovuto `Publisher` ricontrolla piano, revisione, fonti, pausa,
    media e idempotenza, quindi invia a X esclusivamente il testo inglese.
 8. Con `DRY_RUN=true` il piano diventa `simulated`, la bozza resta approvata e
    non viene eseguita alcuna chiamata di scrittura X.
 
-I comandi Telegram includono `/status`, `/posts`, `/growth`, `/stats`, `/ideas`, `/pause`, `/resume`, `/errors` e `/help`. Il refresh riuscito o senza novità è silenzioso; `/errors` mostra solo codici di errore sistemici sanitizzati.
+I comandi Telegram includono `/status`, `/posts`, `/growth`, `/stats`, `/ideas`,
+`/newpost`, `/pause`, `/resume`, `/errors` e `/help`. `/newpost` conserva il
+testo inglese esatto, fa scegliere categoria, 1–3 fonti e un media facoltativo,
+poi prepara o acquisisce la traduzione italiana prima di creare una sola bozza
+in revisione. Il refresh riuscito o senza novità è silenzioso; `/errors` mostra
+solo codici di errore sistemici sanitizzati.
 
 ## Fonti automatiche
 
@@ -86,13 +92,14 @@ git diff --check
 ```
 
 Il test end-to-end è in `tests/test_end_to_end_dry_run.py` e prova fonte →
-coda bilingue → approvazione Telegram → riserva da 7 → due piani ET → due
-simulazioni, incluso un riavvio senza duplicati e zero scritture X/engagement.
+coda bilingue → approvazione Telegram → riserva da 14 → due/tre piani ET →
+simulazioni, incluso un riavvio senza duplicati, `/newpost` e zero scritture
+X/engagement.
 
 Prima di ogni riavvio sul VPS, `deploy.sh` esegue un preflight in sola lettura
 che richiede `APPROVAL_REQUIRED=true`, `DRY_RUN=true`, configurazione valida e
 `PRAGMA integrity_check=ok`. Il passaggio alla pubblicazione automatica reale è
-una fase separata: richiede due giornate USA simulate, una riserva di 7 post,
+una fase separata: richiede due giornate USA simulate, una riserva di 14 post,
 `/errors` pulito e una nuova autorizzazione esplicita prima di cambiare
 `DRY_RUN`. La procedura completa è in [SETUP.md](SETUP.md).
 

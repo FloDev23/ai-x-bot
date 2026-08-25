@@ -2,7 +2,7 @@
 
 Questa release usa Telegram come control plane obbligatorio. `DRY_RUN=false`
 permette soltanto a `Publisher` di inviare una bozza inglese già approvata in
-Telegram e assegnata a uno dei due piani giornalieri USA. La traduzione italiana
+Telegram e assegnata a uno dei piani giornalieri USA. La traduzione italiana
 è esclusivamente un aiuto privato alla revisione e non raggiunge mai X.
 
 ## 1. Prerequisiti
@@ -64,15 +64,18 @@ Usare questi valori durante tutto il dry-run:
 ```dotenv
 BOT_TIMEZONE=Europe/Rome
 POSTS_PER_DAY=2
-APPROVED_QUEUE_TARGET=7
-PENDING_REVIEW_LIMIT=3
-DRAFT_GENERATION_DAILY_CAP=4
+THIRD_POST_DAYS_PER_WEEK=3
+APPROVED_QUEUE_TARGET=14
+PENDING_REVIEW_LIMIT=5
+DRAFT_GENERATION_DAILY_CAP=5
 AUDIENCE_TIMEZONE=America/New_York
-MORNING_WINDOW=08:30-11:30
-EVENING_WINDOW=16:30-20:30
-MIN_POST_GAP_HOURS=6
+MORNING_WINDOW=08:30-10:30
+MIDDAY_WINDOW=13:00-15:30
+EVENING_WINDOW=18:00-20:30
+MIN_POST_GAP_HOURS=4
 ADAPTIVE_TIMING_MIN_POSTS=30
 ADAPTIVE_WEEKDAY_MIN_POSTS=90
+THIRD_POST_TIMING_MIN_POSTS=30
 PUBLICATION_PLAN_GRACE_MINUTES=90
 APPROVAL_REQUIRED=true
 DRY_RUN=true
@@ -129,6 +132,8 @@ Completare e annotare tutta la checklist:
 
 - [ ] autorizzazione Telegram: la chat corretta funziona e una chat diversa è ignorata;
 - [ ] inserimento e classificazione di una fonte testuale;
+- [ ] `/newpost`: testo inglese esatto, categoria, 1–3 fonti, media facoltativo
+      e traduzione manuale/automatica producono una sola card bilingue;
 - [ ] upload di una foto senza creazione automatica di una bozza;
 - [ ] upload di un video senza creazione automatica di una bozza;
 - [ ] ricezione della preview della bozza e del media abbinato;
@@ -138,9 +143,10 @@ Completare e annotare tutta la checklist:
 - [ ] reinvio dello stesso callback senza doppia mutazione;
 - [ ] digest growth con link/username e sole azioni manuali;
 - [ ] snapshot follower e report `/stats` coerenti;
-- [ ] riserva `approved/planned` pari a 7 e non più di 3 card in revisione;
-- [ ] due giornate `America/New_York` con 2 piani `simulated` al giorno, uno
-      nella finestra mattutina e uno nella finestra serale, separati di 6 ore;
+- [ ] riserva `approved/planned` pari a 14 e non più di 5 card in revisione;
+- [ ] due giornate `America/New_York` con almeno 2 piani `simulated` al giorno;
+      nei giorni a tre post sono presenti mattina, metà giornata e sera, con
+      almeno 4 ore di distanza;
 - [ ] `/errors` privo di errori sistemici irrisolti;
 - [ ] conteggio scritture X pari a zero, inclusi post ed engagement.
 
@@ -193,8 +199,9 @@ APPROVAL_REQUIRED=true
 DRY_RUN=true
 ```
 
-1. Completare due intere giornate USA in dry-run con 2 piani simulati per
-   giornata, riserva da 7, card bilingui complete, `/errors` pulito e zero write X.
+1. Completare due intere giornate USA in dry-run con almeno 2 piani simulati per
+   giornata e 3 nei giorni selezionati, riserva da 14, card bilingui complete,
+   `/errors` pulito e zero write X.
 2. Controllare su Telegram le bozze approvate, gli orari ET/Roma e gli eventuali
    media. Usare `/pause` se esiste qualunque dubbio.
 3. Eseguire backup SQLite e preflight; annotare HEAD e conteggi dei piani.
@@ -205,8 +212,9 @@ DRY_RUN=true
 6. Sorvegliare il primo piano dovuto. `published` deve produrre un solo tweet;
    `unknown`/`publication_unknown` richiede riconciliazione manuale su X e non
    va mai ritentato. In caso di errore usare subito `/pause`.
-7. Dopo il primo giorno live verificare esattamente due pubblicazioni, testo X
-   solo inglese, media corretto, nessun engagement automatico e `/errors` pulito.
+7. Dopo il primo giorno live verificare almeno due pubblicazioni e, nei giorni
+   selezionati, al massimo tre; testo X solo inglese, media corretto, nessun
+   engagement automatico e `/errors` pulito.
 
 ## Troubleshooting
 
