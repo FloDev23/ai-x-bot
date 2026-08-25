@@ -17,6 +17,7 @@ from modules.draft_pipeline import DraftPipeline
 from modules.fact_guard import FactCheckResult
 from modules.media_processor import MediaProcessor
 from modules.media_store import media_store_lock
+from modules.review_translation import ReviewTranslation
 from modules.telegram_api import (
     TELEGRAM_MESSAGE_MAX_CHARS,
     TelegramApi,
@@ -103,6 +104,7 @@ class StubPipeline:
     def __init__(self, db):
         self.db = db
         self.calls = []
+        self.review_translator = StubManualTranslator()
 
     def approve(self, draft_id, approved_by):
         self.calls.append(("approve", draft_id, approved_by))
@@ -155,6 +157,50 @@ class StubPipeline:
         self.calls.append(("discard", draft_id, reason))
         return self.db.transition_post_draft(
             draft_id, ["pending_approval"], "discarded", error=reason,
+        )
+
+    def create_manual_from_telegram_session(
+        self,
+        *,
+        text,
+        category,
+        source_ids,
+        media_id,
+        translation_it,
+        state_key,
+        expected_state_value,
+        session_token,
+    ):
+        self.calls.append(("manual", text, category, source_ids, media_id))
+        microsecond = int(session_token[:6], 16) % 1_000_000
+        return self.db.create_manual_queue_draft_consuming_state_atomic(
+            text=text,
+            category=category,
+            source_ids=source_ids,
+            score_data={"total": 88},
+            intended_slot=datetime(
+                2029, 8, 15, 12, 0, 0, microsecond, tzinfo=timezone.utc,
+            ).isoformat(),
+            media_id=media_id,
+            translation_it=translation_it,
+            state_key=state_key,
+            expected_state_value=expected_state_value,
+            session_token=session_token,
+            validation_time=datetime(2029, 8, 15, 12, 0, tzinfo=timezone.utc),
+        )
+
+
+class StubManualTranslator:
+    def __init__(self, translated="Traduzione automatica privata."):
+        self.translated = translated
+        self.calls = []
+
+    def translate(self, english_text):
+        self.calls.append(english_text)
+        return (
+            ReviewTranslation(self.translated)
+            if isinstance(self.translated, str)
+            else None
         )
 
 
@@ -1296,6 +1342,185 @@ def test_status_exposes_queue_and_us_publication_targets(tmp_path):
     assert "generazione oggi: 0/5" in rendered
     assert "pubblicazioni target oggi: 2" in rendered
     assert "pubblico: Stati Uniti (America/New_York)" in rendered
+
+
+def test_newpost_exact_text_survives_restart_to_bilingual_card(tmp_path):
+    db = Database(str(tmp_path / "manual-workflow.db"))
+    source_id = db.add_content_source(
+        "founder_note",
+        "I learned that careful operator notes deserve review.",
+        metadata={"publishable": True},
+        verified_by="floriano",
+    )
+    telegram = WorkflowTelegramApi(tmp_path)
+    pipeline = StubPipeline(db)
+    controller = workflow_controller(db, telegram, pipeline=pipeline)
+    exact_english = "  An exact operator note, preserved for review.  "
+    exact_italian = "Una nota esatta per gli operatori, conservata per la revisione."
+
+    assert controller.process_update(message_update(400, "/newpost")) == "processed"
+    assert controller.process_update(message_update(401, exact_english)) == "processed"
+    restarted = workflow_controller(db, telegram, pipeline=pipeline)
+    assert restarted.process_update(
+        callback_update(402, "manual:category:founder_journey")
+    ) == "processed"
+    assert restarted.process_update(
+        callback_update(403, f"manual:source:{source_id}")
+    ) == "processed"
+    assert restarted.process_update(
+        callback_update(404, "manual:sources_done")
+    ) == "processed"
+    assert restarted.process_update(
+        callback_update(405, "manual:media:none")
+    ) == "processed"
+    assert restarted.process_update(
+        callback_update(406, "manual:translation:manual")
+    ) == "processed"
+    assert restarted.process_update(message_update(407, exact_italian)) == "processed"
+
+    drafts = db.list_post_drafts(["pending_approval"])
+    assert len(drafts) == 1
+    assert drafts[0]["text"] == exact_english
+    queued = db.get_queue_draft(drafts[0]["id"])
+    assert queued["translation_it"] == exact_italian
+    assert queued["translation_status"] == "ready"
+    assert db.get_state("telegram_session:42") is None
+    rendered = "\n".join(message[1] for message in telegram.messages)
+    assert "Tweet da pubblicare" in rendered
+    assert exact_english.strip() in rendered
+    assert exact_italian in rendered
+
+
+def test_newpost_auto_translation_failure_creates_one_pending_draft(tmp_path):
+    db = Database(str(tmp_path / "manual-auto-pending.db"))
+    source_id = db.add_content_source(
+        "founder_note",
+        "A private founder note suitable for review.",
+        metadata={"publishable": True},
+        verified_by="floriano",
+    )
+    telegram = WorkflowTelegramApi(tmp_path)
+    pipeline = StubPipeline(db)
+    pipeline.review_translator.translated = None
+    controller = workflow_controller(db, telegram, pipeline=pipeline)
+
+    updates = (
+        message_update(410, "/newpost"),
+        message_update(411, "Manual copy awaiting private translation."),
+        callback_update(412, "manual:category:founder_journey"),
+        callback_update(413, f"manual:source:{source_id}"),
+        callback_update(414, "manual:sources_done"),
+        callback_update(415, "manual:media:none"),
+        callback_update(416, "manual:translation:auto"),
+    )
+    for update in updates:
+        assert controller.process_update(update) == "processed"
+
+    drafts = db.list_post_drafts(["pending_approval"])
+    assert len(drafts) == 1
+    queued = db.get_queue_draft(drafts[0]["id"])
+    assert queued["translation_status"] == "pending"
+    assert queued["translation_it"] is None
+    assert pipeline.review_translator.calls == [drafts[0]["text"]]
+    assert db.get_state("telegram_session:42") is None
+
+
+def test_newpost_is_authorized_and_cancel_is_restart_safe(tmp_path):
+    db = Database(str(tmp_path / "manual-auth-cancel.db"))
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    assert controller.process_update(
+        message_update(420, "/newpost", chat_id=999)
+    ) == "unauthorized"
+    assert db.get_state("telegram_session:999") is None
+    assert controller.process_update(message_update(421, "/newpost")) == "processed"
+    assert controller.process_update(
+        callback_update(422, "manual:cancel")
+    ) == "processed"
+    assert db.get_state("telegram_session:42") is None
+
+
+def test_newpost_can_reserve_available_media_and_replay_does_not_duplicate(tmp_path):
+    db = Database(str(tmp_path / "manual-media-workflow.db"))
+    source_id = db.add_content_source(
+        "founder_note",
+        "PRIVATE_SOURCE_BODY_MUST_NOT_BE_RENDERED",
+        metadata={"publishable": True, "title": "Founder lesson"},
+        verified_by="floriano",
+    )
+    media_root = tmp_path / "manual-media-library"
+    media_root.mkdir(mode=0o700)
+    staged = media_root / "manual-staged.jpg"
+    content = b"\xff\xd8\xff\xe0manual-workflow-media"
+    staged.write_bytes(content)
+    media = MediaProcessor(db).process_new_file(
+        str(staged),
+        "manual-photo.jpg",
+        "image/jpeg",
+        len(content),
+        "A studio operator welcoming a drop-in athlete.",
+    )
+    telegram = WorkflowTelegramApi(tmp_path)
+    pipeline = StubPipeline(db)
+    controller = workflow_controller(db, telegram, pipeline=pipeline)
+    updates = (
+        message_update(430, "/newpost"),
+        message_update(431, "A useful founder lesson for flexible fitness."),
+        callback_update(432, "manual:category:founder_journey"),
+        callback_update(433, f"manual:source:{source_id}"),
+        callback_update(434, "manual:sources_done"),
+        callback_update(435, f"manual:media:{media['id']}"),
+        callback_update(436, "manual:translation:auto"),
+    )
+    for update in updates:
+        assert controller.process_update(update) == "processed"
+
+    drafts = db.list_post_drafts(["pending_approval"])
+    assert len(drafts) == 1
+    assert drafts[0]["media_id"] == media["id"]
+    reserved = db.get_media_by_id(media["id"])
+    assert reserved["lifecycle_state"] == "reserved"
+    assert reserved["reserved_by_draft_id"] == drafts[0]["id"]
+    assert controller.process_update(
+        callback_update(437, "manual:translation:auto")
+    ) == "processed"
+    assert len(db.list_post_drafts(["pending_approval"])) == 1
+    rendered = "\n".join(message[1] for message in telegram.messages)
+    assert "PRIVATE_SOURCE_BODY_MUST_NOT_BE_RENDERED" not in rendered
+
+
+def test_newpost_rejects_unsafe_urls_and_category_source_mismatch(tmp_path):
+    db = Database(str(tmp_path / "manual-invalid-input.db"))
+    product_source = db.add_content_source(
+        "product_fact",
+        "Verified product fact.",
+        verified_by="floriano",
+    )
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    assert controller.process_update(message_update(440, "/newpost")) == "processed"
+    assert controller.process_update(
+        message_update(441, "Read this unsafe URL http://example.com/report")
+    ) == "processed"
+    assert db.list_post_drafts() == []
+    session = controller._decode_session(db.get_state("telegram_session:42"))
+    assert session["step"] == "text"
+
+    assert controller.process_update(
+        message_update(442, "A source-backed founder observation.")
+    ) == "processed"
+    assert controller.process_update(
+        callback_update(443, "manual:category:founder_journey")
+    ) == "processed"
+    assert controller.process_update(
+        callback_update(444, f"manual:source:{product_source}")
+    ) == "processed"
+    session = controller._decode_session(db.get_state("telegram_session:42"))
+    assert session["step"] == "sources"
+    assert session["payload"]["source_ids"] == []
+    assert db.list_post_drafts() == []
 
 
 def test_status_and_posts_show_planned_time_in_et_and_rome(tmp_path):

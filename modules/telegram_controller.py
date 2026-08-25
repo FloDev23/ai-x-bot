@@ -21,6 +21,8 @@ from config import (
     POSTS_PER_DAY,
 )
 from modules.media_store import open_verified_media
+from modules.content_planner import PORTFOLIO, SOURCE_TYPES as MANUAL_SOURCE_TYPES
+from modules.source_validation import is_safe_https_url
 from modules.telegram_api import (
     TELEGRAM_CAPTION_MAX_CHARS,
     TELEGRAM_CALLBACK_DATA_MAX_BYTES,
@@ -42,12 +44,23 @@ _SESSION_KINDS = {
     "source_intake": {"text", "classification", "news_url", "news_date", "news_source"},
     "draft_edit": {"text"},
     "draft_postpone": {"slot"},
+    "manual_post": {
+        "text", "category", "sources", "media",
+        "translation_mode", "translation_text",
+    },
 }
 _SOURCE_TYPES = {
     "founder_note": "Founder note",
     "product_fact": "Product fact",
     "evergreen_idea": "Evergreen idea",
     "verified_news": "Verified news",
+}
+_MANUAL_CATEGORY_LABELS = {
+    "gym_strategy": "Strategia palestra",
+    "fitness_business_insight": "Business fitness",
+    "shareable_fitness": "Fitness condivisibile",
+    "product_proof": "Prodotto",
+    "founder_journey": "Percorso founder",
 }
 _GROWTH_REASONS = {
     "not_relevant": "Non pertinente",
@@ -111,6 +124,7 @@ class TelegramController:
             "/growth": self._growth,
             "/stats": self._stats,
             "/ideas": self._ideas,
+            "/newpost": self._newpost,
             "/pause": self._pause,
             "/resume": self._resume,
             "/errors": self._errors,
@@ -878,6 +892,157 @@ class TelegramController:
         self._send(chat_id, "\n".join(lines))
         return "ideas"
 
+    def _newpost(self, chat_id: str):
+        self._set_session(chat_id, "manual_post", "text", {})
+        self._send(
+            chat_id,
+            "Invia il testo inglese esatto del post (massimo 280 caratteri).",
+            reply_markup=self._callback_markup([[
+                self._callback_button("Annulla", "manual:cancel"),
+            ]]),
+        )
+        return "manual_text_input"
+
+    def _manual_category_markup(self):
+        rows = [
+            [self._callback_button(
+                _MANUAL_CATEGORY_LABELS[category],
+                f"manual:category:{category}",
+            )]
+            for category in PORTFOLIO
+        ]
+        rows.append([self._callback_button("Annulla", "manual:cancel")])
+        return self._callback_markup(rows)
+
+    @staticmethod
+    def _manual_text_urls_are_safe(text: str) -> bool:
+        urls = tuple(
+            match.group(0).rstrip(".,!?;:)")
+            for match in re.finditer(
+                r"https?://[^\s<>\[\]{}\"']+",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        return all(is_safe_https_url(url) for url in urls)
+
+    def _manual_source_markup(self, category: str, selected_ids):
+        allowed_types = MANUAL_SOURCE_TYPES.get(category, set())
+        try:
+            sources = self.db.get_eligible_sources(now=self._now())
+        except Exception:
+            sources = []
+        rows = []
+        selected = set(selected_ids)
+        for source in sources:
+            source_id = source.get("id")
+            source_type = source.get("source_type")
+            if (
+                type(source_id) is not int
+                or source_id <= 0
+                or source_type not in allowed_types
+            ):
+                continue
+            metadata = source.get("metadata")
+            title = ""
+            if isinstance(metadata, dict):
+                title = self._clean_text(
+                    metadata.get("title") or metadata.get("source_name"), 42,
+                )
+            marker = "✓ " if source_id in selected else ""
+            label = f"{marker}#{source_id} {source_type}"
+            if title:
+                label += f" — {title}"
+            rows.append([
+                self._callback_button(label[:64], f"manual:source:{source_id}")
+            ])
+            if len(rows) >= 20:
+                break
+        rows.append([
+            self._callback_button("Fonti selezionate", "manual:sources_done")
+        ])
+        rows.append([self._callback_button("Annulla", "manual:cancel")])
+        return self._callback_markup(rows)
+
+    def _manual_media_markup(self):
+        try:
+            media_rows = self.db.get_available_media(limit=10)
+        except Exception:
+            media_rows = []
+        rows = [[self._callback_button("Nessun media", "manual:media:none")]]
+        for media in media_rows:
+            media_id = media.get("id")
+            if type(media_id) is not int or media_id <= 0:
+                continue
+            filename = self._clean_text(media.get("filename"), 44) or "media"
+            rows.append([
+                self._callback_button(
+                    f"#{media_id} {filename}"[:64],
+                    f"manual:media:{media_id}",
+                )
+            ])
+        rows.append([self._callback_button("Annulla", "manual:cancel")])
+        return self._callback_markup(rows)
+
+    def _finish_manual_post(
+        self,
+        chat_id: str,
+        raw: str,
+        session: Dict[str, Any],
+        translation_it: Optional[str],
+    ):
+        if self.draft_pipeline is None:
+            self._send(chat_id, "Pipeline bozze non disponibile.")
+            return "draft_unavailable"
+        payload = session["payload"]
+        try:
+            draft, outcome = (
+                self.draft_pipeline.create_manual_from_telegram_session(
+                    text=payload["text"],
+                    category=payload["category"],
+                    source_ids=list(payload["source_ids"]),
+                    media_id=payload["media_id"],
+                    translation_it=translation_it,
+                    state_key=self._session_key(chat_id),
+                    expected_state_value=raw,
+                    session_token=session["token"],
+                )
+            )
+        except Exception:
+            self._send(
+                chat_id,
+                "Creazione non riuscita. La sessione è ancora disponibile.",
+            )
+            return "manual_create_failed"
+        if outcome == "session_conflict":
+            self._send(chat_id, "Operazione già gestita.")
+            return "session_conflict"
+        if outcome not in {"created", "already_applied"} or not isinstance(
+            draft, dict,
+        ):
+            messages = {
+                "no_eligible_source": "Le fonti selezionate non sono più disponibili.",
+                "media_unavailable": "Il media selezionato non è più disponibile.",
+            }
+            self._send(
+                chat_id,
+                messages.get(
+                    outcome,
+                    "Post respinto dai controlli editoriali. Correggi e riprova.",
+                ),
+            )
+            return "manual_rejected"
+        queued = self.db.get_queue_draft(draft.get("id")) or draft
+        if queued.get("translation_status") == "ready":
+            self._send(chat_id, "Post manuale aggiunto alla coda di revisione.")
+        else:
+            self._send(
+                chat_id,
+                "Post salvato; traduzione italiana ancora in preparazione.",
+            )
+        self._send_draft_card(chat_id, queued)
+        return "manual_created"
+
     def _pause(self, chat_id: str):
         self.db.set_state("paused", "true")
         self._send(chat_id, "Pubblicazioni in pausa.")
@@ -911,6 +1076,7 @@ class TelegramController:
             "/growth — candidati manuali",
             "/stats — riepilogo performance",
             "/ideas — aggiungi una fonte",
+            "/newpost — aggiungi un post manuale alla coda",
             "/pause — ferma le pubblicazioni",
             "/resume — riattiva le pubblicazioni",
             "/errors — ultimi errori sicuri",
@@ -922,10 +1088,17 @@ class TelegramController:
     def _session_key(chat_id: str) -> str:
         return f"telegram_session:{chat_id}"
 
-    def _session_value(self, kind: str, step: str, payload: Dict[str, Any]) -> str:
+    def _session_value(
+        self,
+        kind: str,
+        step: str,
+        payload: Dict[str, Any],
+        *,
+        token: Optional[str] = None,
+    ) -> str:
         session = {
             "version": _SESSION_VERSION,
-            "token": uuid4().hex,
+            "token": token or uuid4().hex,
             "kind": kind,
             "step": step,
             "payload": payload,
@@ -972,6 +1145,51 @@ class TelegramController:
                 set(payload) == {"draft_id"}
                 and type(payload.get("draft_id")) is int
                 and 0 < payload["draft_id"] <= _SQLITE_INTEGER_MAX
+            )
+        if kind == "manual_post":
+            if step == "text":
+                return payload == {}
+            text = payload.get("text")
+            if (
+                type(text) is not str
+                or not text.strip()
+                or len(text) > 280
+            ):
+                return False
+            if step == "category":
+                return set(payload) == {"text"}
+            category = payload.get("category")
+            source_ids = payload.get("source_ids")
+            if (
+                type(category) is not str
+                or category not in PORTFOLIO
+                or type(source_ids) is not list
+                or len(source_ids) > 3
+                or any(
+                    type(source_id) is not int
+                    or not 0 < source_id <= _SQLITE_INTEGER_MAX
+                    for source_id in source_ids
+                )
+                or len(set(source_ids)) != len(source_ids)
+            ):
+                return False
+            if step == "sources":
+                return set(payload) == {"text", "category", "source_ids"}
+            if not source_ids:
+                return False
+            if step == "media":
+                return set(payload) == {"text", "category", "source_ids"}
+            media_id = payload.get("media_id")
+            if media_id is not None and (
+                type(media_id) is not int
+                or not 0 < media_id <= _SQLITE_INTEGER_MAX
+            ):
+                return False
+            return (
+                step in {"translation_mode", "translation_text"}
+                and set(payload) == {
+                    "text", "category", "source_ids", "media_id",
+                }
             )
         return False
 
@@ -1027,7 +1245,14 @@ class TelegramController:
         step: str,
         payload: Dict[str, Any],
     ) -> bool:
-        new_value = self._session_value(kind, step, payload)
+        try:
+            prior = json.loads(expected_raw)
+        except (TypeError, ValueError):
+            return False
+        token = prior.get("token") if isinstance(prior, dict) else None
+        if not isinstance(token, str) or _SAFE_TOKEN.fullmatch(token) is None:
+            return False
+        new_value = self._session_value(kind, step, payload, token=token)
         return self.db.compare_and_set_state(
             self._session_key(chat_id), expected_raw, new_value,
         )
@@ -1050,6 +1275,37 @@ class TelegramController:
         kind = session["kind"]
         step = session["step"]
         payload = session["payload"]
+        if kind == "manual_post":
+            if step == "text":
+                if (
+                    not text.strip()
+                    or len(text) > 280
+                    or not self._manual_text_urls_are_safe(text)
+                ):
+                    self._send(
+                        chat_id,
+                        "Testo non valido: massimo 280 caratteri e solo URL HTTPS sicuri.",
+                    )
+                    return "invalid_manual_text"
+                if not self._replace_session(
+                    chat_id, raw, kind, "category", {"text": text},
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                self._send(
+                    chat_id,
+                    "Scegli la categoria editoriale.",
+                    reply_markup=self._manual_category_markup(),
+                )
+                return "manual_category"
+            if step == "translation_text":
+                return self._finish_manual_post(
+                    chat_id,
+                    raw,
+                    session,
+                    text,
+                )
+
         if kind == "source_intake":
             if step == "text":
                 if not clean or len(clean) > 2000:
@@ -1245,6 +1501,8 @@ class TelegramController:
             return self._growth_callback(chat_id, parts)
         if parts[0] == "input":
             return self._input_callback(chat_id, parts)
+        if parts[0] == "manual":
+            return self._manual_callback(chat_id, parts)
         self._send(chat_id, "Azione non valida.")
         return "invalid_callback"
 
@@ -1428,6 +1686,194 @@ class TelegramController:
             return "session_conflict"
         self._send(chat_id, f"{_SOURCE_TYPES[source_type]} salvata.")
         return "source_saved"
+
+    def _manual_callback(self, chat_id: str, parts):
+        if parts == ["manual", "cancel"]:
+            raw = self.db.get_state(self._session_key(chat_id))
+            if raw is not None:
+                self.db.compare_and_clear_state(self._session_key(chat_id), raw)
+            self._send(chat_id, "Creazione del post annullata.")
+            return "manual_cancelled"
+
+        raw, session, invalid = self._load_session(chat_id)
+        if invalid or session is None:
+            self._send(chat_id, "Sessione non valida o scaduta. Riprova.")
+            return "invalid_session"
+        if session["kind"] != "manual_post":
+            self._send(chat_id, "Questa sessione non riguarda un post manuale.")
+            return "invalid_session"
+
+        step = session["step"]
+        payload = session["payload"]
+        if len(parts) == 3 and parts[1] == "category":
+            category = parts[2]
+            if step != "category" or category not in PORTFOLIO:
+                self._send(chat_id, "Categoria non valida.")
+                return "invalid_callback"
+            next_payload = {
+                "text": payload["text"],
+                "category": category,
+                "source_ids": [],
+            }
+            if not self._replace_session(
+                chat_id, raw, "manual_post", "sources", next_payload,
+            ):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            self._send(
+                chat_id,
+                "Scegli da una a tre fonti, poi conferma.",
+                reply_markup=self._manual_source_markup(category, []),
+            )
+            return "manual_sources"
+
+        if len(parts) == 3 and parts[1] == "source":
+            source_id = self._positive_id(parts[2])
+            if step != "sources" or source_id is None:
+                self._send(chat_id, "Fonte non valida.")
+                return "invalid_callback"
+            selected = list(payload["source_ids"])
+            if source_id not in selected:
+                if len(selected) >= 3:
+                    self._send(chat_id, "Puoi selezionare al massimo tre fonti.")
+                    return "manual_source_limit"
+                try:
+                    eligible = self.db.get_eligible_content_sources(
+                        [source_id], now=self._now(),
+                    )
+                except Exception:
+                    eligible = []
+                if (
+                    len(eligible) != 1
+                    or eligible[0].get("id") != source_id
+                    or eligible[0].get("source_type")
+                    not in MANUAL_SOURCE_TYPES[payload["category"]]
+                ):
+                    self._send(chat_id, "Fonte non disponibile per questa categoria.")
+                    return "manual_source_rejected"
+                selected.append(source_id)
+            next_payload = dict(payload)
+            next_payload["source_ids"] = selected
+            if not self._replace_session(
+                chat_id, raw, "manual_post", "sources", next_payload,
+            ):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            self._send(
+                chat_id,
+                f"Fonti selezionate: {len(selected)}/3.",
+                reply_markup=self._manual_source_markup(
+                    payload["category"], selected,
+                ),
+            )
+            return "manual_source_selected"
+
+        if parts == ["manual", "sources_done"]:
+            if step != "sources" or not payload["source_ids"]:
+                self._send(chat_id, "Seleziona almeno una fonte.")
+                return "manual_sources_required"
+            if not self._replace_session(
+                chat_id, raw, "manual_post", "media", dict(payload),
+            ):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            self._send(
+                chat_id,
+                "Scegli un media disponibile oppure continua senza media.",
+                reply_markup=self._manual_media_markup(),
+            )
+            return "manual_media"
+
+        if len(parts) == 3 and parts[1] == "media":
+            if step != "media":
+                self._send(chat_id, "Questa sessione non attende un media.")
+                return "invalid_session"
+            media_id = None if parts[2] == "none" else self._positive_id(parts[2])
+            if parts[2] != "none" and media_id is None:
+                self._send(chat_id, "Media non valido.")
+                return "invalid_callback"
+            if media_id is not None:
+                try:
+                    media = self.db.get_media_by_id(media_id)
+                except Exception:
+                    media = None
+                if (
+                    not isinstance(media, dict)
+                    or media.get("id") != media_id
+                    or media.get("lifecycle_state") != "available"
+                    or media.get("file_deleted") != 0
+                ):
+                    self._send(chat_id, "Media non più disponibile.")
+                    return "manual_media_rejected"
+            next_payload = dict(payload)
+            next_payload["media_id"] = media_id
+            if not self._replace_session(
+                chat_id,
+                raw,
+                "manual_post",
+                "translation_mode",
+                next_payload,
+            ):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            self._send(
+                chat_id,
+                "Come vuoi preparare la traduzione italiana per la revisione?",
+                reply_markup=self._callback_markup([
+                    [
+                        self._callback_button(
+                            "Traduci automaticamente", "manual:translation:auto",
+                        ),
+                        self._callback_button(
+                            "La inserisco io", "manual:translation:manual",
+                        ),
+                    ],
+                    [self._callback_button("Annulla", "manual:cancel")],
+                ]),
+            )
+            return "manual_translation_mode"
+
+        if len(parts) == 3 and parts[1] == "translation":
+            mode = parts[2]
+            if step != "translation_mode" or mode not in {"auto", "manual"}:
+                self._send(chat_id, "Modalità di traduzione non valida.")
+                return "invalid_callback"
+            if mode == "manual":
+                if not self._replace_session(
+                    chat_id,
+                    raw,
+                    "manual_post",
+                    "translation_text",
+                    dict(payload),
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                self._send(
+                    chat_id,
+                    "Invia la traduzione italiana esatta, senza virgolette esterne.",
+                )
+                return "manual_translation_text"
+
+            translation_it = None
+            translator = getattr(self.draft_pipeline, "review_translator", None)
+            translate = getattr(translator, "translate", None)
+            if callable(translate):
+                try:
+                    translated = translate(payload["text"])
+                except Exception:
+                    translated = None
+                candidate = getattr(translated, "text_it", None)
+                if isinstance(candidate, str):
+                    translation_it = candidate
+            return self._finish_manual_post(
+                chat_id,
+                raw,
+                session,
+                translation_it,
+            )
+
+        self._send(chat_id, "Azione manuale non valida.")
+        return "invalid_callback"
 
     def _growth_callback(self, chat_id: str, parts):
         if len(parts) == 3 and parts[1] in {"save", "followed", "discard"}:
