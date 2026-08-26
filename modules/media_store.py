@@ -65,6 +65,120 @@ def _flock_retry(fd: int, operation: int) -> None:
             continue
 
 
+def fsync_media_directory(root_fd: int) -> None:
+    """Durably persist a directory entry mutation, retrying EINTR."""
+    while True:
+        try:
+            os.fsync(root_fd)
+            return
+        except InterruptedError:
+            continue
+
+
+def _validated_record_locator(record: Mapping) -> Tuple[Path, str]:
+    filepath = record.get("filepath")
+    filename = record.get("filename")
+    if type(filepath) is not str or type(filename) is not str:
+        raise ValueError("invalid_media_locator")
+    locator = Path(filepath)
+    if locator.name != filename or filename in {"", ".", ".."}:
+        raise ValueError("invalid_media_locator")
+    return locator.parent, filename
+
+
+def quarantine_verified_media(record: Mapping, quarantine_name: str) -> str:
+    """Move one verified inode into a private same-directory quarantine.
+
+    The caller receives no usable pathname.  The basename is intentionally
+    random and is only transient recovery metadata in the database.
+    """
+    if (
+        type(quarantine_name) is not str
+        or not quarantine_name.startswith(".delete-")
+        or "/" in quarantine_name
+        or "\\" in quarantine_name
+    ):
+        raise ValueError("invalid_quarantine_name")
+    root, name = _validated_record_locator(record)
+    with media_store_lock(root) as (_locked_root, root_fd):
+        try:
+            file_fd = os.open(
+                quarantine_name, os.O_RDONLY | _require_nofollow_support(),
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            file_fd = os.open(
+                name, os.O_RDONLY | _require_nofollow_support(), dir_fd=root_fd,
+            )
+            source_name = name
+        else:
+            # This is the hard-crash boundary after rename/fsync and before the
+            # intent transaction.  A deterministic intent basename makes it
+            # safe to resume without scanning or trusting arbitrary entries.
+            source_name = quarantine_name
+        try:
+            pinned = PinnedMediaFile(
+                root_fd, source_name, file_fd, media_identity_from_record(record),
+            )
+            verify_pinned_media(pinned)
+            if source_name == name:
+                while True:
+                    try:
+                        os.rename(name, quarantine_name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+                        break
+                    except InterruptedError:
+                        continue
+                fsync_media_directory(root_fd)
+        finally:
+            os.close(file_fd)
+    return quarantine_name
+
+
+def unlink_quarantined_media(record: Mapping, quarantine_name: str) -> None:
+    """Unlink a random quarantine entry through a trusted directory FD."""
+    root, _name = _validated_record_locator(record)
+    if type(quarantine_name) is not str or not quarantine_name.startswith(".delete-"):
+        raise ValueError("invalid_quarantine_name")
+    with media_store_lock(root) as (_locked_root, root_fd):
+        try:
+            file_fd = os.open(
+                quarantine_name, os.O_RDONLY | _require_nofollow_support(),
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            return
+        while True:
+            try:
+                pinned = PinnedMediaFile(
+                    root_fd, quarantine_name, file_fd,
+                    media_identity_from_record(record),
+                )
+                verify_pinned_media(pinned)
+                while True:
+                    try:
+                        os.unlink(quarantine_name, dir_fd=root_fd)
+                        break
+                    except InterruptedError:
+                        continue
+                break
+            finally:
+                os.close(file_fd)
+        fsync_media_directory(root_fd)
+
+
+def deletion_entries_are_absent(record: Mapping, quarantine_name: str) -> bool:
+    """Authorize a crash-recovery tombstone only when both names are absent."""
+    root, name = _validated_record_locator(record)
+    with media_store_lock(root) as (_locked_root, root_fd):
+        for entry_name in (name, quarantine_name):
+            try:
+                os.stat(entry_name, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            return False
+    return True
+
+
 class MediaStoreLease:
     """Reentrant process/thread lease plus cross-process advisory lock."""
 

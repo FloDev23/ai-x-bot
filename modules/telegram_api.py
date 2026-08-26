@@ -658,6 +658,17 @@ class TelegramApi:
             raise TypeError("media must be a path or binary stream")
         return send(media)
 
+    def delete_message(self, chat_id: str, message_id: int) -> bool:
+        """Best-effort preview cleanup; callers deliberately tolerate failure."""
+        if type(message_id) is not int or message_id <= 0:
+            raise ValueError("message_id must be a positive integer")
+        result = self._post(
+            "deleteMessage",
+            {"chat_id": str(chat_id), "message_id": message_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+        return bool(result)
+
     def get_file(self, file_id: str) -> Dict[str, Any]:
         result = self._post(
             "getFile",

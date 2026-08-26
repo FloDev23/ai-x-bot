@@ -25,8 +25,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from modules.media_store import (
     PinnedMediaFile,
+    deletion_entries_are_absent,
     media_store_lock,
+    open_verified_media,
     record_has_media_identity,
+    quarantine_verified_media,
+    unlink_quarantined_media,
     verify_pinned_media,
 )
 from modules.growth_candidate_schema import (
@@ -106,6 +110,12 @@ _PREVIEW_MEDIA_SNAPSHOT_COLUMNS = (
     "used",
     "used_in_tweet_id",
 )
+_TELEGRAM_VIEW_STATE_MAX_BYTES = 8192
+_TELEGRAM_VIEW_TTL = timedelta(minutes=30)
+_TELEGRAM_VIEW_STATE_KEYS = frozenset({
+    "target_ids", "direction", "filters", "last_message_id",
+})
+_TELEGRAM_VIEW_DIRECTIONS = frozenset({"current", "next", "previous"})
 
 
 @dataclass(frozen=True)
@@ -358,7 +368,8 @@ class Database:
                     file_size INTEGER DEFAULT 0,
                     file_device INTEGER,
                     file_inode INTEGER,
-                    file_sha256 TEXT
+                    file_sha256 TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0
                 )
             """)
 
@@ -376,6 +387,7 @@ class Database:
                 "file_device": "INTEGER",
                 "file_inode": "INTEGER",
                 "file_sha256": "TEXT",
+                "revision": "INTEGER NOT NULL DEFAULT 0",
             }
             lifecycle_added = "lifecycle_state" not in media_columns
             for column, definition in media_migrations.items():
@@ -421,6 +433,42 @@ class Database:
                     token TEXT PRIMARY KEY,
                     request_json TEXT NOT NULL,
                     result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS telegram_views (
+                    token TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    view_kind TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS media_delete_intents (
+                    token TEXT PRIMARY KEY,
+                    media_id INTEGER NOT NULL UNIQUE,
+                    expected_revision INTEGER NOT NULL,
+                    expected_sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('prepared', 'quarantined', 'complete')),
+                    quarantine_name TEXT,
+                    prior_lifecycle TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS media_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    media_id INTEGER NOT NULL,
+                    event TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 )
             """)
@@ -888,6 +936,7 @@ class Database:
             conn.commit()
         if media_schema_reconciliation_needed:
             self._reconcile_media_schema(lifecycle_migration_pending)
+        self.reconcile_media_delete_intents()
         logger.info("✅ Database inizializzato (bot_data.db)")
 
     # ---------- Posted tweets / memoria a lungo termine ----------
@@ -2172,7 +2221,8 @@ class Database:
                 if media is not None:
                     reserved = conn.execute("""
                         UPDATE media_library
-                        SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
+                        SET lifecycle_state = 'reserved', reserved_by_draft_id = ?,
+                            revision = revision + 1
                         WHERE id = ? AND lifecycle_state = 'available'
                           AND file_deleted = 0 AND reserved_by_draft_id IS NULL
                     """, (draft_id, media_id))
@@ -2401,7 +2451,8 @@ class Database:
                 if media is not None:
                     reserved = conn.execute("""
                         UPDATE media_library
-                        SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
+                        SET lifecycle_state = 'reserved', reserved_by_draft_id = ?,
+                            revision = revision + 1
                         WHERE id = ? AND lifecycle_state = 'available'
                           AND file_deleted = 0 AND reserved_by_draft_id IS NULL
                     """, (draft_id, media_id))
@@ -4006,7 +4057,8 @@ class Database:
                 media_update = conn.execute("""
                     UPDATE media_library
                     SET used = 1, used_at = ?, used_in_tweet_id = ?,
-                        lifecycle_state = 'used', reserved_by_draft_id = NULL
+                        lifecycle_state = 'used', reserved_by_draft_id = NULL,
+                        revision = revision + 1
                     WHERE id = ? AND lifecycle_state = 'reserved'
                       AND reserved_by_draft_id = ? AND file_deleted = 0
                 """, (
@@ -4499,7 +4551,8 @@ class Database:
             )
             conn.execute("""
                 UPDATE media_library
-                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL,
+                    revision = revision + 1
                 WHERE reserved_by_draft_id = ? AND lifecycle_state = 'reserved'
             """, (prior_draft_id,))
             row = conn.execute(
@@ -4614,7 +4667,8 @@ class Database:
             )
             conn.execute("""
                 UPDATE media_library
-                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL,
+                    revision = revision + 1
                 WHERE reserved_by_draft_id = ? AND lifecycle_state = 'reserved'
             """, (prior_draft_id,))
             row = conn.execute(
@@ -4921,7 +4975,8 @@ class Database:
                 media_update = conn.execute("""
                     UPDATE media_library
                     SET used = 1, used_at = ?, used_in_tweet_id = ?,
-                        lifecycle_state = 'used', reserved_by_draft_id = NULL
+                        lifecycle_state = 'used', reserved_by_draft_id = NULL,
+                        revision = revision + 1
                     WHERE id = ? AND lifecycle_state = 'reserved'
                       AND reserved_by_draft_id = ? AND file_deleted = 0
                 """, (
@@ -4993,7 +5048,8 @@ class Database:
                 return False
             conn.execute("""
                 UPDATE media_library
-                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL,
+                    revision = revision + 1
                 WHERE reserved_by_draft_id = ?
                   AND lifecycle_state = 'reserved'
             """, (claim.draft_id,))
@@ -5370,6 +5426,122 @@ class Database:
             hashtags += [w for w in r['text'].split() if w.startswith('#')]
         return hashtags
 
+    # ---------- Persisted Telegram views ----------
+
+    @staticmethod
+    def _validate_telegram_view_state(state: Mapping) -> Dict:
+        if not isinstance(state, Mapping) or set(state) - _TELEGRAM_VIEW_STATE_KEYS:
+            raise ValueError("invalid_telegram_view_state")
+        target_ids = state.get("target_ids", [])
+        if (
+            not isinstance(target_ids, list)
+            or len(target_ids) > 300
+            or any(type(value) is not int or value <= 0 for value in target_ids)
+        ):
+            raise ValueError("invalid_telegram_view_state")
+        direction = state.get("direction", "current")
+        if direction not in _TELEGRAM_VIEW_DIRECTIONS:
+            raise ValueError("invalid_telegram_view_state")
+        filters = state.get("filters", {})
+        if not isinstance(filters, dict) or any(
+            not isinstance(key, str) or not isinstance(value, (str, int, float, type(None)))
+            or isinstance(value, bool)
+            for key, value in filters.items()
+        ):
+            raise ValueError("invalid_telegram_view_state")
+        last_message_id = state.get("last_message_id")
+        if last_message_id is not None and (
+            type(last_message_id) is not int or last_message_id <= 0
+        ):
+            raise ValueError("invalid_telegram_view_state")
+        normalized = {
+            "target_ids": list(target_ids),
+            "direction": direction,
+            "filters": dict(filters),
+            "last_message_id": last_message_id,
+        }
+        encoded = json.dumps(normalized, separators=(",", ":"), allow_nan=False)
+        if len(encoded.encode("utf-8")) > _TELEGRAM_VIEW_STATE_MAX_BYTES:
+            raise ValueError("invalid_telegram_view_state")
+        return normalized
+
+    def create_telegram_view(self, chat_id: str, view_kind: str, state: Mapping) -> str:
+        if not isinstance(chat_id, str) or not chat_id or not isinstance(view_kind, str) or not view_kind:
+            raise ValueError("invalid_telegram_view")
+        normalized = self._validate_telegram_view_state(state)
+        now = datetime.now(timezone.utc)
+        expires_at = now + _TELEGRAM_VIEW_TTL
+        for _attempt in range(8):
+            token = secrets.token_urlsafe(12)
+            with self._conn() as conn:
+                try:
+                    conn.execute("""
+                        INSERT INTO telegram_views (
+                            token, chat_id, view_kind, state_json, revision,
+                            expires_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+                    """, (
+                        token, chat_id, view_kind,
+                        json.dumps(normalized, separators=(",", ":"), allow_nan=False),
+                        expires_at.isoformat(), now.isoformat(), now.isoformat(),
+                    ))
+                    return token
+                except sqlite3.IntegrityError:
+                    continue
+        raise RuntimeError("telegram_view_token_collision")
+
+    def get_telegram_view(self, token: str, chat_id: str, view_kind: str) -> Optional[Dict]:
+        if not isinstance(token, str) or not isinstance(chat_id, str) or not isinstance(view_kind, str):
+            return None
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT * FROM telegram_views
+                WHERE token = ? AND chat_id = ? AND view_kind = ?
+            """, (token, chat_id, view_kind)).fetchone()
+        if row is None:
+            return None
+        try:
+            expires_at = datetime.fromisoformat(row["expires_at"])
+            created_at = datetime.fromisoformat(row["created_at"])
+            updated_at = datetime.fromisoformat(row["updated_at"])
+            if (
+                expires_at.tzinfo is None or created_at.tzinfo is None
+                or updated_at.tzinfo is None
+                or expires_at <= datetime.now(timezone.utc)
+                or expires_at <= created_at or updated_at < created_at
+                or expires_at - created_at > _TELEGRAM_VIEW_TTL + timedelta(seconds=1)
+            ):
+                return None
+            state = self._validate_telegram_view_state(json.loads(row["state_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+            return None
+        view = dict(row)
+        view["state"] = state
+        return view
+
+    def update_telegram_view(
+        self, token: str, chat_id: str, view_kind: str,
+        expected_revision: int, state: Mapping,
+    ) -> bool:
+        if type(expected_revision) is not int or expected_revision < 0:
+            return False
+        try:
+            normalized = self._validate_telegram_view_state(state)
+        except ValueError:
+            return False
+        now = self._now_iso()
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                UPDATE telegram_views
+                SET state_json = ?, revision = revision + 1, updated_at = ?
+                WHERE token = ? AND chat_id = ? AND view_kind = ?
+                  AND revision = ? AND expires_at > ?
+            """, (
+                json.dumps(normalized, separators=(",", ":"), allow_nan=False), now,
+                token, chat_id, view_kind, expected_revision, now,
+            ))
+            return cursor.rowcount == 1
+
     # ---------- Libreria media (foto/video reali per i post) ----------
 
     @staticmethod
@@ -5617,7 +5789,8 @@ class Database:
                     conn.execute("""
                         UPDATE media_library
                         SET lifecycle_state = 'available',
-                            reserved_by_draft_id = NULL
+                            reserved_by_draft_id = NULL,
+                            revision = revision + 1
                         WHERE reserved_by_draft_id = ?
                           AND lifecycle_state = 'reserved'
                     """, (stale["id"],))
@@ -5803,7 +5976,8 @@ class Database:
         ) as conn:
             cursor = conn.execute("""
                 UPDATE media_library
-                SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
+                SET lifecycle_state = 'reserved', reserved_by_draft_id = ?,
+                    revision = revision + 1
                 WHERE id = ? AND lifecycle_state = 'available'
                   AND file_deleted = 0
             """, (draft_id, media_id))
@@ -5844,7 +6018,8 @@ class Database:
                 return False
             reserved = conn.execute("""
                 UPDATE media_library
-                SET lifecycle_state = 'reserved', reserved_by_draft_id = ?
+                SET lifecycle_state = 'reserved', reserved_by_draft_id = ?,
+                    revision = revision + 1
                 WHERE id = ? AND lifecycle_state = 'available'
                   AND file_deleted = 0
             """, (draft_id, media_id))
@@ -5916,7 +6091,8 @@ class Database:
             ]
             released = conn.execute("""
                 UPDATE media_library
-                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL,
+                    revision = revision + 1
                 WHERE id = ? AND lifecycle_state = 'reserved'
                   AND reserved_by_draft_id = ?
             """, (media_id, draft_id))
@@ -5959,7 +6135,8 @@ class Database:
             """, (draft_id,)).fetchall()]
             conn.execute("""
                 UPDATE media_library
-                SET lifecycle_state = 'available', reserved_by_draft_id = NULL
+                SET lifecycle_state = 'available', reserved_by_draft_id = NULL,
+                    revision = revision + 1
                 WHERE reserved_by_draft_id = ?
                   AND lifecycle_state = 'reserved'
             """, (draft_id,))
@@ -5980,7 +6157,8 @@ class Database:
             conn.execute("""
                 UPDATE media_library
                 SET used = 1, used_at = ?, used_in_tweet_id = ?,
-                    lifecycle_state = 'used', reserved_by_draft_id = NULL
+                    lifecycle_state = 'used', reserved_by_draft_id = NULL,
+                    revision = revision + 1
                 WHERE id = ? AND lifecycle_state IN ('available', 'reserved')
                   AND file_deleted = 0
             """, (self._now_iso(), tweet_id, media_id))
@@ -5989,7 +6167,8 @@ class Database:
         with self._media_store_mutation_lock("media", media_id) as conn:
             cursor = conn.execute("""
                 UPDATE media_library
-                SET lifecycle_state = 'archived', reserved_by_draft_id = NULL
+                SET lifecycle_state = 'archived', reserved_by_draft_id = NULL,
+                    revision = revision + 1
                 WHERE id = ? AND lifecycle_state = 'available'
             """, (media_id,))
             return cursor.rowcount == 1
@@ -6004,10 +6183,258 @@ class Database:
                         WHEN ? = 0 AND used = 1
                              AND lifecycle_state = 'available' THEN 'used'
                         ELSE lifecycle_state
-                    END
+                    END,
+                    revision = revision + 1
                 WHERE id = ?
             """, (int(reusable), int(reusable), int(reusable), media_id))
             return cursor.rowcount == 1
+
+    @staticmethod
+    def _valid_media_delete_identity(revision: Any, digest: Any) -> bool:
+        return (
+            type(revision) is int and revision >= 0
+            and type(digest) is str and len(digest) == 64
+            and all(character in "0123456789abcdef" for character in digest)
+        )
+
+    @staticmethod
+    def _insert_media_event_in_conn(
+        conn: sqlite3.Connection, media_id: int, event: str, details: Mapping,
+    ) -> None:
+        conn.execute("""
+            INSERT INTO media_events (media_id, event, details_json, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (media_id, event, json.dumps(dict(details), separators=(",", ":")),
+              Database._now_iso()))
+
+    def archive_media_atomic(
+        self, media_id: int, expected_revision: int, expected_sha256: str,
+    ) -> bool:
+        if not self._valid_media_delete_identity(expected_revision, expected_sha256):
+            return False
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            record = conn.execute("SELECT * FROM media_library WHERE id = ?", (media_id,)).fetchone()
+            try:
+                if record is None:
+                    return False
+                with open_verified_media(dict(record)):
+                    pass
+            except Exception:
+                return False
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'archived', reserved_by_draft_id = NULL,
+                    revision = revision + 1
+                WHERE id = ? AND lifecycle_state = 'available' AND used = 0
+                  AND file_deleted = 0 AND reserved_by_draft_id IS NULL
+                  AND revision = ? AND file_sha256 = ?
+            """, (media_id, expected_revision, expected_sha256))
+            if cursor.rowcount:
+                self._insert_media_event_in_conn(conn, media_id, "archived", {})
+            return cursor.rowcount == 1
+
+    def restore_media_atomic(
+        self, media_id: int, expected_revision: int, expected_sha256: str,
+    ) -> bool:
+        if not self._valid_media_delete_identity(expected_revision, expected_sha256):
+            return False
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            record = conn.execute("SELECT * FROM media_library WHERE id = ?", (media_id,)).fetchone()
+            try:
+                if record is None:
+                    return False
+                with open_verified_media(dict(record)):
+                    pass
+            except Exception:
+                return False
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'available', revision = revision + 1
+                WHERE id = ? AND lifecycle_state = 'archived' AND used = 0
+                  AND file_deleted = 0 AND reserved_by_draft_id IS NULL
+                  AND revision = ? AND file_sha256 = ?
+            """, (media_id, expected_revision, expected_sha256))
+            if cursor.rowcount:
+                self._insert_media_event_in_conn(conn, media_id, "restored", {})
+            return cursor.rowcount == 1
+
+    def prepare_unused_media_delete_atomic(
+        self, media_id: int, expected_revision: int, expected_sha256: str,
+    ) -> Tuple[Optional[Dict], str]:
+        """Fence one never-used media identity before filesystem quarantine."""
+        if (
+            type(media_id) is not int or media_id <= 0
+            or not self._valid_media_delete_identity(expected_revision, expected_sha256)
+        ):
+            return None, "invalid_identity"
+        with self._media_store_mutation_lock("media", media_id) as conn:
+            row = conn.execute(
+                "SELECT * FROM media_library WHERE id = ?", (media_id,)
+            ).fetchone()
+            if row is None:
+                return None, "missing"
+            record = dict(row)
+            if (
+                record["revision"] != expected_revision
+                or record["file_sha256"] != expected_sha256
+                or record["used"] != 0
+                or record["file_deleted"] != 0
+                or record["reserved_by_draft_id"] is not None
+                or record["lifecycle_state"] not in {"available", "archived"}
+                or not record_has_media_identity(record)
+            ):
+                return None, "not_deletable"
+            token = secrets.token_urlsafe(18)
+            now = self._now_iso()
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET lifecycle_state = 'deleting', revision = revision + 1
+                WHERE id = ? AND revision = ? AND file_sha256 = ?
+                  AND lifecycle_state IN ('available', 'archived')
+                  AND used = 0 AND file_deleted = 0 AND reserved_by_draft_id IS NULL
+            """, (media_id, expected_revision, expected_sha256))
+            if cursor.rowcount != 1:
+                return None, "stale"
+            conn.execute("""
+                INSERT INTO media_delete_intents (
+                    token, media_id, expected_revision, expected_sha256, state,
+                    quarantine_name, prior_lifecycle, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'prepared', NULL, ?, ?, ?)
+            """, (token, media_id, expected_revision, expected_sha256,
+                  record["lifecycle_state"], now, now))
+            self._insert_media_event_in_conn(conn, media_id, "delete_prepared", {})
+            record["intent_token"] = token
+            record["revision"] = expected_revision + 1
+            record["lifecycle_state"] = "deleting"
+            return record, "prepared"
+
+    def _delete_intent_record(self, token: str) -> Optional[Dict]:
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT intent.*, media.*
+                FROM media_delete_intents AS intent
+                JOIN media_library AS media ON media.id = intent.media_id
+                WHERE intent.token = ?
+            """, (token,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def quarantine_unused_media_delete(self, intent_token: str) -> bool:
+        intent = self._delete_intent_record(intent_token)
+        if intent is None:
+            return False
+        if intent["state"] == "quarantined":
+            return True
+        if intent["state"] != "prepared" or intent["lifecycle_state"] != "deleting":
+            return False
+        # Derived from the persisted token so recovery knows the one allowed
+        # basename if a hard crash occurs after rename and before this intent
+        # can be marked quarantined.
+        quarantine_name = ".delete-" + intent_token
+        try:
+            quarantine_verified_media(intent, quarantine_name)
+        except Exception:
+            with self._media_store_mutation_lock("media", intent["media_id"]) as conn:
+                cursor = conn.execute("""
+                    UPDATE media_library SET lifecycle_state = ?, revision = revision + 1
+                    WHERE id = ? AND lifecycle_state = 'deleting'
+                      AND revision = ? AND file_sha256 = ?
+                """, (intent["prior_lifecycle"], intent["media_id"],
+                      intent["expected_revision"] + 1, intent["expected_sha256"]))
+                if cursor.rowcount:
+                    conn.execute("DELETE FROM media_delete_intents WHERE token = ?", (intent_token,))
+                    self._insert_media_event_in_conn(conn, intent["media_id"], "delete_aborted", {})
+            return False
+        with self._media_store_mutation_lock("media", intent["media_id"]) as conn:
+            cursor = conn.execute("""
+                UPDATE media_delete_intents
+                SET state = 'quarantined', quarantine_name = ?, updated_at = ?
+                WHERE token = ? AND state = 'prepared'
+            """, (quarantine_name, self._now_iso(), intent_token))
+            if cursor.rowcount:
+                self._insert_media_event_in_conn(conn, intent["media_id"], "delete_quarantined", {})
+            return cursor.rowcount == 1
+
+    def complete_unused_media_delete_atomic(
+        self, intent_token: str, exact_identity: Mapping,
+    ) -> bool:
+        if not isinstance(exact_identity, Mapping):
+            return False
+        intent = self._delete_intent_record(intent_token)
+        if intent is None:
+            return False
+        if intent["state"] == "complete":
+            return True
+        if (
+            intent["state"] != "quarantined"
+            or exact_identity.get("id") != intent["media_id"]
+            or exact_identity.get("file_sha256") != intent["expected_sha256"]
+            or exact_identity.get("revision") not in {
+                intent["expected_revision"], intent["expected_revision"] + 1,
+            }
+        ):
+            return False
+        try:
+            if not deletion_entries_are_absent(intent, intent["quarantine_name"]):
+                return False
+        except Exception:
+            return False
+        with self._media_store_mutation_lock("media", intent["media_id"]) as conn:
+            cursor = conn.execute("""
+                UPDATE media_library
+                SET file_deleted = 1, lifecycle_state = 'deleted',
+                    reserved_by_draft_id = NULL, filepath = '', filename = '',
+                    file_device = NULL, file_inode = NULL, file_size = 0,
+                    file_sha256 = NULL, revision = revision + 1
+                WHERE id = ? AND lifecycle_state = 'deleting' AND used = 0
+                  AND file_deleted = 0 AND revision = ?
+            """, (intent["media_id"], intent["expected_revision"] + 1))
+            if cursor.rowcount != 1:
+                return False
+            conn.execute("""
+                UPDATE media_delete_intents SET state = 'complete', updated_at = ?
+                WHERE token = ? AND state = 'quarantined'
+            """, (self._now_iso(), intent_token))
+            self._insert_media_event_in_conn(conn, intent["media_id"], "delete_complete", {})
+            return True
+
+    def delete_unused_media_safely(
+        self, media_id: int, expected_revision: int, expected_sha256: str,
+    ) -> bool:
+        record, status = self.prepare_unused_media_delete_atomic(
+            media_id, expected_revision, expected_sha256,
+        )
+        if record is None or status != "prepared":
+            return False
+        token = record["intent_token"]
+        if not self.quarantine_unused_media_delete(token):
+            return False
+        intent = self._delete_intent_record(token)
+        if intent is None:
+            return False
+        try:
+            unlink_quarantined_media(intent, intent["quarantine_name"])
+        except Exception:
+            return False
+        return self.complete_unused_media_delete_atomic(token, record)
+
+    def reconcile_media_delete_intents(self) -> None:
+        """Resume prepared/quarantined deletes after a process hard crash."""
+        with self._conn() as conn:
+            intents = [dict(row) for row in conn.execute("""
+                SELECT token, state FROM media_delete_intents
+                WHERE state IN ('prepared', 'quarantined') ORDER BY created_at
+            """).fetchall()]
+        for intent in intents:
+            if intent["state"] == "prepared":
+                self.quarantine_unused_media_delete(intent["token"])
+            current = self._delete_intent_record(intent["token"])
+            if current is None or current["state"] != "quarantined":
+                continue
+            try:
+                unlink_quarantined_media(current, current["quarantine_name"])
+            except Exception:
+                continue
+            self.complete_unused_media_delete_atomic(intent["token"], current)
 
     def mark_media_file_deleted(self, media_id: int, delete_file=None) -> bool:
         """Segna che il file fisico è stato rimosso dal disco per risparmiare
@@ -6027,7 +6454,7 @@ class Database:
             cursor = conn.execute("""
                 UPDATE media_library
                 SET file_deleted = 1, lifecycle_state = 'deleted',
-                    reserved_by_draft_id = NULL
+                    reserved_by_draft_id = NULL, revision = revision + 1
                 WHERE id = ? AND file_deleted = 0
                   AND lifecycle_state = ?
             """, (media_id, row["lifecycle_state"]))

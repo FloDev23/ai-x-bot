@@ -21,6 +21,7 @@ from config import (
     POSTS_PER_DAY,
 )
 from modules.media_store import open_verified_media
+from modules.telegram_media_browser import MediaBrowser
 from modules.content_planner import PORTFOLIO, SOURCE_TYPES as MANUAL_SOURCE_TYPES
 from modules.source_validation import is_complete_verified_news, is_safe_https_url
 from modules.telegram_api import (
@@ -128,11 +129,13 @@ class TelegramController:
             "/stats": self._stats,
             "/ideas": self._ideas,
             "/newpost": self._newpost,
+            "/media": self._media,
             "/pause": self._pause,
             "/resume": self._resume,
             "/errors": self._errors,
             "/help": self._help,
         }
+        self.media_browser = MediaBrowser(db, telegram_api)
 
     @staticmethod
     def _supported_subtype(update: Dict[str, Any]):
@@ -906,6 +909,15 @@ class TelegramController:
         )
         return "manual_text_input"
 
+    def _media(self, chat_id: str):
+        """Open the persisted, verified media browser (never filename buttons)."""
+        try:
+            self.media_browser.show(chat_id=chat_id, media_id=None, context="manage")
+        except Exception:
+            self._send(chat_id, "Media non disponibile.")
+            return "media_unavailable"
+        return "media_browser"
+
     def _manual_category_markup(self):
         rows = [
             [self._callback_button(
@@ -1003,23 +1015,11 @@ class TelegramController:
         return self._callback_markup(rows)
 
     def _manual_media_markup(self):
-        try:
-            media_rows = self.db.get_available_media(limit=10)
-        except Exception:
-            media_rows = []
-        rows = [[self._callback_button("Nessun media", "manual:media:none")]]
-        for media in media_rows:
-            media_id = media.get("id")
-            if type(media_id) is not int or media_id <= 0:
-                continue
-            filename = self._clean_text(media.get("filename"), 44) or "media"
-            rows.append([
-                self._callback_button(
-                    f"#{media_id} {filename}"[:64],
-                    f"manual:media:{media_id}",
-                )
-            ])
-        rows.append([self._callback_button("Annulla", "manual:cancel")])
+        rows = [
+            [self._callback_button("Sfoglia media", "manual:media:browse")],
+            [self._callback_button("Nessun media", "manual:media:none")],
+            [self._callback_button("Annulla", "manual:cancel")],
+        ]
         return self._callback_markup(rows)
 
     def _finish_manual_post(
@@ -1730,6 +1730,8 @@ class TelegramController:
 
     def _handle_callback(self, chat_id: str, data: str):
         parts = data.split(":")
+        if parts[0] == "mb":
+            return self._media_browser_callback(chat_id, parts)
         if parts[0] == "draft" and len(parts) == 3:
             draft_id = self._positive_id(parts[2])
             if draft_id is not None:
@@ -1741,6 +1743,95 @@ class TelegramController:
         if parts[0] == "manual":
             return self._manual_callback(chat_id, parts)
         self._send(chat_id, "Azione non valida.")
+        return "invalid_callback"
+
+    def _media_browser_callback(self, chat_id: str, parts):
+        if len(parts) == 3 and parts[1] in {"p", "n"}:
+            rendered = self.media_browser.render(
+                token=parts[2], chat_id=chat_id,
+                direction="previous" if parts[1] == "p" else "next",
+            )
+            return "media_browser" if rendered else "media_unavailable"
+        if len(parts) == 5 and parts[1] == "u":
+            try:
+                media_id = int(parts[3])
+                revision = int(parts[4])
+            except ValueError:
+                return "invalid_callback"
+            record = self.media_browser.select(
+                media_id=media_id, expected_revision=revision,
+            )
+            if record is None:
+                self._send(chat_id, "Media non più disponibile.")
+                return "media_unavailable"
+            raw, session, invalid = self._load_session(chat_id)
+            if not invalid and session is not None and session.get("kind") == "manual_post" and session.get("step") == "media":
+                payload = dict(session["payload"])
+                payload["media_id"] = media_id
+                return self._finish_manual_post(chat_id, raw, {**session, "payload": payload})
+            self._send(chat_id, f"Media #{media_id} selezionato.")
+            return "media_selected"
+        if len(parts) == 5 and parts[1] in {"a", "r", "d"}:
+            try:
+                media_id = int(parts[3])
+                revision = int(parts[4])
+            except ValueError:
+                return "invalid_callback"
+            record = self.db.get_media_by_id(media_id)
+            if (
+                not isinstance(record, dict) or record.get("revision") != revision
+                or not isinstance(record.get("file_sha256"), str)
+            ):
+                self._send(chat_id, "Media non più disponibile.")
+                return "media_unavailable"
+            digest = record["file_sha256"]
+            if parts[1] == "a":
+                changed = self.db.archive_media_atomic(media_id, revision, digest)
+                self._send(chat_id, "Media archiviato." if changed else "Media non più disponibile.")
+                return "media_archived" if changed else "media_unavailable"
+            if parts[1] == "r":
+                changed = self.db.restore_media_atomic(media_id, revision, digest)
+                self._send(chat_id, "Media ripristinato." if changed else "Media non più disponibile.")
+                return "media_restored" if changed else "media_unavailable"
+            try:
+                confirm = self.db.create_telegram_view(
+                    chat_id, "media_delete_confirm",
+                    {"target_ids": [media_id], "direction": "current", "filters": {
+                        "revision": revision, "sha256": digest,
+                    }, "last_message_id": None},
+                )
+                self._send(chat_id, "Confermi l'eliminazione definitiva?", reply_markup=self._callback_markup([[
+                    self._callback_button("Conferma eliminazione", f"mb:x:{confirm}"),
+                    self._callback_button("Annulla", f"mb:c:{parts[2]}"),
+                ]]))
+            except Exception:
+                self._send(chat_id, "Media non disponibile.")
+                return "media_unavailable"
+            return "media_delete_confirmation"
+        if len(parts) == 3 and parts[1] == "x":
+            view = self.db.get_telegram_view(parts[2], chat_id, "media_delete_confirm")
+            if view is None or len(view["state"]["target_ids"]) != 1:
+                return "media_unavailable"
+            media_id = view["state"]["target_ids"][0]
+            filters = view["state"]["filters"]
+            changed = self.db.delete_unused_media_safely(
+                media_id, filters.get("revision"), filters.get("sha256"),
+            )
+            self._send(chat_id, "Media eliminato definitivamente." if changed else "Media non più eliminabile.")
+            return "media_deleted" if changed else "media_unavailable"
+        if len(parts) == 3 and parts[1] in {"z", "c"}:
+            if parts[1] == "z":
+                raw, session, invalid = self._load_session(chat_id)
+                if not invalid and session is not None and session.get("kind") == "manual_post" and session.get("step") == "media":
+                    payload = dict(session["payload"])
+                    payload["media_id"] = None
+                    return self._finish_manual_post(chat_id, raw, {**session, "payload": payload})
+            self._send(chat_id, "Selezione media annullata.")
+            return "media_cancelled"
+        if len(parts) == 3 and parts[1] == "g":
+            self._send(chat_id, "Gestione media: apri /media per una selezione aggiornata.")
+            return "media_manage"
+        self._send(chat_id, "Azione media non valida.")
         return "invalid_callback"
 
     def _draft_callback(self, chat_id: str, action: str, draft_id: int):
@@ -2123,6 +2214,17 @@ class TelegramController:
                 reply_markup=self._manual_media_markup(),
             )
             return "manual_media"
+
+        if parts == ["manual", "media", "browse"]:
+            if step != "media":
+                self._send(chat_id, "Questa sessione non attende un media.")
+                return "invalid_session"
+            try:
+                self.media_browser.show(chat_id=chat_id, media_id=None, context="manual")
+            except Exception:
+                self._send(chat_id, "Media non disponibile.")
+                return "media_unavailable"
+            return "manual_media_browser"
 
         if len(parts) == 3 and parts[1] == "media":
             if step != "media":
