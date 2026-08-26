@@ -507,6 +507,7 @@ class TelegramController:
         fields = [
             ("Bozza #", draft.get("id")),
             ("stato: ", self._clean_text(draft.get("status"), 40) or "sconosciuto"),
+            ("origine: ", self._clean_text(draft.get("origin"), 40) or "sconosciuta"),
             ("categoria: ", self._clean_text(draft.get("category"), 100) or "n/d"),
             ("pianificazione: ", planning_label),
             ("fonti: ", ", ".join(source_labels[:3]) if source_labels else "nessuna"),
@@ -730,6 +731,12 @@ class TelegramController:
                 "Traduzione italiana — solo per revisione",
                 draft["translation_it"],
             )
+        else:
+            self._send(
+                chat_id,
+                "Traduzione italiana — solo per revisione\n\n"
+                "Non ancora disponibile.",
+            )
         status = draft.get("status")
         rows = []
         if status == "approved":
@@ -737,8 +744,22 @@ class TelegramController:
                 "Rimuovi dalla coda", f"postrm:{token}:{draft_id}:{revision}",
             )])
         elif status == "discarded":
+            restore_token = self.db.create_telegram_view(
+                chat_id,
+                "post_restore_action",
+                {
+                    "target_ids": [draft_id],
+                    "direction": "current",
+                    "last_message_id": None,
+                    "filters": {
+                        "revision": revision,
+                        "queue_revision": draft.get("queue_revision"),
+                        "parent": token,
+                    },
+                },
+            )
             rows.append([self._callback_button(
-                "Ripristina", f"postrs:{token}:{draft_id}:{revision}",
+                "Ripristina", f"postrs:{restore_token}",
             )])
         rows.append([self._callback_button("Torna all'elenco", f"posts:{token}:refresh")])
         self._send(chat_id, self._draft_card_text(draft), reply_markup=self._callback_markup(rows))
@@ -1803,10 +1824,12 @@ class TelegramController:
             draft_id, revision = self._positive_id(parts[2]), self._nonnegative_id(parts[3])
             if draft_id is not None and revision is not None:
                 return self._post_detail(chat_id, parts[1], draft_id, revision)
-        if parts[0] in {"postrm", "postrs"} and len(parts) == 4:
+        if parts[0] == "postrm" and len(parts) == 4:
             draft_id, revision = self._positive_id(parts[2]), self._nonnegative_id(parts[3])
             if draft_id is not None and revision is not None:
                 return self._post_queue_action(chat_id, parts[0], parts[1], draft_id, revision)
+        if parts[0] == "postrs" and len(parts) == 2:
+            return self._restore_post_queue_action(chat_id, parts[1])
         if parts[0] == "postok" and len(parts) == 2:
             return self._confirm_post_removal(chat_id, parts[1])
         if parts[0] == "mb":
@@ -1836,16 +1859,6 @@ class TelegramController:
         ):
             self._send(chat_id, "Azione non valida o scaduta. Aggiorna l'elenco.")
             return "post_unavailable"
-        if action == "postrs":
-            restored, outcome = self.db.restore_discarded_draft_atomic(
-                draft_id, revision, draft["queue_revision"], "floriano",
-                f"restore_{parent}_{draft_id}",
-            )
-            if outcome not in {"restored", "already_applied"} or restored is None:
-                self._send(chat_id, "Ripristino non disponibile. Aggiorna l'elenco.")
-                return "post_restore_rejected"
-            self._send(chat_id, "Post ripristinato.")
-            return self._post_detail(chat_id, parent, draft_id, restored["revision"])
         if draft.get("status") != "approved":
             self._send(chat_id, "Rimozione non disponibile. Aggiorna l'elenco.")
             return "post_remove_rejected"
@@ -1877,6 +1890,40 @@ class TelegramController:
         except Exception:
             self._send(chat_id, "Rimozione non disponibile.")
             return "post_remove_rejected"
+
+    def _restore_post_queue_action(self, chat_id: str, token: str) -> str:
+        action = self.db.get_telegram_view(
+            token, chat_id, "post_restore_action",
+        )
+        if action is None or len(action["state"]["target_ids"]) != 1:
+            self._send(chat_id, "Ripristino non valido o scaduto.")
+            return "post_restore_rejected"
+        draft_id = action["state"]["target_ids"][0]
+        filters = action["state"]["filters"]
+        parent = filters.get("parent")
+        parent_view = (
+            self.db.get_telegram_view(
+                parent, chat_id, self.post_browser.view_kind,
+            )
+            if isinstance(parent, str) else None
+        )
+        if parent_view is None or draft_id not in parent_view["state"]["target_ids"]:
+            self._send(chat_id, "Ripristino non valido o scaduto.")
+            return "post_restore_rejected"
+        restored, outcome = self.db.restore_discarded_draft_atomic(
+            draft_id,
+            filters.get("revision"),
+            filters.get("queue_revision"),
+            "floriano",
+            token,
+        )
+        if outcome not in {"restored", "already_applied"} or restored is None:
+            self._send(chat_id, "Ripristino non disponibile. Aggiorna l'elenco.")
+            return "post_restore_rejected"
+        self._send(chat_id, "Post ripristinato.")
+        return self._post_detail(
+            chat_id, parent, draft_id, restored["revision"],
+        )
 
     def _confirm_post_removal(self, chat_id: str, token: str) -> str:
         confirm = self.db.get_telegram_view(token, chat_id, "post_remove_confirm")

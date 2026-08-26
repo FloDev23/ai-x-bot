@@ -1298,7 +1298,7 @@ def test_posts_discard_filter_uses_an_opaque_refresh_view(tmp_path):
 
 
 def test_posts_confirmed_remove_and_restore_refresh_exact_revision(tmp_path):
-    """Catches Telegram queue actions bypassing confirmation/CAS or losing restore."""
+    """Catches restore-token reuse across two cycles in one persisted browser view."""
     db = Database(str(tmp_path / "post-actions.db"))
     _source, draft_id = add_pending_draft(db, text="Manual approved queue copy")
     db.ensure_editorial_queue(draft_id)
@@ -1326,10 +1326,89 @@ def test_posts_confirmed_remove_and_restore_refresh_exact_revision(tmp_path):
     assert controller.process_update(callback_update(3603, confirm)) == "processed"
     assert db.get_queue_draft(draft_id)["status"] == "discarded"
     restore = _button_callback(telegram.messages[-1], "Ripristina")
+    assert restore.count(":") == 1
     assert controller.process_update(callback_update(3604, restore)) == "processed"
     restored = db.get_queue_draft(draft_id)
     assert restored["status"] == "approved"
     assert restored["translation_policy"] == "advisory"
+
+    first_replay_start = len(telegram.messages)
+    assert controller.process_update(callback_update(3605, restore)) == "processed"
+    assert telegram.messages[first_replay_start][1] == "Post ripristinato."
+
+    remove = _button_callback(telegram.messages[-1], "Rimuovi dalla coda")
+    assert controller.process_update(callback_update(3606, remove)) == "processed"
+    confirm = _button_callback(telegram.messages[-1], "Conferma rimozione")
+    assert controller.process_update(callback_update(3607, confirm)) == "processed"
+    second_restore = _button_callback(telegram.messages[-1], "Ripristina")
+    assert second_restore.count(":") == 1
+    assert second_restore != restore
+    assert controller.process_update(callback_update(3608, second_restore)) == "processed"
+    second_replay_start = len(telegram.messages)
+    assert controller.process_update(callback_update(3609, second_restore)) == "processed"
+    assert telegram.messages[second_replay_start][1] == "Post ripristinato."
+    assert db.get_queue_draft(draft_id)["status"] == "approved"
+    with db._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM operator_operations WHERE action = 'restore'"
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM draft_evaluations "
+            "WHERE outcome = 'operator_restored'"
+        ).fetchone()[0] == 2
+
+
+def test_posts_detail_shows_origin_and_unavailable_italian_for_manual_and_generated(
+    tmp_path,
+):
+    """Catches detail omitting origin or the explicit Italian advisory state."""
+    db = Database(str(tmp_path / "detail-required-fields.db"))
+    _source, generated_id = add_pending_draft(
+        db, text="Exact generated English copy",
+    )
+    db.ensure_editorial_queue(generated_id)
+    _source, manual_id = add_pending_draft(
+        db,
+        slot="2030-08-15T13:00:00+00:00",
+        text="Exact manual English copy",
+    )
+    db.ensure_editorial_queue(manual_id)
+    with db._conn() as conn:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE post_drafts SET status = 'approved', "
+            "origin = 'manual_operator', approved_at = ?, "
+            "approved_by = 'floriano' WHERE id = ?",
+            (now, manual_id),
+        )
+        conn.execute(
+            "UPDATE editorial_queue SET translation_policy = 'advisory', "
+            "approved_queue_at = ? WHERE draft_id = ?",
+            (now, manual_id),
+        )
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+    assert controller.process_update(message_update(365, "/posts")) == "processed"
+    index = telegram.messages[-1]
+
+    for update_id, excerpt, exact_text, status, origin in (
+        (3651, "Exact generated", "Exact generated English copy",
+         "pending_approval", "generated"),
+        (3652, "Exact manual", "Exact manual English copy",
+         "approved", "manual_operator"),
+    ):
+        start = len(telegram.messages)
+        assert controller.process_update(callback_update(
+            update_id, post_detail_callback(index, excerpt),
+        )) == "processed"
+        detail = "\n".join(message[1] for message in telegram.messages[start:])
+        assert exact_text in detail
+        assert "Traduzione italiana — solo per revisione" in detail
+        assert "Non ancora disponibile." in detail
+        assert f"stato: {status}" in detail
+        assert f"origine: {origin}" in detail
+        assert "fonti: founder_note" in detail
+        assert "media: nessuno" in detail
 
 
 def test_posts_planned_detail_keeps_et_and_rome_schedule(tmp_path):
