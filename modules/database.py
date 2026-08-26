@@ -31,6 +31,7 @@ from modules.media_store import (
     record_has_media_identity,
     quarantine_verified_media,
     unlink_quarantined_media,
+    verified_delete_entry_state,
     verify_pinned_media,
 )
 from modules.growth_candidate_schema import (
@@ -6331,19 +6332,33 @@ class Database:
         # can be marked quarantined.
         quarantine_name = ".delete-" + intent_token
         try:
-            quarantine_verified_media(intent, quarantine_name)
+            quarantine_verified_media(
+                intent, quarantine_name, expected_name=quarantine_name,
+            )
         except Exception:
-            with self._media_store_mutation_lock("media", intent["media_id"]) as conn:
-                cursor = conn.execute("""
-                    UPDATE media_library SET lifecycle_state = ?, revision = revision + 1
-                    WHERE id = ? AND lifecycle_state = 'deleting'
-                      AND revision = ? AND file_sha256 = ?
-                """, (intent["prior_lifecycle"], intent["media_id"],
-                      intent["expected_revision"] + 1, intent["expected_sha256"]))
-                if cursor.rowcount:
-                    conn.execute("DELETE FROM media_delete_intents WHERE token = ?", (intent_token,))
-                    self._insert_media_event_in_conn(conn, intent["media_id"], "delete_aborted", {})
-            return False
+            # A rename can have happened before its directory fsync raised.
+            # Never restore availability merely because the syscall errored:
+            # inspect the exact deterministic entry under the root lease.
+            try:
+                entry_state = verified_delete_entry_state(
+                    intent, quarantine_name, expected_name=quarantine_name,
+                )
+            except Exception:
+                return False
+            if entry_state == "original":
+                with self._media_store_mutation_lock("media", intent["media_id"]) as conn:
+                    cursor = conn.execute("""
+                        UPDATE media_library SET lifecycle_state = ?, revision = revision + 1
+                        WHERE id = ? AND lifecycle_state = 'deleting'
+                          AND revision = ? AND file_sha256 = ?
+                    """, (intent["prior_lifecycle"], intent["media_id"],
+                          intent["expected_revision"] + 1, intent["expected_sha256"]))
+                    if cursor.rowcount:
+                        conn.execute("DELETE FROM media_delete_intents WHERE token = ?", (intent_token,))
+                        self._insert_media_event_in_conn(conn, intent["media_id"], "delete_aborted", {})
+                return False
+            if entry_state != "quarantine":
+                return False
         with self._media_store_mutation_lock("media", intent["media_id"]) as conn:
             cursor = conn.execute("""
                 UPDATE media_delete_intents
@@ -6374,7 +6389,10 @@ class Database:
         ):
             return False
         try:
-            if not deletion_entries_are_absent(intent, intent["quarantine_name"]):
+            expected_name = ".delete-" + intent_token
+            if not deletion_entries_are_absent(
+                intent, intent["quarantine_name"], expected_name=expected_name,
+            ):
                 return False
         except Exception:
             return False
@@ -6412,7 +6430,10 @@ class Database:
         if intent is None:
             return False
         try:
-            unlink_quarantined_media(intent, intent["quarantine_name"])
+            expected_name = ".delete-" + token
+            unlink_quarantined_media(
+                intent, intent["quarantine_name"], expected_name=expected_name,
+            )
         except Exception:
             return False
         return self.complete_unused_media_delete_atomic(token, record)
@@ -6431,7 +6452,10 @@ class Database:
             if current is None or current["state"] != "quarantined":
                 continue
             try:
-                unlink_quarantined_media(current, current["quarantine_name"])
+                expected_name = ".delete-" + intent["token"]
+                unlink_quarantined_media(
+                    current, current["quarantine_name"], expected_name=expected_name,
+                )
             except Exception:
                 continue
             self.complete_unused_media_delete_atomic(intent["token"], current)
@@ -6478,9 +6502,15 @@ class Database:
                     (ai_description, media_id),
                 )
 
-    def delete_media(self, media_id: int):
-        with self._media_store_mutation_lock("media", media_id) as conn:
-            conn.execute("DELETE FROM media_library WHERE id = ?", (media_id,))
+    def delete_media(self, media_id: int) -> bool:
+        """Legacy destructive API is intentionally disabled.
+
+        Historical media rows are audit records.  Callers must use the
+        exact-identity tombstone protocol above; silently deleting a row could
+        strand an intent and defeat restart reconciliation.
+        """
+        del media_id
+        return False
 
     # ---------- Growth candidates and follower snapshots ----------
 

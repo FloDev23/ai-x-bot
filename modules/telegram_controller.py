@@ -1752,12 +1752,27 @@ class TelegramController:
                 direction="previous" if parts[1] == "p" else "next",
             )
             return "media_browser" if rendered else "media_unavailable"
+        def validated_action_view(token, media_id, revision):
+            view = self.db.get_telegram_view(
+                token, chat_id, self.media_browser.view_kind,
+            )
+            if (
+                view is None
+                or media_id not in view["state"].get("target_ids", [])
+                or type(revision) is not int or revision < 0
+            ):
+                return None
+            return view
+
         if len(parts) == 5 and parts[1] == "u":
             try:
                 media_id = int(parts[3])
                 revision = int(parts[4])
             except ValueError:
                 return "invalid_callback"
+            if validated_action_view(parts[2], media_id, revision) is None:
+                self._send(chat_id, "Selezione media non valida o scaduta.")
+                return "media_unavailable"
             record = self.media_browser.select(
                 media_id=media_id, expected_revision=revision,
             )
@@ -1777,6 +1792,10 @@ class TelegramController:
                 revision = int(parts[4])
             except ValueError:
                 return "invalid_callback"
+            source_view = validated_action_view(parts[2], media_id, revision)
+            if source_view is None:
+                self._send(chat_id, "Azione media non valida o scaduta.")
+                return "media_unavailable"
             record = self.db.get_media_by_id(media_id)
             if (
                 not isinstance(record, dict) or record.get("revision") != revision
@@ -1798,11 +1817,12 @@ class TelegramController:
                     chat_id, "media_delete_confirm",
                     {"target_ids": [media_id], "direction": "current", "filters": {
                         "revision": revision, "sha256": digest,
+                        "parent_token": parts[2],
                     }, "last_message_id": None},
                 )
                 self._send(chat_id, "Confermi l'eliminazione definitiva?", reply_markup=self._callback_markup([[
                     self._callback_button("Conferma eliminazione", f"mb:x:{confirm}"),
-                    self._callback_button("Annulla", f"mb:c:{parts[2]}"),
+                    self._callback_button("Annulla", f"mb:q:{parts[2]}"),
                 ]]))
             except Exception:
                 self._send(chat_id, "Media non disponibile.")
@@ -1814,6 +1834,15 @@ class TelegramController:
                 return "media_unavailable"
             media_id = view["state"]["target_ids"][0]
             filters = view["state"]["filters"]
+            parent_token = filters.get("parent_token")
+            parent_view = (
+                self.db.get_telegram_view(
+                    parent_token, chat_id, self.media_browser.view_kind,
+                ) if isinstance(parent_token, str) else None
+            )
+            if parent_view is None or media_id not in parent_view["state"]["target_ids"]:
+                self._send(chat_id, "Conferma eliminazione non valida o scaduta.")
+                return "media_unavailable"
             changed = self.db.delete_unused_media_safely(
                 media_id, filters.get("revision"), filters.get("sha256"),
             )
@@ -1828,6 +1857,11 @@ class TelegramController:
                     return self._finish_manual_post(chat_id, raw, {**session, "payload": payload})
             self._send(chat_id, "Selezione media annullata.")
             return "media_cancelled"
+        if len(parts) == 3 and parts[1] == "q":
+            rendered = self.media_browser.render(
+                token=parts[2], chat_id=chat_id, direction="current",
+            )
+            return "media_browser" if rendered else "media_unavailable"
         if len(parts) == 3 and parts[1] == "g":
             self._send(chat_id, "Gestione media: apri /media per una selezione aggiornata.")
             return "media_manage"

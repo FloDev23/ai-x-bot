@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+import re
 import stat
 import threading
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _ROOT_LOCKS_GUARD = threading.Lock()
 _ROOT_LOCKS: Dict[Tuple[int, int], threading.RLock] = {}
 _THREAD_STATE = threading.local()
+_QUARANTINE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 
 def _require_nofollow_support() -> int:
@@ -86,19 +88,34 @@ def _validated_record_locator(record: Mapping) -> Tuple[Path, str]:
     return locator.parent, filename
 
 
-def quarantine_verified_media(record: Mapping, quarantine_name: str) -> str:
+def validate_quarantine_name(
+    quarantine_name: str, *, expected_name: str | None = None,
+) -> str:
+    """Accept only one deterministic private-root quarantine basename."""
+    if (
+        type(quarantine_name) is not str
+        or "\x00" in quarantine_name
+        or os.path.basename(quarantine_name) != quarantine_name
+        or quarantine_name in {"", ".", ".."}
+        or not quarantine_name.startswith(".delete-")
+        or _QUARANTINE_TOKEN.fullmatch(quarantine_name[len(".delete-"):]) is None
+        or (expected_name is not None and quarantine_name != expected_name)
+    ):
+        raise ValueError("invalid_quarantine_name")
+    return quarantine_name
+
+
+def quarantine_verified_media(
+    record: Mapping, quarantine_name: str, *, expected_name: str | None = None,
+) -> str:
     """Move one verified inode into a private same-directory quarantine.
 
     The caller receives no usable pathname.  The basename is intentionally
     random and is only transient recovery metadata in the database.
     """
-    if (
-        type(quarantine_name) is not str
-        or not quarantine_name.startswith(".delete-")
-        or "/" in quarantine_name
-        or "\\" in quarantine_name
-    ):
-        raise ValueError("invalid_quarantine_name")
+    quarantine_name = validate_quarantine_name(
+        quarantine_name, expected_name=expected_name,
+    )
     root, name = _validated_record_locator(record)
     with media_store_lock(root) as (_locked_root, root_fd):
         try:
@@ -134,11 +151,14 @@ def quarantine_verified_media(record: Mapping, quarantine_name: str) -> str:
     return quarantine_name
 
 
-def unlink_quarantined_media(record: Mapping, quarantine_name: str) -> None:
+def unlink_quarantined_media(
+    record: Mapping, quarantine_name: str, *, expected_name: str | None = None,
+) -> None:
     """Unlink a random quarantine entry through a trusted directory FD."""
     root, _name = _validated_record_locator(record)
-    if type(quarantine_name) is not str or not quarantine_name.startswith(".delete-"):
-        raise ValueError("invalid_quarantine_name")
+    quarantine_name = validate_quarantine_name(
+        quarantine_name, expected_name=expected_name,
+    )
     with media_store_lock(root) as (_locked_root, root_fd):
         try:
             file_fd = os.open(
@@ -146,6 +166,9 @@ def unlink_quarantined_media(record: Mapping, quarantine_name: str) -> None:
                 dir_fd=root_fd,
             )
         except FileNotFoundError:
+            # A prior process may have died after unlink and before directory
+            # fsync.  Persist that absence before the DB tombstone can happen.
+            fsync_media_directory(root_fd)
             return
         while True:
             try:
@@ -166,8 +189,13 @@ def unlink_quarantined_media(record: Mapping, quarantine_name: str) -> None:
         fsync_media_directory(root_fd)
 
 
-def deletion_entries_are_absent(record: Mapping, quarantine_name: str) -> bool:
+def deletion_entries_are_absent(
+    record: Mapping, quarantine_name: str, *, expected_name: str | None = None,
+) -> bool:
     """Authorize a crash-recovery tombstone only when both names are absent."""
+    quarantine_name = validate_quarantine_name(
+        quarantine_name, expected_name=expected_name,
+    )
     root, name = _validated_record_locator(record)
     with media_store_lock(root) as (_locked_root, root_fd):
         for entry_name in (name, quarantine_name):
@@ -177,6 +205,38 @@ def deletion_entries_are_absent(record: Mapping, quarantine_name: str) -> bool:
                 continue
             return False
     return True
+
+
+def verified_delete_entry_state(
+    record: Mapping, quarantine_name: str, *, expected_name: str | None = None,
+) -> str:
+    """Return the one verified durable locator left by a delete attempt.
+
+    This is deliberately a closed set so callers can compensate only when the
+    original identity is still present; an uncertain/absent directory state
+    must retain the intent for startup reconciliation.
+    """
+    quarantine_name = validate_quarantine_name(
+        quarantine_name, expected_name=expected_name,
+    )
+    root, name = _validated_record_locator(record)
+    with media_store_lock(root) as (_locked_root, root_fd):
+        for entry_name, state in ((quarantine_name, "quarantine"), (name, "original")):
+            try:
+                file_fd = os.open(
+                    entry_name, os.O_RDONLY | _require_nofollow_support(),
+                    dir_fd=root_fd,
+                )
+            except FileNotFoundError:
+                continue
+            try:
+                verify_pinned_media(PinnedMediaFile(
+                    root_fd, entry_name, file_fd, media_identity_from_record(record),
+                ))
+                return state
+            finally:
+                os.close(file_fd)
+    return "absent"
 
 
 class MediaStoreLease:

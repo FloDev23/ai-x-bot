@@ -1,6 +1,7 @@
 """Verified, path-free Telegram rendering for one media-library item."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -35,13 +36,23 @@ class MediaBrowser:
         # Locators should never be reflected even when an operator supplied one
         # as a description by mistake.
         text = " ".join(value.replace("\\", "/").split())
-        if text.startswith("/") or "/Users/" in text or "/home/" in text:
-            return "n/d"
+        # Never reflect any absolute locator, including transient macOS paths.
+        text = re.sub(r"/(?:[^\s/]+/)*[^\s/]+", "[redacted]", text)
         return text[:limit] or "n/d"
 
     @staticmethod
     def _media_kind(record: Dict) -> Optional[str]:
         return _MEDIA_PAIRS.get((record.get("media_type"), record.get("mime_type")))
+
+    @staticmethod
+    def _content_matches(stream, media_kind: str, mime_type: str) -> bool:
+        if media_kind != "document":
+            return media_content_matches(stream, mime_type)
+        position = stream.tell()
+        try:
+            return stream.read(5) == b"%PDF-"
+        finally:
+            stream.seek(position)
 
     def _markup(self, token: str, record: Dict) -> Dict:
         media_id = record["id"]
@@ -100,7 +111,7 @@ class MediaBrowser:
         ))
         try:
             with open_verified_media(record) as stream:
-                if media_kind != "document" and not media_content_matches(stream, record["mime_type"]):
+                if not self._content_matches(stream, media_kind, record["mime_type"]):
                     return None
                 # Re-read the row while the trusted root lease remains held.
                 # A changed lifecycle/revision fails closed before Telegram sees it.
@@ -119,10 +130,35 @@ class MediaBrowser:
             return None
         return result["message_id"]
 
+    def _send_management_record(
+        self, chat_id: str, token: str, record: Dict,
+    ) -> Optional[int]:
+        """Render archived metadata without opening/sending the archived file."""
+        caption = "\n".join((
+            f"Media #{record['id']}",
+            f"Tipo: {self._media_kind(record) or 'n/d'}",
+            f"Data: {self._safe_text(record.get('uploaded_at'), 48)}",
+            f"Descrizione: {self._safe_text(record.get('ai_description') or record.get('user_context'))}",
+            "Stato: archiviato",
+        ))
+        try:
+            result = self.telegram_api.send_message(
+                chat_id, caption, reply_markup=self._markup(token, record),
+            )
+        except Exception:
+            return None
+        return result.get("message_id") if isinstance(result, dict) and type(result.get("message_id")) is int else None
+
     def show(self, *, chat_id: str, media_id: int | None, context: str) -> str:
         if not isinstance(chat_id, str) or not chat_id or not isinstance(context, str):
             raise ValueError("invalid_media_browser_request")
-        rows = self.db.get_available_media(limit=300)
+        rows = (
+            self.db.get_all_media(limit=300)
+            if context == "manage"
+            else self.db.get_available_media(limit=300)
+        )
+        if context == "manage":
+            rows = [row for row in rows if row.get("lifecycle_state") in {"available", "archived"}]
         target_ids = [row["id"] for row in rows if type(row.get("id")) is int]
         if media_id is not None and type(media_id) is int and media_id in target_ids:
             target_ids.remove(media_id)
@@ -149,13 +185,28 @@ class MediaBrowser:
             if isinstance(candidate, dict) and type(candidate.get("revision")) is int
             else None
         )
+        managing_archived = (
+            view["state"]["filters"].get("context") == "manage"
+            and isinstance(candidate, dict)
+            and candidate.get("lifecycle_state") == "archived"
+            and candidate.get("file_deleted") == 0
+            and candidate.get("reserved_by_draft_id") is None
+            and candidate.get("used") == 0
+            and self._media_kind(candidate) is not None
+        )
+        if managing_archived:
+            record = candidate
         if record is None:
             try:
                 self.telegram_api.send_message(chat_id, "Nessun media disponibile.")
             except Exception:
                 pass
             return False
-        message_id = self._send_record(chat_id, token, record)
+        message_id = (
+            self._send_management_record(chat_id, token, record)
+            if managing_archived
+            else self._send_record(chat_id, token, record)
+        )
         if message_id is None:
             try:
                 self.telegram_api.send_message(chat_id, "Media non disponibile.")

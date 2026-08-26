@@ -1,7 +1,14 @@
 import importlib
 import importlib.util
 import io
+import os
 from pathlib import Path
+import subprocess
+import sys
+import threading
+from types import SimpleNamespace
+
+import pytest
 
 from modules.database import Database
 from modules.media_processor import MediaProcessor
@@ -169,3 +176,225 @@ def test_media_view_rejects_boolean_ids_and_wrong_chat(tmp_path):
     )
 
     assert database.get_telegram_view(token, "99", "media_browser") is None
+
+
+def test_quarantine_rejects_traversal_before_any_dirfd_mutation(tmp_path):
+    """Catches a quarantine basename escaping the media root through dir_fd."""
+    from modules.media_store import quarantine_verified_media
+
+    database, root, record = _stored_photo(tmp_path)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"do-not-touch")
+
+    with pytest.raises(ValueError, match="invalid_quarantine_name"):
+        quarantine_verified_media(record, ".delete-/../../victim")
+
+    assert victim.read_bytes() == b"do-not-touch"
+    assert Path(record["filepath"]).exists()
+
+
+def test_post_rename_fsync_failure_retains_recoverable_intent(tmp_path, monkeypatch):
+    """Catches DB rollback after a rename whose durability is uncertain."""
+    from modules import media_store
+
+    database, root, record = _stored_photo(tmp_path)
+    prepared, state = database.prepare_unused_media_delete_atomic(
+        record["id"], record["revision"], record["file_sha256"],
+    )
+    assert state == "prepared"
+
+    monkeypatch.setattr(
+        media_store, "fsync_media_directory",
+        lambda _fd: (_ for _ in ()).throw(OSError("injected fsync failure")),
+    )
+
+    assert database.quarantine_unused_media_delete(prepared["intent_token"]) is True
+
+    with database._conn() as conn:
+        intent = conn.execute("SELECT * FROM media_delete_intents").fetchone()
+    assert intent["state"] == "quarantined"
+    assert (root / intent["quarantine_name"]).exists()
+    assert database.get_media_by_id(record["id"])["lifecycle_state"] == "deleting"
+
+
+def test_legacy_delete_media_preserves_prepared_intent_for_restart(tmp_path):
+    """Catches the obsolete DELETE FROM path erasing deletion audit history."""
+    database, _root, record = _stored_photo(tmp_path)
+    prepared, state = database.prepare_unused_media_delete_atomic(
+        record["id"], record["revision"], record["file_sha256"],
+    )
+    assert state == "prepared"
+
+    assert database.delete_media(record["id"]) is False
+    restarted = Database(database.db_path)
+
+    assert restarted.get_media_by_id(record["id"])["lifecycle_state"] == "deleted"
+
+
+def test_document_preview_rejects_jpeg_relabelled_as_pdf(tmp_path):
+    """Catches document rendering that trusts a MIME label without content."""
+    from modules.telegram_media_browser import MediaBrowser
+
+    database, _root, record = _stored_photo(tmp_path)
+    with database._conn() as conn:
+        conn.execute(
+            "UPDATE media_library SET media_type = 'document', mime_type = 'application/pdf' WHERE id = ?",
+            (record["id"],),
+        )
+    api = RecordingTelegramApi()
+
+    MediaBrowser(database, api).show(chat_id="42", media_id=record["id"], context="manual")
+
+    assert api.media_messages == []
+
+
+def test_caption_redacts_embedded_absolute_private_path():
+    """Catches safe descriptions reflecting a private locator mid-sentence."""
+    from modules.telegram_media_browser import MediaBrowser
+
+    assert "private/var" not in MediaBrowser._safe_text(
+        "Photo stored at /private/var/folders/secret.jpg for review",
+    )
+
+
+def test_management_actions_require_bound_view_and_render_archived_restore(tmp_path):
+    """Catches cross-chat/stale actions and an archive browser hiding restore."""
+    from modules.telegram_controller import TelegramController
+    from modules.telegram_media_browser import MediaBrowser
+
+    database, _root, record = _stored_photo(tmp_path)
+    api = RecordingTelegramApi()
+    browser = MediaBrowser(database, api)
+    controller = TelegramController(
+        api, database, SimpleNamespace(notify_error=lambda *_args: None), "42",
+    )
+    token = browser.show(chat_id="42", media_id=record["id"], context="manage")
+
+    assert controller._media_browser_callback(
+        "99", ["mb", "a", token, str(record["id"]), str(record["revision"])],
+    ) == "media_unavailable"
+    assert database.get_media_by_id(record["id"])["lifecycle_state"] == "available"
+
+    assert controller._media_browser_callback(
+        "42", ["mb", "a", token, str(record["id"]), str(record["revision"])],
+    ) == "media_archived"
+    archived = database.get_media_by_id(record["id"])
+    manage_token = browser.show(chat_id="42", media_id=record["id"], context="manage")
+    labels = {
+        button["text"]
+        for row in api.messages[-1][2]["reply_markup"]["inline_keyboard"]
+        for button in row
+    }
+    assert "Ripristina" in labels
+    assert controller._media_browser_callback(
+        "42", ["mb", "r", manage_token, str(record["id"]), str(archived["revision"])],
+    ) == "media_restored"
+
+
+def test_hard_exit_after_rename_recovers_deterministic_quarantine(tmp_path):
+    """Catches the rename→intent-update crash boundary leaving an orphan."""
+    database, _root, record = _stored_photo(tmp_path)
+    prepared, state = database.prepare_unused_media_delete_atomic(
+        record["id"], record["revision"], record["file_sha256"],
+    )
+    assert state == "prepared"
+    script = """
+import os
+import sys
+from modules import media_store
+media_store.fsync_media_directory = lambda _fd: os._exit(91)
+from modules.database import Database
+Database(sys.argv[1])
+"""
+
+    child = subprocess.run(
+        [sys.executable, "-c", script, database.db_path],
+        cwd=str(Path(__file__).resolve().parent.parent), check=False,
+    )
+
+    assert child.returncode == 91
+    restarted = Database(database.db_path)
+    assert restarted.get_media_by_id(record["id"])["lifecycle_state"] == "deleted"
+
+
+def test_missing_quarantine_is_fsynced_before_restart_tombstone(tmp_path, monkeypatch):
+    """Catches unlink→fsync crash recovery tombstoning an unpersisted unlink."""
+    from modules import media_store
+
+    database, root, record = _stored_photo(tmp_path)
+    prepared, state = database.prepare_unused_media_delete_atomic(
+        record["id"], record["revision"], record["file_sha256"],
+    )
+    assert state == "prepared"
+    assert database.quarantine_unused_media_delete(prepared["intent_token"])
+    with database._conn() as conn:
+        intent = conn.execute("SELECT quarantine_name FROM media_delete_intents").fetchone()
+    os.unlink(root / intent["quarantine_name"])
+    calls = []
+    real_fsync = media_store.fsync_media_directory
+    monkeypatch.setattr(
+        media_store, "fsync_media_directory",
+        lambda fd: (calls.append(fd), real_fsync(fd))[1],
+    )
+
+    database.reconcile_media_delete_intents()
+
+    assert calls
+    assert database.get_media_by_id(record["id"])["lifecycle_state"] == "deleted"
+
+
+def test_two_delete_callbacks_only_prepare_one_intent(tmp_path):
+    """Catches concurrent confirmation callbacks preparing two deletes."""
+    database, _root, record = _stored_photo(tmp_path)
+    results = []
+
+    def prepare():
+        results.append(Database(database.db_path).prepare_unused_media_delete_atomic(
+            record["id"], record["revision"], record["file_sha256"],
+        )[1])
+
+    threads = [threading.Thread(target=prepare) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert results.count("prepared") == 1
+    assert len(results) == 2
+
+
+def test_mutating_callback_rejects_expired_wrong_kind_and_target_view(tmp_path):
+    """Catches action tokens being treated as cosmetic rather than authority."""
+    from modules.telegram_controller import TelegramController
+    from modules.telegram_media_browser import MediaBrowser
+
+    database, _root, record = _stored_photo(tmp_path)
+    api = RecordingTelegramApi()
+    controller = TelegramController(
+        api, database, SimpleNamespace(notify_error=lambda *_args: None), "42",
+    )
+    browser = MediaBrowser(database, api)
+    token = browser.show(chat_id="42", media_id=record["id"], context="manage")
+    with database._conn() as conn:
+        conn.execute(
+            "UPDATE telegram_views SET expires_at = '2000-01-01T00:00:00+00:00' WHERE token = ?",
+            (token,),
+        )
+    assert controller._media_browser_callback(
+        "42", ["mb", "a", token, str(record["id"]), str(record["revision"])],
+    ) == "media_unavailable"
+
+    wrong_kind = database.create_telegram_view(
+        "42", "media_delete_confirm", {"target_ids": [record["id"]], "filters": {}},
+    )
+    assert controller._media_browser_callback(
+        "42", ["mb", "a", wrong_kind, str(record["id"]), str(record["revision"])],
+    ) == "media_unavailable"
+
+    wrong_target = database.create_telegram_view(
+        "42", "media_browser", {"target_ids": [999], "filters": {}},
+    )
+    assert controller._media_browser_callback(
+        "42", ["mb", "a", wrong_target, str(record["id"]), str(record["revision"])],
+    ) == "media_unavailable"
+    assert database.get_media_by_id(record["id"])["lifecycle_state"] == "available"

@@ -209,6 +209,7 @@ class FakeTelegramApi:
         self.media_library_dir = Path(media_library_dir)
         self.messages = []
         self.media_messages = []
+        self.deleted_messages = []
         self.callback_answers = []
         self.downloads = []
 
@@ -220,6 +221,10 @@ class FakeTelegramApi:
         content = media.read()
         self.media_messages.append((str(chat_id), content, media_type, kwargs))
         return {"message_id": len(self.media_messages)}
+
+    def delete_message(self, chat_id, message_id):
+        self.deleted_messages.append((str(chat_id), message_id))
+        return True
 
     def answer_callback(self, callback_id, **kwargs):
         self.callback_answers.append((callback_id, kwargs))
