@@ -44,10 +44,7 @@ _SESSION_KINDS = {
     "source_intake": {"text", "classification", "news_url", "news_date", "news_source"},
     "draft_edit": {"text"},
     "draft_postpone": {"slot"},
-    "manual_post": {
-        "text", "category", "sources", "media",
-        "translation_mode", "translation_text",
-    },
+    "manual_post": {"text", "category", "sources", "media"},
 }
 _SOURCE_TYPES = {
     "founder_note": "Founder note",
@@ -989,7 +986,6 @@ class TelegramController:
         chat_id: str,
         raw: str,
         session: Dict[str, Any],
-        translation_it: Optional[str],
     ):
         if self.draft_pipeline is None:
             self._send(chat_id, "Pipeline bozze non disponibile.")
@@ -1002,7 +998,7 @@ class TelegramController:
                     category=payload["category"],
                     source_ids=list(payload["source_ids"]),
                     media_id=payload["media_id"],
-                    translation_it=translation_it,
+                    translation_it=None,
                     state_key=self._session_key(chat_id),
                     expected_state_value=raw,
                     session_token=session["token"],
@@ -1033,13 +1029,11 @@ class TelegramController:
             )
             return "manual_rejected"
         queued = self.db.get_queue_draft(draft.get("id")) or draft
-        if queued.get("translation_status") == "ready":
-            self._send(chat_id, "Post manuale aggiunto alla coda di revisione.")
-        else:
-            self._send(
-                chat_id,
-                "Post salvato; traduzione italiana ancora in preparazione.",
-            )
+        self._send(
+            chat_id,
+            "Post manuale aggiunto alla coda approvata; "
+            "traduzione italiana facoltativa in preparazione.",
+        )
         self._send_draft_card(chat_id, queued)
         return "manual_created"
 
@@ -1175,8 +1169,6 @@ class TelegramController:
                 return False
             if step == "sources":
                 return set(payload) == {"text", "category", "source_ids"}
-            if not source_ids:
-                return False
             if step == "media":
                 return set(payload) == {"text", "category", "source_ids"}
             media_id = payload.get("media_id")
@@ -1185,12 +1177,7 @@ class TelegramController:
                 or not 0 < media_id <= _SQLITE_INTEGER_MAX
             ):
                 return False
-            return (
-                step in {"translation_mode", "translation_text"}
-                and set(payload) == {
-                    "text", "category", "source_ids", "media_id",
-                }
-            )
+            return False
         return False
 
     def _decode_session(self, raw: Any):
@@ -1298,14 +1285,6 @@ class TelegramController:
                     reply_markup=self._manual_category_markup(),
                 )
                 return "manual_category"
-            if step == "translation_text":
-                return self._finish_manual_post(
-                    chat_id,
-                    raw,
-                    session,
-                    text,
-                )
-
         if kind == "source_intake":
             if step == "text":
                 if not clean or len(clean) > 2000:
@@ -1722,7 +1701,7 @@ class TelegramController:
                 return "session_conflict"
             self._send(
                 chat_id,
-                "Scegli da una a tre fonti, poi conferma.",
+                "Scegli fino a tre fonti facoltative, oppure conferma senza fonti.",
                 reply_markup=self._manual_source_markup(category, []),
             )
             return "manual_sources"
@@ -1769,9 +1748,9 @@ class TelegramController:
             return "manual_source_selected"
 
         if parts == ["manual", "sources_done"]:
-            if step != "sources" or not payload["source_ids"]:
-                self._send(chat_id, "Seleziona almeno una fonte.")
-                return "manual_sources_required"
+            if step != "sources":
+                self._send(chat_id, "Questa sessione non attende fonti.")
+                return "invalid_session"
             if not self._replace_session(
                 chat_id, raw, "manual_post", "media", dict(payload),
             ):
@@ -1807,69 +1786,10 @@ class TelegramController:
                     return "manual_media_rejected"
             next_payload = dict(payload)
             next_payload["media_id"] = media_id
-            if not self._replace_session(
-                chat_id,
-                raw,
-                "manual_post",
-                "translation_mode",
-                next_payload,
-            ):
-                self._send(chat_id, "Operazione già gestita.")
-                return "session_conflict"
-            self._send(
-                chat_id,
-                "Come vuoi preparare la traduzione italiana per la revisione?",
-                reply_markup=self._callback_markup([
-                    [
-                        self._callback_button(
-                            "Traduci automaticamente", "manual:translation:auto",
-                        ),
-                        self._callback_button(
-                            "La inserisco io", "manual:translation:manual",
-                        ),
-                    ],
-                    [self._callback_button("Annulla", "manual:cancel")],
-                ]),
-            )
-            return "manual_translation_mode"
-
-        if len(parts) == 3 and parts[1] == "translation":
-            mode = parts[2]
-            if step != "translation_mode" or mode not in {"auto", "manual"}:
-                self._send(chat_id, "Modalità di traduzione non valida.")
-                return "invalid_callback"
-            if mode == "manual":
-                if not self._replace_session(
-                    chat_id,
-                    raw,
-                    "manual_post",
-                    "translation_text",
-                    dict(payload),
-                ):
-                    self._send(chat_id, "Operazione già gestita.")
-                    return "session_conflict"
-                self._send(
-                    chat_id,
-                    "Invia la traduzione italiana esatta, senza virgolette esterne.",
-                )
-                return "manual_translation_text"
-
-            translation_it = None
-            translator = getattr(self.draft_pipeline, "review_translator", None)
-            translate = getattr(translator, "translate", None)
-            if callable(translate):
-                try:
-                    translated = translate(payload["text"])
-                except Exception:
-                    translated = None
-                candidate = getattr(translated, "text_it", None)
-                if isinstance(candidate, str):
-                    translation_it = candidate
             return self._finish_manual_post(
                 chat_id,
                 raw,
-                session,
-                translation_it,
+                {**session, "payload": next_payload},
             )
 
         self._send(chat_id, "Azione manuale non valida.")

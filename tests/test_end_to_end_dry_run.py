@@ -233,7 +233,6 @@ def test_manual_newpost_enters_approved_reserve_without_x_write(tmp_path):
         callback_update(313, f"manual:source:{source_id}"),
         callback_update(314, "manual:sources_done"),
         callback_update(315, "manual:media:none"),
-        callback_update(316, "manual:translation:auto"),
     )
     for update in updates:
         assert agent.telegram_controller.process_update(update) == "processed"
