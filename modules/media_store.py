@@ -26,6 +26,10 @@ _THREAD_STATE = threading.local()
 _QUARANTINE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 
+class MediaDirectoryFsyncError(OSError):
+    """A directory entry may exist, but its durability is not established."""
+
+
 def _require_nofollow_support() -> int:
     if not isinstance(_NOFOLLOW, int) or _NOFOLLOW == 0:
         raise RuntimeError("secure_nofollow_unavailable")
@@ -75,6 +79,13 @@ def fsync_media_directory(root_fd: int) -> None:
             return
         except InterruptedError:
             continue
+
+
+def _durably_fsync_directory(root_fd: int) -> None:
+    try:
+        fsync_media_directory(root_fd)
+    except OSError as exc:
+        raise MediaDirectoryFsyncError("media_directory_fsync_failed") from exc
 
 
 def _validated_record_locator(record: Mapping) -> Tuple[Path, str]:
@@ -145,7 +156,11 @@ def quarantine_verified_media(
                         break
                     except InterruptedError:
                         continue
-                fsync_media_directory(root_fd)
+                _durably_fsync_directory(root_fd)
+            else:
+                # A restart found the deterministic post-rename entry.  It is
+                # not a committed quarantine until this retry succeeds.
+                _durably_fsync_directory(root_fd)
         finally:
             os.close(file_fd)
     return quarantine_name
@@ -168,7 +183,7 @@ def unlink_quarantined_media(
         except FileNotFoundError:
             # A prior process may have died after unlink and before directory
             # fsync.  Persist that absence before the DB tombstone can happen.
-            fsync_media_directory(root_fd)
+            _durably_fsync_directory(root_fd)
             return
         while True:
             try:
@@ -186,7 +201,7 @@ def unlink_quarantined_media(
                 break
             finally:
                 os.close(file_fd)
-        fsync_media_directory(root_fd)
+        _durably_fsync_directory(root_fd)
 
 
 def deletion_entries_are_absent(

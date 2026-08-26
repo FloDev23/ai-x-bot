@@ -24,6 +24,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from modules.media_store import (
+    MediaDirectoryFsyncError,
     PinnedMediaFile,
     deletion_entries_are_absent,
     media_store_lock,
@@ -6335,6 +6336,10 @@ class Database:
             quarantine_verified_media(
                 intent, quarantine_name, expected_name=quarantine_name,
             )
+        except MediaDirectoryFsyncError:
+            # The entry may be visible but cannot be claimed durable.  Keep
+            # the prepared intent so startup reopens/verifies and retries fsync.
+            return False
         except Exception:
             # A rename can have happened before its directory fsync raised.
             # Never restore availability merely because the syscall errored:
