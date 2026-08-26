@@ -1178,6 +1178,12 @@ class Database:
             if isinstance(expected, dict) and isinstance(expected.get("payload"), dict)
             else None
         )
+        resumed_payload = resumed.get("payload") if isinstance(resumed, dict) else None
+        resumed_ids = (
+            resumed_payload.get("source_ids")
+            if isinstance(resumed_payload, dict)
+            else None
+        )
         if (
             not isinstance(expected_child, dict)
             or expected.get("kind") != "manual_post"
@@ -1189,8 +1195,22 @@ class Database:
             or resumed.get("kind") != "manual_post"
             or resumed.get("step") != "sources"
             or resumed.get("token") != expected.get("token")
-            or not isinstance(resumed.get("payload"), dict)
-            or "child" in resumed["payload"]
+            or set(resumed) != {
+                "version", "token", "kind", "step", "payload", "expires_at",
+            }
+            or resumed.get("version") != 1
+            or not isinstance(resumed_payload, dict)
+            or set(resumed_payload) != {"text", "category", "source_ids"}
+            or not isinstance(resumed_payload.get("text"), str)
+            or not resumed_payload["text"].strip()
+            or len(resumed_payload["text"]) > 280
+            or not isinstance(resumed_payload.get("category"), str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{1,63}", resumed_payload["category"]) is None
+            or type(resumed_ids) is not list
+            or len(resumed_ids) >= 3
+            or any(type(value) is not int or value <= 0 for value in resumed_ids)
+            or len(set(resumed_ids)) != len(resumed_ids)
+            or self._strict_aware_datetime(resumed.get("expires_at")) is None
         ):
             return None, "rejected"
 
@@ -1251,14 +1271,7 @@ class Database:
                 verified_by=verified_by,
                 verified_at=None,
             )
-            resumed_payload = resumed["payload"]
-            resumed_ids = resumed_payload.get("source_ids")
-            if (
-                type(resumed_ids) is not list
-                or any(type(value) is not int or value <= 0 for value in resumed_ids)
-                or source_id in resumed_ids
-                or len(resumed_ids) >= 3
-            ):
+            if source_id in resumed_ids:
                 return None, "rejected"
             resumed_payload["source_ids"] = resumed_ids + [source_id]
             effective_resumed_value = json.dumps(

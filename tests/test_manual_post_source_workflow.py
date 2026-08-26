@@ -121,7 +121,10 @@ def test_existing_sources_paginate_select_exact_ids_without_rendering_bodies(tmp
         expected.append(db.add_content_source(
             "founder_note",
             f"PRIVATE_SOURCE_BODY_{index}",
-            metadata={"publishable": True, "title": f"Lesson {index}"},
+            metadata={
+                "publishable": True,
+                "title": f"Lesson {index} " + "x" * 80,
+            },
             verified_by="floriano",
         ))
     telegram = Telegram(tmp_path)
@@ -131,6 +134,8 @@ def test_existing_sources_paginate_select_exact_ids_without_rendering_bodies(tmp
     rendered = "\n".join(text for _chat, text, _kwargs in telegram.messages)
     labels = button_texts(telegram)
     assert "PRIVATE_SOURCE_BODY_0" not in rendered
+    assert all("PRIVATE_SOURCE_BODY_0" not in label for label in labels)
+    assert any("· Verificata" in label for label in labels)
     assert any(f"#{expected[-1]} founder_note" in label for label in labels)
     assert bot.process_update(callback(5, "manual:sources:page:1")) == "processed"
     assert any(f"#{expected[0]} founder_note" in label for label in button_texts(telegram))
@@ -145,9 +150,12 @@ def test_child_news_source_survives_restarts_and_atomically_resumes_parent(tmp_p
     path = str(tmp_path / "child-news.db")
     telegram = Telegram(tmp_path)
     bot = start_at_sources(Database(path), telegram, category="fitness_business_insight")
+    parent_token = session(Database(path))["token"]
 
     assert bot.process_update(callback(4, "manual:sources:add")) == "processed"
-    assert session(Database(path))["step"] == "source_child_text"
+    initial_child = session(Database(path))
+    assert initial_child["step"] == "source_child_text"
+    assert initial_child["token"] == parent_token
     for update_id, update in enumerate((
         message(5, "Studios report a measurable change."),
         callback(6, "manual:child:source:verified_news"),
@@ -158,9 +166,11 @@ def test_child_news_source_survives_restarts_and_atomically_resumes_parent(tmp_p
         del update_id
         bot = controller(Database(path), telegram)
         assert bot.process_update(update) == "processed"
+        assert session(Database(path))["token"] == parent_token
 
     resumed = session(Database(path))
     assert resumed["step"] == "sources"
+    assert resumed["token"] == parent_token
     assert "child" not in resumed["payload"]
     source_ids = resumed["payload"]["source_ids"]
     assert len(source_ids) == 1
@@ -177,10 +187,14 @@ def test_child_cancel_preserves_parent_and_replayed_finish_creates_one_source(tm
     db = Database(str(tmp_path / "child-replay.db"))
     telegram = Telegram(tmp_path)
     bot = start_at_sources(db, telegram)
+    parent_token = session(db)["token"]
     assert bot.process_update(callback(4, "manual:sources:add")) == "processed"
-    child = session(db)["payload"]["child"]["token"]
+    child_session = session(db)
+    child = child_session["payload"]["child"]["token"]
+    assert child_session["token"] == parent_token
     assert bot.process_update(callback(5, "manual:sources:child_cancel")) == "processed"
     assert session(db)["step"] == "sources"
+    assert session(db)["token"] == parent_token
     assert session(db)["payload"]["source_ids"] == []
 
     assert bot.process_update(callback(6, "manual:sources:add")) == "processed"
@@ -189,7 +203,8 @@ def test_child_cancel_preserves_parent_and_replayed_finish_creates_one_source(tm
     assert len(db.get_eligible_sources("founder_note")) == 1
     assert bot.process_update(callback(9, "manual:child:source:founder_note")) == "processed"
     assert len(db.get_eligible_sources("founder_note")) == 1
-    assert child != session(db)["token"]
+    assert child != parent_token
+    assert session(db)["token"] == parent_token
 
 
 def test_stale_source_keeps_parent_for_reselection_and_unauthorized_gets_no_state(tmp_path):
@@ -198,18 +213,25 @@ def test_stale_source_keeps_parent_for_reselection_and_unauthorized_gets_no_stat
         "founder_note", "A source that will become stale.",
         metadata={"publishable": True}, verified_by="floriano",
     )
+    valid_source_id = db.add_content_source(
+        "founder_note", "A source that remains eligible.",
+        metadata={"publishable": True}, verified_by="floriano",
+    )
     telegram = Telegram(tmp_path)
     bot = start_at_sources(db, telegram)
     assert bot.process_update(callback(4, "manual:sources:existing")) == "processed"
     assert bot.process_update(callback(5, f"manual:source:{source_id}")) == "processed"
-    assert bot.process_update(callback(6, "manual:sources_done")) == "processed"
+    assert bot.process_update(callback(6, f"manual:source:{valid_source_id}")) == "processed"
+    assert bot.process_update(callback(7, "manual:sources_done")) == "processed"
     with db._conn() as conn:
         conn.execute("DELETE FROM content_sources WHERE id = ?", (source_id,))
-    assert bot.process_update(callback(7, "manual:media:none")) == "processed"
-    assert session(db)["step"] == "sources"
+    assert bot.process_update(callback(8, "manual:media:none")) == "processed"
+    recovered = session(db)
+    assert recovered["step"] == "sources"
+    assert recovered["payload"]["source_ids"] == [valid_source_id]
     assert "fonti selezionate non sono più disponibili" in telegram.messages[-1][1].lower()
 
-    assert bot.process_update(message(8, "/newpost", chat_id=999)) == "unauthorized"
+    assert bot.process_update(message(9, "/newpost", chat_id=999)) == "unauthorized"
     assert db.get_state("telegram_session:999") is None
     assert all(chat_id != "999" for chat_id, _text, _kwargs in telegram.messages)
 
@@ -314,6 +336,50 @@ def test_child_operation_rolls_back_source_and_parent_state_on_insert_failure(tm
     else:
         raise AssertionError("injected source write must fail")
 
+    assert db.get_state("telegram_session:42") == expected
+    assert db.get_eligible_sources("founder_note") == []
+    with db._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM telegram_child_operations",
+        ).fetchone()[0] == 0
+
+
+def test_child_operation_rejects_malformed_resume_without_orphan_source(tmp_path):
+    db = Database(str(tmp_path / "child-malformed-resume.db"))
+    telegram = Telegram(tmp_path)
+    bot = start_at_sources(db, telegram)
+    assert bot.process_update(callback(4, "manual:sources:add")) == "processed"
+    assert bot.process_update(message(5, "A source that cannot be orphaned.")) == "processed"
+    expected = db.get_state("telegram_session:42")
+    current = session(db)
+    malformed_resume = json.dumps({
+        "version": 1,
+        "token": current["token"],
+        "kind": "manual_post",
+        "step": "sources",
+        "payload": {
+            "text": "Exact English source intake copy.",
+            "category": "founder_journey",
+            "source_ids": ["not-an-id"],
+        },
+        "expires_at": current["expires_at"],
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    source_id, outcome = db.add_content_source_and_resume_manual_state_atomic(
+        state_key="telegram_session:42",
+        expected_state_value=expected,
+        resumed_state_value=malformed_resume,
+        child_token=current["payload"]["child"]["token"],
+        source_type="founder_note",
+        text="A source that cannot be orphaned.",
+        url=None,
+        metadata={"publishable": True},
+        trust_state="verified",
+        verified_by="floriano",
+    )
+
+    assert source_id is None
+    assert outcome == "rejected"
     assert db.get_state("telegram_session:42") == expected
     assert db.get_eligible_sources("founder_note") == []
     with db._conn() as conn:

@@ -57,6 +57,7 @@ _SOURCE_TYPES = {
     "evergreen_idea": "Evergreen idea",
     "verified_news": "Verified news",
 }
+_SOURCE_TRUST_LABELS = {"verified": "Verificata"}
 _MANUAL_CATEGORY_LABELS = {
     "gym_strategy": "Strategia palestra",
     "fitness_business_insight": "Business fitness",
@@ -968,8 +969,15 @@ class TelegramController:
                 )
             marker = "✓ " if source_id in selected else ""
             label = f"{marker}#{source_id} {source_type}"
-            if title:
-                label += f" — {title}"
+            trust_label = _SOURCE_TRUST_LABELS.get(source.get("trust_state"))
+            trust_suffix = f" · {trust_label}" if trust_label else ""
+            if trust_label:
+                title_budget = 64 - len(label) - len(trust_suffix) - 3
+                if title and title_budget > 0:
+                    label += " — " + title[:title_budget]
+                label += trust_suffix
+            elif title:
+                label += " — " + title
             rows.append([
                 self._callback_button(label[:64], f"manual:source:{source_id}")
             ])
@@ -1050,12 +1058,29 @@ class TelegramController:
             draft, dict,
         ):
             if outcome == "no_eligible_source":
+                retained_source_ids = []
+                for source_id in payload["source_ids"]:
+                    try:
+                        eligible = self.db.get_eligible_content_sources(
+                            [source_id], now=self._now(),
+                        )
+                    except Exception:
+                        eligible = []
+                    if (
+                        len(eligible) == 1
+                        and eligible[0].get("id") == source_id
+                        and eligible[0].get("source_type")
+                        in MANUAL_SOURCE_TYPES[payload["category"]]
+                    ):
+                        retained_source_ids.append(source_id)
+                resumed_payload = self._manual_parent_payload(payload)
+                resumed_payload["source_ids"] = retained_source_ids
                 if not self._replace_session(
                     chat_id,
                     raw,
                     "manual_post",
                     "sources",
-                    self._manual_parent_payload(payload),
+                    resumed_payload,
                 ):
                     self._send(chat_id, "Operazione già gestita.")
                     return "session_conflict"
