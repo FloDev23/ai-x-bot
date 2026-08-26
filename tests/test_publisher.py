@@ -162,6 +162,17 @@ def test_unapproved_draft_never_calls_x(publisher, fake_x, fake_db):
     assert fake_x.posts == []
 
 
+def test_operator_discarded_draft_never_calls_x(publisher, fake_x, fake_db):
+    """Catches the legacy publish path treating recoverable removal as approved."""
+    fake_db.draft["status"] = "discarded"
+
+    result = publisher.publish(fake_db.draft["id"], fake_db.slot)
+
+    assert result.status == "not_publishable"
+    assert fake_db.draft["status"] == "discarded"
+    assert fake_x.posts == []
+
+
 @pytest.mark.parametrize("expected_revision", [True, 0, -1, 2, "1"])
 def test_expected_revision_mismatch_fails_before_x(
     publisher,

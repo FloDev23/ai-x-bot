@@ -115,9 +115,17 @@ _PREVIEW_MEDIA_SNAPSHOT_COLUMNS = (
 _TELEGRAM_VIEW_STATE_MAX_BYTES = 8192
 _TELEGRAM_VIEW_TTL = timedelta(minutes=30)
 _TELEGRAM_VIEW_STATE_KEYS = frozenset({
-    "target_ids", "direction", "filters", "last_message_id",
+    "target_ids", "direction", "filters", "last_message_id", "cursor",
+    "previous_cursor", "next_cursor", "history",
 })
 _TELEGRAM_VIEW_DIRECTIONS = frozenset({"current", "next", "previous"})
+_OPERATOR_QUEUE_AUDIT_OUTCOMES = frozenset({
+    "operator_discarded", "operator_restored",
+})
+_OPERATOR_QUEUE_RESULTS = {
+    "discard": "discarded",
+    "restore": "restored",
+}
 
 
 @dataclass(frozen=True)
@@ -449,6 +457,20 @@ class Database:
                     expires_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+            """)
+
+            # Durable operator mutations are deliberately separate from update
+            # delivery: Telegram may replay a callback after a process crash.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS operator_operations (
+                    operation_key TEXT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    draft_id INTEGER NOT NULL,
+                    operator TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 )
             """)
 
@@ -2609,6 +2631,114 @@ class Database:
                 """, (limit,)).fetchall()
         return [self._decode_post_draft(row) for row in rows]
 
+    def list_post_index_page(
+        self,
+        *,
+        cursor: Optional[Dict],
+        limit: int = 8,
+        include_discarded: bool = False,
+    ) -> Tuple[List[Dict], Optional[Dict], Optional[Dict]]:
+        """Return one stable keyset page for the compact Telegram index."""
+        if (
+            type(limit) is not int or not 1 <= limit <= 8
+            or type(include_discarded) is not bool
+        ):
+            return [], None, None
+        cursor_rank = cursor_updated = cursor_id = None
+        if cursor is not None:
+            if not isinstance(cursor, dict):
+                return [], None, None
+            cursor_rank, cursor_updated, cursor_id = (
+                cursor.get("rank"), cursor.get("updated_at"), cursor.get("id"),
+            )
+            if (
+                type(cursor_rank) is not int or not 0 <= cursor_rank <= 9
+                or self._strict_aware_datetime(cursor_updated) is None
+                or not self._exact_positive_identifier(cursor_id)
+            ):
+                return [], None, None
+        # The fixed rank is intentionally duplicated in SELECT/WHERE: changing
+        # a draft after a page was opened cannot turn this into offset paging.
+        rank = """CASE
+            WHEN d.status = 'publication_unknown' THEN 0
+            WHEN d.status = 'pending_approval'
+              AND COALESCE(q.translation_status, 'pending') != 'ready' THEN 0
+            WHEN d.status = 'pending_approval' THEN 1
+            WHEN d.status IN ('approved', 'publishing') THEN 2
+            WHEN d.status = 'published' THEN 3
+            WHEN d.status = 'discarded' THEN 4
+            ELSE 5 END"""
+        clauses = ["d.status != 'discarded'" if not include_discarded else "1=1"]
+        values: List[Any] = []
+        if cursor is not None:
+            clauses.append(
+                f"({rank} > ? OR ({rank} = ? AND (d.updated_at < ? OR "
+                "(d.updated_at = ? AND d.id < ?))))"
+            )
+            values.extend([
+                cursor_rank, cursor_rank, cursor_updated, cursor_updated,
+                cursor_id,
+            ])
+        with self._conn() as conn:
+            rows = conn.execute(f"""
+                SELECT d.id, d.text, d.category, d.status, d.media_id, d.revision,
+                       d.updated_at, d.origin, q.translation_status,
+                       q.translation_policy, q.revision AS queue_revision, q.blocked_reason,
+                       p.scheduled_for, p.status AS plan_status, {rank} AS index_rank
+                FROM post_drafts d LEFT JOIN editorial_queue q ON q.draft_id = d.id
+                LEFT JOIN publication_plans p ON p.id = (
+                    SELECT p2.id FROM publication_plans p2
+                    WHERE p2.draft_id = d.id
+                      AND p2.status IN ('planned', 'publishing', 'unknown', 'simulated')
+                    ORDER BY p2.id DESC LIMIT 1
+                )
+                WHERE {' AND '.join(clauses)}
+                ORDER BY index_rank ASC, d.updated_at DESC, d.id DESC
+                LIMIT ?
+            """, values + [limit + 1]).fetchall()
+        page = [dict(row) for row in rows[:limit]]
+        next_cursor = None
+        if len(rows) > limit and page:
+            last = page[-1]
+            next_cursor = {
+                "rank": last["index_rank"], "updated_at": last["updated_at"],
+                "id": last["id"],
+            }
+        return page, next_cursor, dict(cursor) if cursor is not None else None
+
+    def get_post_index_rows(
+        self, target_ids: List[int], *, include_discarded: bool = False,
+    ) -> List[Dict]:
+        """Reload one persisted compact page without changing its keyset order."""
+        if (
+            type(target_ids) is not list or not 0 <= len(target_ids) <= 8
+            or len(target_ids) != len(set(target_ids))
+            or any(not self._exact_positive_identifier(value) for value in target_ids)
+            or type(include_discarded) is not bool
+        ):
+            return []
+        if not target_ids:
+            return []
+        placeholders = ", ".join("?" for _ in target_ids)
+        discarded = "1=1" if include_discarded else "d.status != 'discarded'"
+        with self._conn() as conn:
+            rows = conn.execute(f"""
+                SELECT d.id, d.text, d.category, d.status, d.media_id, d.revision,
+                       d.updated_at, d.origin, q.translation_status,
+                       q.translation_policy, q.revision AS queue_revision,
+                       q.blocked_reason, p.scheduled_for, p.status AS plan_status
+                FROM post_drafts d LEFT JOIN editorial_queue q ON q.draft_id = d.id
+                LEFT JOIN publication_plans p ON p.id = (
+                    SELECT p2.id FROM publication_plans p2
+                    WHERE p2.draft_id = d.id
+                      AND p2.status IN ('planned', 'publishing', 'unknown', 'simulated')
+                    ORDER BY p2.id DESC LIMIT 1
+                )
+                WHERE d.id IN ({placeholders}) AND {discarded}
+            """, target_ids).fetchall()
+        by_id = {row["id"]: dict(row) for row in rows}
+        return [by_id[draft_id] for draft_id in target_ids if draft_id in by_id]
+
     def get_active_draft_for_slot(self, intended_slot: str) -> Optional[Dict]:
         intended_slot = self._normalize_datetime_iso(intended_slot)
         with self._conn() as conn:
@@ -2841,6 +2971,288 @@ class Database:
         with self._conn() as conn:
             row = self._queue_draft_row_in_conn(conn, draft_id)
         return self._decode_queue_draft_row(row)
+
+    @staticmethod
+    def _valid_operator_operation(value: Any) -> bool:
+        return (
+            type(value) is str and 1 <= len(value) <= 128
+            and re.fullmatch(r"[A-Za-z0-9_-]+", value) is not None
+        )
+
+    def _operator_replay_in_conn(
+        self, conn, action: str, draft_id: int, operator: str, operation_key: str,
+        request: str,
+    ) -> Optional[Tuple[Optional[Dict], str]]:
+        existing = conn.execute(
+            "SELECT * FROM operator_operations WHERE operation_key = ?", (operation_key,),
+        ).fetchone()
+        if existing is None:
+            return None
+        if (
+            existing["action"] != action or existing["draft_id"] != draft_id
+            or existing["operator"] != operator or existing["request_json"] != request
+        ):
+            return None, "rejected"
+        try:
+            result = json.loads(existing["result_json"])
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+            return None, "rejected"
+        expected_outcome = _OPERATOR_QUEUE_RESULTS.get(action)
+        draft = result.get("draft") if type(result) is dict else None
+        if (
+            type(result) is not dict
+            or result.get("outcome") != expected_outcome
+            or type(draft) is not dict or draft.get("id") != draft_id
+        ):
+            return None, "rejected"
+        return dict(draft), "already_applied"
+
+    def _record_operator_operation_in_conn(
+        self, conn, action: str, draft_id: int, operator: str, operation_key: str,
+        request: str, outcome: str, draft: Dict,
+    ) -> None:
+        if _OPERATOR_QUEUE_RESULTS.get(action) != outcome:
+            raise ValueError("invalid_operator_operation_outcome")
+        conn.execute(
+            "INSERT INTO operator_operations "
+            "(operation_key, action, draft_id, operator, request_json, "
+            "result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (operation_key, action, draft_id, operator, request,
+             json.dumps({"draft": draft, "outcome": outcome}, sort_keys=True),
+             self._now_iso()),
+        )
+
+    def _insert_operator_queue_audit_in_conn(
+        self, conn, current: Mapping, outcome: str, operator: str, changed: str,
+    ) -> None:
+        if outcome not in _OPERATOR_QUEUE_AUDIT_OUTCOMES:
+            raise ValueError("invalid_operator_queue_audit")
+        self._insert_draft_evaluation_in_conn(
+            conn, current["intended_slot"], current["category"], outcome,
+            {"draft_id": current["id"], "operator": operator}, changed,
+        )
+
+    def discard_queued_draft_atomic(
+        self, draft_id: int, expected_draft_revision: int,
+        expected_queue_revision: int, operator: str, operation_key: str,
+    ) -> Tuple[Optional[Dict], str]:
+        """Remove only an approved or safely-future planned draft, atomically."""
+        if not (
+            self._exact_positive_identifier(draft_id)
+            and self._exact_nonnegative_revision(expected_draft_revision)
+            and self._exact_nonnegative_revision(expected_queue_revision)
+            and type(operator) is str and 1 <= len(operator.strip()) <= 64
+            and self._valid_operator_operation(operation_key)
+        ):
+            return None, "rejected"
+        operator = operator.strip()
+        request = json.dumps({"draft_revision": expected_draft_revision,
+                              "queue_revision": expected_queue_revision}, sort_keys=True)
+        try:
+            with self._post_draft_mutation_lock(draft_id) as conn:
+                replay = self._operator_replay_in_conn(
+                    conn, "discard", draft_id, operator, operation_key, request,
+                )
+                if replay is not None:
+                    return replay
+                current = self._queue_draft_row_in_conn(conn, draft_id)
+                if (
+                    current is None or current["revision"] != expected_draft_revision
+                    or current["queue_revision"] != expected_queue_revision
+                    or current["status"] != "approved"
+                ):
+                    return None, "rejected"
+                plans = conn.execute(
+                    "SELECT * FROM publication_plans WHERE draft_id = ? ORDER BY id", (draft_id,),
+                ).fetchall()
+                now = datetime.now(timezone.utc)
+                for plan in plans:
+                    scheduled = self._strict_aware_datetime(plan["scheduled_for"])
+                    if plan["status"] in {"publishing", "unknown", "simulated", "published"}:
+                        return None, "rejected"
+                    if plan["status"] == "planned" and (
+                        scheduled is None or scheduled <= now
+                        or plan["draft_revision"] != expected_draft_revision
+                    ):
+                        return None, "rejected"
+                changed = self._now_iso()
+                for plan in plans:
+                    if plan["status"] == "planned":
+                        cursor = conn.execute("""
+                            UPDATE publication_plans SET status = 'open', draft_id = NULL,
+                                draft_revision = NULL, claim_token = NULL, updated_at = ?,
+                                revision = revision + 1
+                            WHERE id = ? AND status = 'planned' AND revision = ?
+                        """, (changed, plan["id"], plan["revision"]))
+                        if cursor.rowcount != 1:
+                            raise sqlite3.IntegrityError("discard_plan_conflict")
+                if current["media_id"] is not None:
+                    cursor = conn.execute("""
+                        UPDATE media_library SET lifecycle_state = 'available',
+                            reserved_by_draft_id = NULL, revision = revision + 1
+                        WHERE id = ? AND lifecycle_state = 'reserved'
+                          AND reserved_by_draft_id = ? AND file_deleted = 0
+                    """, (current["media_id"], draft_id))
+                    if cursor.rowcount != 1:
+                        return None, "rejected"
+                cursor = conn.execute("""
+                    UPDATE post_drafts SET status = 'discarded', error = NULL,
+                        updated_at = ?, revision = revision + 1
+                    WHERE id = ? AND revision = ? AND status = 'approved'
+                """, (changed, draft_id, expected_draft_revision))
+                if cursor.rowcount != 1:
+                    return None, "rejected"
+                cursor = conn.execute("""
+                    UPDATE editorial_queue SET blocked_reason = 'operator_removed_from_queue',
+                        updated_at = ?, revision = revision + 1 WHERE draft_id = ? AND revision = ?
+                """, (changed, draft_id, expected_queue_revision))
+                if cursor.rowcount != 1:
+                    raise sqlite3.IntegrityError("discard_queue_conflict")
+                self._insert_operator_queue_audit_in_conn(
+                    conn, current, "operator_discarded", operator, changed,
+                )
+                result = self._decode_queue_draft_row(
+                    self._queue_draft_row_in_conn(conn, draft_id)
+                )
+                if result is None:
+                    raise ValueError("invalid_discard_result")
+                self._record_operator_operation_in_conn(
+                    conn, "discard", draft_id, operator, operation_key, request,
+                    "discarded", result,
+                )
+                return result, "discarded"
+        except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError):
+            return None, "rejected"
+
+    def restore_discarded_draft_atomic(
+        self, draft_id: int, expected_draft_revision: int,
+        expected_queue_revision: int, operator: str, operation_key: str,
+    ) -> Tuple[Optional[Dict], str]:
+        """Restore a discarded draft after rechecking sources and its media identity."""
+        if not (
+            self._exact_positive_identifier(draft_id)
+            and self._exact_nonnegative_revision(expected_draft_revision)
+            and self._exact_nonnegative_revision(expected_queue_revision)
+            and type(operator) is str and 1 <= len(operator.strip()) <= 64
+            and self._valid_operator_operation(operation_key)
+        ):
+            return None, "rejected"
+        operator = operator.strip()
+        request = json.dumps({"draft_revision": expected_draft_revision,
+                              "queue_revision": expected_queue_revision}, sort_keys=True)
+        try:
+            with self._post_draft_mutation_lock(draft_id) as conn:
+                replay = self._operator_replay_in_conn(
+                    conn, "restore", draft_id, operator, operation_key, request,
+                )
+                if replay is not None:
+                    return replay
+                current = self._queue_draft_row_in_conn(conn, draft_id)
+                if (
+                    current is None or current["revision"] != expected_draft_revision
+                    or current["queue_revision"] != expected_queue_revision
+                    or current["status"] != "discarded"
+                    or current["blocked_reason"] != "operator_removed_from_queue"
+                ):
+                    return None, "rejected"
+                source_ids = self._decode_queue_source_ids(
+                    current["source_ids_json"], current["origin"],
+                )
+                expected_policy = (
+                    "advisory"
+                    if current["origin"] == "manual_operator"
+                    else "required"
+                )
+                if source_ids is None:
+                    return None, "rejected"
+                if current["translation_policy"] != expected_policy:
+                    return None, "rejected"
+                eligible_sources = (
+                    self._eligible_content_sources_in_conn(conn, source_ids)
+                    if source_ids else []
+                )
+                if source_ids and len(eligible_sources) != len(source_ids):
+                    return None, "rejected"
+                if current["origin"] == "generated" and not source_ids:
+                    return None, "rejected"
+                for source in eligible_sources:
+                    if source.get("source_type") != "media_context":
+                        continue
+                    metadata = source.get("metadata")
+                    if (
+                        type(metadata) is not dict
+                        or metadata.get("media_id") != current["media_id"]
+                    ):
+                        return None, "rejected"
+                if current["media_id"] is not None:
+                    media = conn.execute(
+                        "SELECT * FROM media_library WHERE id = ?",
+                        (current["media_id"],),
+                    ).fetchone()
+                    if (
+                        media is None or media["lifecycle_state"] != "available"
+                        or media["file_deleted"] != 0 or media["reserved_by_draft_id"] is not None
+                        or not record_has_media_identity(dict(media))
+                    ):
+                        return None, "rejected"
+                    try:
+                        with open_verified_media(dict(media)):
+                            pass
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        return None, "rejected"
+                    reserved = conn.execute("""
+                        UPDATE media_library SET lifecycle_state = 'reserved',
+                            reserved_by_draft_id = ?,
+                            revision = revision + 1 WHERE id = ? AND lifecycle_state = 'available'
+                              AND file_deleted = 0 AND reserved_by_draft_id IS NULL
+                    """, (draft_id, current["media_id"]))
+                    if reserved.rowcount != 1:
+                        return None, "rejected"
+                changed = self._now_iso()
+                manual = current["origin"] == "manual_operator"
+                status = "approved" if manual else "pending_approval"
+                draft = conn.execute("""
+                    UPDATE post_drafts SET status = ?,
+                        approved_at = CASE WHEN ? = 'approved' THEN approved_at ELSE NULL END,
+                        approved_by = CASE WHEN ? = 'approved' THEN approved_by ELSE NULL END,
+                        updated_at = ?, revision = revision + 1
+                    WHERE id = ? AND status = 'discarded' AND revision = ?
+                """, (
+                    status, status, status, changed, draft_id,
+                    expected_draft_revision,
+                ))
+                if draft.rowcount != 1:
+                    raise sqlite3.IntegrityError("restore_draft_conflict")
+                queue = conn.execute("""
+                    UPDATE editorial_queue SET blocked_reason = NULL,
+                        translation_policy = ?, translation_it = ?, translation_status = ?,
+                        approved_queue_at = CASE
+                            WHEN ? = 'advisory' THEN approved_queue_at ELSE NULL END,
+                        updated_at = ?, revision = revision + 1 WHERE draft_id = ? AND revision = ?
+                """, (
+                    "advisory" if manual else "required",
+                    current["translation_it"] if manual else None,
+                    current["translation_status"] if manual else "invalidated",
+                    "advisory" if manual else "required", changed, draft_id,
+                    expected_queue_revision,
+                ))
+                if queue.rowcount != 1:
+                    raise sqlite3.IntegrityError("restore_queue_conflict")
+                self._insert_operator_queue_audit_in_conn(
+                    conn, current, "operator_restored", operator, changed,
+                )
+                result = self._decode_queue_draft_row(
+                    self._queue_draft_row_in_conn(conn, draft_id)
+                )
+                if result is None:
+                    raise ValueError("invalid_restore_result")
+                self._record_operator_operation_in_conn(
+                    conn, "restore", draft_id, operator, operation_key, request,
+                    "restored", result,
+                )
+                return result, "restored"
+        except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError):
+            return None, "rejected"
 
     def save_review_translation(
         self,
@@ -5456,11 +5868,50 @@ class Database:
             type(last_message_id) is not int or last_message_id <= 0
         ):
             raise ValueError("invalid_telegram_view_state")
+        def cursor_value(value):
+            if value is None:
+                return None
+            if not isinstance(value, dict) or set(value) != {"rank", "updated_at", "id"}:
+                raise ValueError("invalid_telegram_view_state")
+            if (
+                type(value["rank"]) is not int or not 0 <= value["rank"] <= 9
+                or Database._strict_aware_datetime(value["updated_at"]) is None
+                or type(value["id"]) is not int or value["id"] <= 0
+            ):
+                raise ValueError("invalid_telegram_view_state")
+            return dict(value)
+        cursor = cursor_value(state.get("cursor"))
+        previous_cursor = cursor_value(state.get("previous_cursor"))
+        next_cursor = cursor_value(state.get("next_cursor"))
+        history = state.get("history", [])
+        if (
+            type(history) is not list or len(history) > 36
+            or any(not isinstance(entry, dict) or set(entry) != {"cursor", "target_ids"}
+                   for entry in history)
+        ):
+            raise ValueError("invalid_telegram_view_state")
+        normalized_history = []
+        for entry in history:
+            history_cursor = cursor_value(entry["cursor"])
+            history_ids = entry["target_ids"]
+            if (
+                type(history_ids) is not list or not 0 <= len(history_ids) <= 8
+                or len(history_ids) != len(set(history_ids))
+                or any(type(value) is not int or value <= 0 for value in history_ids)
+            ):
+                raise ValueError("invalid_telegram_view_state")
+            normalized_history.append({
+                "cursor": history_cursor, "target_ids": list(history_ids),
+            })
         normalized = {
             "target_ids": list(target_ids),
             "direction": direction,
             "filters": dict(filters),
             "last_message_id": last_message_id,
+            "cursor": cursor,
+            "previous_cursor": previous_cursor,
+            "next_cursor": next_cursor,
+            "history": normalized_history,
         }
         encoded = json.dumps(normalized, separators=(",", ":"), allow_nan=False)
         if len(encoded.encode("utf-8")) > _TELEGRAM_VIEW_STATE_MAX_BYTES:

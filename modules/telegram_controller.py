@@ -22,6 +22,7 @@ from config import (
 )
 from modules.media_store import open_verified_media
 from modules.telegram_media_browser import MediaBrowser
+from modules.telegram_post_browser import PostBrowser
 from modules.content_planner import PORTFOLIO, SOURCE_TYPES as MANUAL_SOURCE_TYPES
 from modules.source_validation import is_complete_verified_news, is_safe_https_url
 from modules.telegram_api import (
@@ -136,6 +137,7 @@ class TelegramController:
             "/help": self._help,
         }
         self.media_browser = MediaBrowser(db, telegram_api)
+        self.post_browser = PostBrowser()
 
     @staticmethod
     def _supported_subtype(update: Dict[str, Any]):
@@ -192,6 +194,16 @@ class TelegramController:
         if not 0 < parsed <= _SQLITE_INTEGER_MAX:
             return None
         return parsed
+
+    @staticmethod
+    def _nonnegative_id(value: Any) -> Optional[int]:
+        if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+            return None
+        try:
+            parsed = int(value)
+        except (ValueError, OverflowError):
+            return None
+        return parsed if 0 <= parsed <= _SQLITE_INTEGER_MAX else None
 
     def _now(self) -> datetime:
         value = self.now_fn()
@@ -606,79 +618,131 @@ class TelegramController:
         return True
 
     def _posts(self, chat_id: str):
-        pending = self.db.list_post_drafts(["pending_approval"], limit=50)
-        approved = self.db.list_post_drafts(["approved"], limit=50)
-        scheduled = self.db.list_post_drafts(["publishing"], limit=50)
-        published = self.db.list_post_drafts(["published"], limit=5)
-        try:
-            local_date = self._now().astimezone(ZoneInfo("Europe/Rome")).date()
-            counts = self.db.get_queue_counts(local_date, "Europe/Rome")
-        except Exception:
-            counts = None
-        if isinstance(counts, dict):
-            summary = (
-                "Post\n"
-                f"traduzione in attesa: {counts.get('awaiting_translation', 0)}\n"
-                f"revisione in attesa: {counts.get('awaiting_review', 0)}\n"
-                f"approvati disponibili: {counts.get('approved_available', 0)}\n"
-                f"pianificati oggi: {counts.get('planned_today', 0)}\n"
-                f"bloccati: {counts.get('blocked', 0)}\n"
-                f"pubblicati recenti: {len(published)}"
+        rows, next_cursor, _previous = self.db.list_post_index_page(cursor=None)
+        token = self.db.create_telegram_view(
+            chat_id, self.post_browser.view_kind,
+            {"target_ids": [row["id"] for row in rows], "direction": "current",
+             "filters": {"discarded": 0}, "last_message_id": None,
+             "cursor": None, "previous_cursor": None,
+             "next_cursor": next_cursor, "history": []},
+        )
+        discarded_rows, discarded_next, _previous = self.db.list_post_index_page(
+            cursor=None, include_discarded=True,
+        )
+        discarded_token = self.db.create_telegram_view(
+            chat_id, self.post_browser.view_kind,
+            {"target_ids": [row["id"] for row in discarded_rows],
+             "direction": "current", "filters": {"discarded": 1},
+             "last_message_id": None, "cursor": None, "previous_cursor": None,
+             "next_cursor": discarded_next, "history": []},
+        )
+        markup = self.post_browser.render_index(
+            rows, token=token, has_next=next_cursor is not None, has_previous=False,
+            discarded_token=discarded_token,
+        )["reply_markup"]
+        self._send(
+            chat_id,
+            self.post_browser.summary(rows, include_discarded=False),
+            reply_markup=markup,
+        )
+        return "posts"
+
+    def _render_post_browser(self, chat_id: str, token: str, action: str) -> bool:
+        view = self.db.get_telegram_view(token, chat_id, self.post_browser.view_kind)
+        if view is None:
+            return False
+        state = dict(view["state"])
+        include_discarded = state["filters"].get("discarded") == 1
+        cursor = state.get("cursor")
+        next_cursor = state.get("next_cursor")
+        history = list(state.get("history") or [])
+        if action == "next":
+            if next_cursor is None:
+                return False
+            history.append({
+                "cursor": cursor, "target_ids": list(state["target_ids"]),
+            })
+            page_cursor = next_cursor
+            rows, new_next, _back = self.db.list_post_index_page(
+                cursor=page_cursor, include_discarded=include_discarded,
+            )
+        elif action == "prev":
+            if not history:
+                return False
+            prior = history.pop()
+            new_next = cursor
+            page_cursor = prior["cursor"]
+            rows = self.db.get_post_index_rows(
+                prior["target_ids"], include_discarded=include_discarded,
+            )
+        elif action == "refresh":
+            page_cursor = cursor
+            new_next = next_cursor
+            rows = self.db.get_post_index_rows(
+                state["target_ids"], include_discarded=include_discarded,
             )
         else:
-            summary = (
-                "Post\n"
-                f"in attesa: {len(pending)}\n"
-                f"approvati: {len(approved)}\n"
-                f"programmati: {len(scheduled)}\n"
-                f"pubblicati recenti: {len(published)}"
-            )
-        self._send(chat_id, summary)
-        details = []
-        seen = set()
-        try:
-            active_plans = self.db.list_publication_positions(
-                statuses=["planned", "publishing", "unknown"]
-            )
-        except Exception:
-            active_plans = []
-        plans_by_draft = {
-            plan.get("draft_id"): plan
-            for plan in active_plans
-            if type(plan.get("draft_id")) is int
-        }
-        try:
-            queue_positions = {
-                draft.get("id"): index
-                for index, draft in enumerate(
-                    self.db.list_approved_queue(self._now()), start=1,
-                )
+            return False
+        state.update(
+            target_ids=[row["id"] for row in rows], cursor=page_cursor,
+            previous_cursor=history[-1]["cursor"] if history else None,
+            next_cursor=new_next, history=history,
+            filters={"discarded": int(include_discarded)},
+        )
+        if not self.db.update_telegram_view(
+            token, chat_id, self.post_browser.view_kind, view["revision"], state,
+        ):
+            return False
+        markup = self.post_browser.render_index(
+            rows, token=token, has_next=new_next is not None,
+            has_previous=bool(history), include_discarded=include_discarded,
+        )["reply_markup"]
+        self._send(
+            chat_id,
+            self.post_browser.summary(
+                rows, include_discarded=include_discarded,
+            ),
+            reply_markup=markup,
+        )
+        return True
+
+    def _post_detail(self, chat_id: str, token: str, draft_id: int, revision: int) -> str:
+        view = self.db.get_telegram_view(token, chat_id, self.post_browser.view_kind)
+        if view is None or draft_id not in view["state"]["target_ids"]:
+            self._send(chat_id, "Post non valido o scaduto. Aggiorna l'elenco.")
+            return "post_unavailable"
+        draft = self.db.get_queue_draft(draft_id) or self.db.get_post_draft(draft_id)
+        if draft is None or draft.get("revision") != revision:
+            self._send(chat_id, "Post aggiornato: apri di nuovo l'elenco.")
+            return "post_unavailable"
+        index_rows = self.db.get_post_index_rows([draft_id], include_discarded=True)
+        if index_rows:
+            draft = {
+                **draft,
+                "scheduled_for": index_rows[0].get("scheduled_for"),
+                "plan_status": index_rows[0].get("plan_status"),
             }
-        except Exception:
-            queue_positions = {}
-        for draft in pending + approved + scheduled + published:
-            draft_id = draft.get("id") if isinstance(draft, dict) else None
-            if type(draft_id) is not int or draft_id in seen:
-                continue
-            seen.add(draft_id)
-            display = self.db.get_queue_draft(draft_id) or draft
-            plan = plans_by_draft.get(draft_id)
-            if isinstance(plan, dict):
-                display = {
-                    **display,
-                    "scheduled_for": plan.get("scheduled_for"),
-                }
-            elif draft_id in queue_positions:
-                display = {
-                    **display,
-                    "queue_position": queue_positions[draft_id],
-                }
-            details.append(display)
-            if len(details) >= 50:
-                break
-        for draft in details:
-            self._send_draft_card(chat_id, draft)
-        return "posts"
+        self._send_draft_preview(chat_id, draft)
+        self._send_complete_section(chat_id, "Tweet da pubblicare", draft.get("text") or "")
+        if isinstance(draft.get("translation_it"), str):
+            self._send_complete_section(
+                chat_id,
+                "Traduzione italiana — solo per revisione",
+                draft["translation_it"],
+            )
+        status = draft.get("status")
+        rows = []
+        if status == "approved":
+            rows.append([self._callback_button(
+                "Rimuovi dalla coda", f"postrm:{token}:{draft_id}:{revision}",
+            )])
+        elif status == "discarded":
+            rows.append([self._callback_button(
+                "Ripristina", f"postrs:{token}:{draft_id}:{revision}",
+            )])
+        rows.append([self._callback_button("Torna all'elenco", f"posts:{token}:refresh")])
+        self._send(chat_id, self._draft_card_text(draft), reply_markup=self._callback_markup(rows))
+        return "post_detail"
 
     @staticmethod
     def _candidate_url(candidate: Dict[str, Any]) -> Optional[str]:
@@ -1730,6 +1794,21 @@ class TelegramController:
 
     def _handle_callback(self, chat_id: str, data: str):
         parts = data.split(":")
+        if parts[0] == "posts" and len(parts) == 3:
+            rendered = self._render_post_browser(chat_id, parts[1], parts[2])
+            if not rendered:
+                self._send(chat_id, "Elenco non valido o scaduto. Usa /posts.")
+            return "posts_browser" if rendered else "post_unavailable"
+        if parts[0] == "post" and len(parts) == 4:
+            draft_id, revision = self._positive_id(parts[2]), self._nonnegative_id(parts[3])
+            if draft_id is not None and revision is not None:
+                return self._post_detail(chat_id, parts[1], draft_id, revision)
+        if parts[0] in {"postrm", "postrs"} and len(parts) == 4:
+            draft_id, revision = self._positive_id(parts[2]), self._nonnegative_id(parts[3])
+            if draft_id is not None and revision is not None:
+                return self._post_queue_action(chat_id, parts[0], parts[1], draft_id, revision)
+        if parts[0] == "postok" and len(parts) == 2:
+            return self._confirm_post_removal(chat_id, parts[1])
         if parts[0] == "mb":
             return self._media_browser_callback(chat_id, parts)
         if parts[0] == "draft" and len(parts) == 3:
@@ -1744,6 +1823,86 @@ class TelegramController:
             return self._manual_callback(chat_id, parts)
         self._send(chat_id, "Azione non valida.")
         return "invalid_callback"
+
+    def _post_queue_action(
+        self, chat_id: str, action: str, parent: str,
+        draft_id: int, revision: int,
+    ) -> str:
+        view = self.db.get_telegram_view(parent, chat_id, self.post_browser.view_kind)
+        draft = self.db.get_queue_draft(draft_id)
+        if (
+            view is None or draft_id not in view["state"]["target_ids"]
+            or draft is None or draft.get("revision") != revision
+        ):
+            self._send(chat_id, "Azione non valida o scaduta. Aggiorna l'elenco.")
+            return "post_unavailable"
+        if action == "postrs":
+            restored, outcome = self.db.restore_discarded_draft_atomic(
+                draft_id, revision, draft["queue_revision"], "floriano",
+                f"restore_{parent}_{draft_id}",
+            )
+            if outcome not in {"restored", "already_applied"} or restored is None:
+                self._send(chat_id, "Ripristino non disponibile. Aggiorna l'elenco.")
+                return "post_restore_rejected"
+            self._send(chat_id, "Post ripristinato.")
+            return self._post_detail(chat_id, parent, draft_id, restored["revision"])
+        if draft.get("status") != "approved":
+            self._send(chat_id, "Rimozione non disponibile. Aggiorna l'elenco.")
+            return "post_remove_rejected"
+        try:
+            confirmation = self.db.create_telegram_view(
+                chat_id, "post_remove_confirm",
+                {"target_ids": [draft_id], "direction": "current", "last_message_id": None,
+                 "cursor": None, "previous_cursor": None,
+                 "filters": {
+                     "revision": revision,
+                     "queue_revision": draft["queue_revision"],
+                     "parent": parent,
+                 }},
+            )
+            excerpt = self.post_browser.excerpt(draft.get("text"))
+            self._send(
+                chat_id,
+                f"Rimuovere dalla coda?\n{excerpt}",
+                reply_markup=self._callback_markup([[
+                    self._callback_button(
+                        "Conferma rimozione", f"postok:{confirmation}",
+                    ),
+                    self._callback_button(
+                        "Annulla", f"post:{parent}:{draft_id}:{revision}",
+                    ),
+                ]]),
+            )
+            return "post_remove_confirmation"
+        except Exception:
+            self._send(chat_id, "Rimozione non disponibile.")
+            return "post_remove_rejected"
+
+    def _confirm_post_removal(self, chat_id: str, token: str) -> str:
+        confirm = self.db.get_telegram_view(token, chat_id, "post_remove_confirm")
+        if confirm is None:
+            self._send(chat_id, "Conferma non valida o scaduta.")
+            return "post_remove_rejected"
+        draft_id = confirm["state"]["target_ids"][0]
+        filters = confirm["state"]["filters"]
+        parent = filters.get("parent")
+        parent_view = (
+            self.db.get_telegram_view(
+                parent, chat_id, self.post_browser.view_kind,
+            )
+            if isinstance(parent, str) else None
+        )
+        if parent_view is None or draft_id not in parent_view["state"]["target_ids"]:
+            self._send(chat_id, "Conferma non valida o scaduta.")
+            return "post_remove_rejected"
+        changed, outcome = self.db.discard_queued_draft_atomic(
+            draft_id, filters.get("revision"), filters.get("queue_revision"), "floriano", token,
+        )
+        if outcome not in {"discarded", "already_applied"} or changed is None:
+            self._send(chat_id, "Rimozione non disponibile. Aggiorna l'elenco.")
+            return "post_remove_rejected"
+        self._send(chat_id, "Post rimosso dalla coda.")
+        return self._post_detail(chat_id, parent, draft_id, changed["revision"])
 
     def _media_browser_callback(self, chat_id: str, parts):
         if len(parts) == 3 and parts[1] in {"p", "n"}:

@@ -259,6 +259,29 @@ def callback_update(update_id, data, chat_id=42):
     }
 
 
+def open_first_post_detail(controller, telegram, update_id):
+    """Select the first compact `/posts` row through its bound callback."""
+    for row in telegram.messages[-1][2]["reply_markup"]["inline_keyboard"]:
+        for button in row:
+            if button["callback_data"].startswith("post:"):
+                assert controller.process_update(
+                    callback_update(update_id, button["callback_data"])
+                ) == "processed"
+                return button["callback_data"]
+    raise AssertionError("compact post row missing")
+
+
+def post_detail_callback(message, excerpt=None):
+    """Return one detail callback from a compact index message."""
+    for row in message[2]["reply_markup"]["inline_keyboard"]:
+        for button in row:
+            if button["callback_data"].startswith("post:") and (
+                excerpt is None or excerpt in button["text"]
+            ):
+                return button["callback_data"]
+    raise AssertionError("matching compact post row missing")
+
+
 def workflow_controller(
     db,
     telegram,
@@ -1093,6 +1116,11 @@ def test_posts_renders_complete_safe_draft_card_and_latest_published(tmp_path):
     controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
 
     assert controller.process_update(message_update(30, "/posts")) == "processed"
+    index_message = telegram.messages[-1]
+    pending_callback = post_detail_callback(index_message, "Complete")
+    published_callback = post_detail_callback(index_message, "Already published")
+    assert controller.process_update(callback_update(3000, pending_callback)) == "processed"
+    assert controller.process_update(callback_update(3001, published_callback)) == "processed"
 
     rendered = "\n".join(item[1] for item in telegram.messages)
     assert "Complete <draft> & copy" in rendered
@@ -1104,7 +1132,7 @@ def test_posts_renders_complete_safe_draft_card_and_latest_published(tmp_path):
     assert "studio.jpg" in rendered
     card_kwargs = next(
         item[2] for item in telegram.messages
-        if item[2].get("reply_markup") is not None
+        if item[1].startswith("Bozza #") and item[2].get("reply_markup") is not None
     )
     assert card_kwargs["parse_mode"] is None
     callback_data = [
@@ -1112,15 +1140,230 @@ def test_posts_renders_complete_safe_draft_card_and_latest_published(tmp_path):
         for row in card_kwargs["reply_markup"]["inline_keyboard"]
         for button in row
     ]
-    assert set(callback_data) == {
-        f"draft:approve:{draft_id}",
-        f"draft:regen:{draft_id}",
-        f"draft:edit:{draft_id}",
-        f"draft:media:{draft_id}",
-        f"draft:textonly:{draft_id}",
-        f"draft:postpone:{draft_id}",
-        f"draft:discard:{draft_id}",
-    }
+    assert any(
+        value.startswith("posts:") and value.endswith(":refresh")
+        for value in callback_data
+    )
+
+
+def _post_row_ids(message):
+    ids = []
+    for callback in _callback_values(message):
+        parts = callback.split(":")
+        if len(parts) == 4 and parts[0] == "post" and parts[2].isdigit():
+            ids.append(int(parts[2]))
+    return sorted(ids)
+
+
+def _button_callback(message, label):
+    markup = message[2].get("reply_markup") or {"inline_keyboard": []}
+    for row in markup["inline_keyboard"]:
+        for button in row:
+            if button.get("text") == label:
+                return button["callback_data"]
+    raise AssertionError(f"button missing: {label}")
+
+
+def test_posts_compact_index_defers_full_copy_and_fails_closed_tokens(tmp_path):
+    """Catches `/posts` sending cards/media eagerly or accepting unbound detail state."""
+    db = Database(str(tmp_path / "compact-index.db"))
+    source_id = db.add_content_source("founder_note", "Verified index source")
+    full_text = "Exact <English> copy " + "x" * 180
+    for number in range(12):
+        draft_id = db.create_post_draft(
+            full_text if number == 11 else f"Compact draft {number} " + "y" * 120,
+            "founder_story", [source_id], {"total": 88},
+            (
+                datetime(2031, 1, 1, 12, tzinfo=timezone.utc)
+                + timedelta(minutes=number)
+            ).isoformat(),
+            f"compact-index-{number}",
+        )
+        db.ensure_editorial_queue(draft_id)
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+
+    assert controller.process_update(message_update(330, "/posts")) == "processed"
+
+    assert len(telegram.messages) == 1
+    assert telegram.media_messages == []
+    assert full_text not in telegram.messages[0][1]
+    assert 1 <= len(_post_row_ids(telegram.messages[0])) <= 8
+    detail = post_detail_callback(telegram.messages[0], "Exact English")
+    assert len(detail.encode("utf-8")) <= 64
+
+    before_wrong_chat = len(telegram.messages)
+    assert controller.process_update(callback_update(3301, detail, chat_id=777)) == "unauthorized"
+    assert len(telegram.messages) == before_wrong_chat
+    stale_id = int(detail.split(":")[2])
+    with db._conn() as conn:
+        conn.execute(
+            "UPDATE post_drafts SET revision = revision + 1 WHERE id = ?", (stale_id,),
+        )
+    assert controller.process_update(callback_update(3304, detail)) == "processed"
+    assert "Post aggiornato" in telegram.messages[-1][1]
+    with db._conn() as conn:
+        token = detail.split(":")[1]
+        conn.execute(
+            "UPDATE telegram_views SET expires_at = ? WHERE token = ?",
+            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), token),
+        )
+    assert controller.process_update(callback_update(3302, detail)) == "processed"
+    assert "non valido o scaduto" in telegram.messages[-1][1]
+    assert controller.process_update(
+        callback_update(3303, "post:hostile:-1:0")
+    ) == "processed"
+    assert "Azione non valida" in telegram.messages[-1][1]
+
+
+def test_posts_keyset_next_previous_refresh_and_detail_back_keep_same_page(tmp_path):
+    """Catches navigation falling back to offsets or losing its persisted page."""
+    db = Database(str(tmp_path / "keyset-navigation.db"))
+    source_id = db.add_content_source("founder_note", "Verified navigation source")
+    for number in range(20):
+        draft_id = db.create_post_draft(
+            f"Navigation draft {number} " + "z" * 90,
+            "founder_story", [source_id], {"total": 88},
+            (
+                datetime(2032, 1, 1, 12, tzinfo=timezone.utc)
+                + timedelta(minutes=number)
+            ).isoformat(),
+            f"navigation-{number}",
+        )
+        db.ensure_editorial_queue(draft_id)
+        with db._conn() as conn:
+            conn.execute(
+                "UPDATE post_drafts SET updated_at = ? WHERE id = ?",
+                (
+                    (
+                        datetime(2026, 1, 1, tzinfo=timezone.utc)
+                        + timedelta(minutes=number)
+                    ).isoformat(),
+                    draft_id,
+                ),
+            )
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+    assert controller.process_update(message_update(340, "/posts")) == "processed"
+    first_ids = _post_row_ids(telegram.messages[-1])
+
+    assert controller.process_update(callback_update(
+        3401, _button_callback(telegram.messages[-1], "Successivo"),
+    )) == "processed"
+    second_message = telegram.messages[-1]
+    second_ids = _post_row_ids(second_message)
+    assert second_ids and not set(first_ids) & set(second_ids)
+
+    newest = db.create_post_draft(
+        "Inserted after view creation", "founder_story", [source_id], {"total": 88},
+        "2033-01-01T12:00:00+00:00", "navigation-newest",
+    )
+    db.ensure_editorial_queue(newest)
+    assert controller.process_update(callback_update(
+        3402, _button_callback(second_message, "Precedente"),
+    )) == "processed"
+    assert _post_row_ids(telegram.messages[-1]) == first_ids
+
+    assert controller.process_update(callback_update(
+        3403, _button_callback(telegram.messages[-1], "Successivo"),
+    )) == "processed"
+    assert _post_row_ids(telegram.messages[-1]) == second_ids
+    detail = post_detail_callback(telegram.messages[-1])
+    assert controller.process_update(callback_update(3404, detail)) == "processed"
+    back = _button_callback(telegram.messages[-1], "Torna all'elenco")
+    assert controller.process_update(callback_update(3405, back)) == "processed"
+    assert _post_row_ids(telegram.messages[-1]) == second_ids
+
+
+def test_posts_discard_filter_uses_an_opaque_refresh_view(tmp_path):
+    """Catches the explicit discarded filter inventing a fourth navigation action."""
+    db = Database(str(tmp_path / "discarded-filter.db"))
+    _source, draft_id = add_pending_draft(db, text="Removed from queue")
+    db.ensure_editorial_queue(draft_id)
+    with db._conn() as conn:
+        conn.execute("UPDATE post_drafts SET status = 'discarded' WHERE id = ?", (draft_id,))
+        conn.execute(
+            "UPDATE editorial_queue SET blocked_reason = 'operator_removed_from_queue' "
+            "WHERE draft_id = ?", (draft_id,),
+        )
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+    assert controller.process_update(message_update(350, "/posts")) == "processed"
+
+    show_removed = _button_callback(telegram.messages[-1], "Mostra rimossi")
+    assert show_removed.startswith("posts:")
+    assert show_removed.endswith(":refresh")
+    assert controller.process_update(callback_update(3501, show_removed)) == "processed"
+    assert draft_id in _post_row_ids(telegram.messages[-1])
+
+
+def test_posts_confirmed_remove_and_restore_refresh_exact_revision(tmp_path):
+    """Catches Telegram queue actions bypassing confirmation/CAS or losing restore."""
+    db = Database(str(tmp_path / "post-actions.db"))
+    _source, draft_id = add_pending_draft(db, text="Manual approved queue copy")
+    db.ensure_editorial_queue(draft_id)
+    with db._conn() as conn:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE post_drafts SET status = 'approved', origin = 'manual_operator', "
+            "approved_at = ?, approved_by = 'floriano' WHERE id = ?", (now, draft_id),
+        )
+        conn.execute(
+            "UPDATE editorial_queue SET translation_policy = 'advisory', "
+            "approved_queue_at = ? WHERE draft_id = ?", (now, draft_id),
+        )
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+    assert controller.process_update(message_update(360, "/posts")) == "processed"
+    assert controller.process_update(callback_update(
+        3601, post_detail_callback(telegram.messages[-1]),
+    )) == "processed"
+
+    remove = _button_callback(telegram.messages[-1], "Rimuovi dalla coda")
+    assert controller.process_update(callback_update(3602, remove)) == "processed"
+    assert db.get_queue_draft(draft_id)["status"] == "approved"
+    confirm = _button_callback(telegram.messages[-1], "Conferma rimozione")
+    assert controller.process_update(callback_update(3603, confirm)) == "processed"
+    assert db.get_queue_draft(draft_id)["status"] == "discarded"
+    restore = _button_callback(telegram.messages[-1], "Ripristina")
+    assert controller.process_update(callback_update(3604, restore)) == "processed"
+    restored = db.get_queue_draft(draft_id)
+    assert restored["status"] == "approved"
+    assert restored["translation_policy"] == "advisory"
+
+
+def test_posts_planned_detail_keeps_et_and_rome_schedule(tmp_path):
+    """Catches detail reload dropping the plan joined by the compact index."""
+    db = Database(str(tmp_path / "planned-detail.db"))
+    _source, draft_id = add_pending_draft(db, text="Future planned queue copy")
+    db.ensure_editorial_queue(draft_id)
+    with db._conn() as conn:
+        conn.execute("UPDATE post_drafts SET status = 'approved' WHERE id = ?", (draft_id,))
+        future = datetime(2030, 8, 15, 14, tzinfo=timezone.utc)
+        conn.execute(
+            "INSERT INTO publication_plans "
+            "(local_date, position, scheduled_for, draft_id, draft_revision, status, "
+            "selection_reason_json, created_at, updated_at) "
+            "VALUES (?, 1, ?, ?, 0, 'planned', ?, ?, ?)",
+            (future.date().isoformat(), future.isoformat(), draft_id,
+             '{"timing_bucket":"morning:9","timing_reason":"cold_start"}',
+             future.isoformat(), future.isoformat()),
+        )
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+    assert controller.process_update(message_update(370, "/posts")) == "processed"
+    compact_label = telegram.messages[-1][2]["reply_markup"][
+        "inline_keyboard"
+    ][0][0]["text"]
+    assert "Pianificato" in compact_label
+    assert controller.process_update(callback_update(
+        3701, post_detail_callback(telegram.messages[-1]),
+    )) == "processed"
+
+    detail = "\n".join(message[1] for message in telegram.messages)
+    assert "EDT" in detail
+    assert "CEST" in detail
+    assert "non ancora pianificato" not in detail
 
 
 def _callback_values(message):
@@ -1570,6 +1813,8 @@ def test_posts_sends_verified_media_stream_before_separate_full_draft_card(tmp_p
     controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
 
     assert controller.process_update(message_update(301, "/posts")) == "processed"
+    assert telegram.media_messages == []
+    open_first_post_detail(controller, telegram, 3001)
 
     assert telegram.media_messages == [(
         "42",
@@ -1627,6 +1872,7 @@ def test_posts_dispatches_verified_video_and_document_previews(tmp_path):
         assert controller.process_update(
             message_update(update_id, "/posts")
         ) == "processed"
+        open_first_post_detail(controller, telegram, update_id + 3000)
 
         assert len(telegram.media_messages) == 1
         assert telegram.media_messages[0][1:3] == (content, telegram_type)
@@ -1648,6 +1894,7 @@ def test_posts_media_type_mime_mismatch_fails_closed(tmp_path):
     controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
 
     assert controller.process_update(message_update(308, "/posts")) == "processed"
+    open_first_post_detail(controller, telegram, 3308)
 
     assert telegram.media_messages == []
     assert any(
@@ -1679,6 +1926,7 @@ def test_published_preview_requires_exact_tweet_media_binding(tmp_path):
     controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
 
     assert controller.process_update(message_update(309, "/posts")) == "processed"
+    open_first_post_detail(controller, telegram, 3309)
 
     assert telegram.media_messages == []
     assert any(
@@ -1711,6 +1959,7 @@ def test_preview_revalidates_draft_media_binding_under_open_media_lease(tmp_path
     controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
 
     assert controller.process_update(message_update(310, "/posts")) == "processed"
+    open_first_post_detail(controller, telegram, 3310)
 
     assert telegram.media_messages == []
     assert Database(path).get_post_draft(draft_id)["media_id"] is None
@@ -1751,6 +2000,8 @@ def test_preview_send_linearizes_before_same_draft_transition_and_frees_sqlite(
     attach_verified_preview(db, tmp_path, draft_id)
     telegram = BlockingPreviewTelegramApi(tmp_path)
     controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+    assert controller.process_update(message_update(311, "/posts")) == "processed"
+    detail_callback = post_detail_callback(telegram.messages[-1])
     controller_result = []
     transition_result = []
     transition_started = threading.Event()
@@ -1772,7 +2023,7 @@ def test_preview_send_linearizes_before_same_draft_transition_and_frees_sqlite(
 
     def render_posts():
         controller_result.append(
-            controller.process_update(message_update(311, "/posts"))
+            controller.process_update(callback_update(3110, detail_callback))
         )
 
     def discard_draft():
@@ -2001,6 +2252,8 @@ def test_transition_that_wins_root_first_invalidates_preview_without_deadlock(
     record = attach_verified_preview(db, tmp_path, draft_id)
     telegram = WorkflowTelegramApi(tmp_path)
     controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+    assert controller.process_update(message_update(312, "/posts")) == "processed"
+    detail_callback = post_detail_callback(telegram.messages[-1])
     mutation_has_root = threading.Event()
     preview_attempted_root = threading.Event()
     allow_mutation_db = threading.Event()
@@ -2043,7 +2296,7 @@ def test_transition_that_wins_root_first_invalidates_preview_without_deadlock(
     def render_posts():
         controller_thread_id.append(threading.get_ident())
         controller_result.append(
-            controller.process_update(message_update(312, "/posts"))
+            controller.process_update(callback_update(3120, detail_callback))
         )
 
     mutation_thread = threading.Thread(target=mutate)
@@ -2326,6 +2579,7 @@ def test_posts_tampered_media_fails_closed_and_keeps_safe_full_card(tmp_path):
     controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
 
     assert controller.process_update(message_update(302, "/posts")) == "processed"
+    open_first_post_detail(controller, telegram, 3302)
 
     assert telegram.media_messages == []
     rendered = "\n".join(message[1] for message in telegram.messages)
@@ -2356,6 +2610,7 @@ def test_posts_missing_or_stale_media_fails_closed_without_raw_path(tmp_path):
         assert controller.process_update(
             message_update(update_id, "/posts")
         ) == "processed"
+        open_first_post_detail(controller, telegram, update_id + 3300)
 
         assert telegram.media_messages == []
         rendered = "\n".join(message[1] for message in telegram.messages)
@@ -2389,6 +2644,7 @@ def test_draft_card_preserves_complete_text_when_metadata_exceeds_message_limit(
     controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
 
     assert controller.process_update(message_update(31, "/posts")) == "processed"
+    open_first_post_detail(controller, telegram, 3031)
 
     rendered = "\n".join(message[1] for message in telegram.messages)
     assert complete_text in rendered

@@ -1255,6 +1255,52 @@ def test_two_publishers_claim_one_plan_and_call_x_once(tmp_path):
     assert Database(path).get_post_draft(draft_id)["status"] == "published"
 
 
+def test_due_plan_discard_race_never_reopens_slot_or_duplicates_x(tmp_path):
+    """Catches operator removal racing a due publisher-owned plan."""
+    setup, draft_id, plan = _planned_publication_fixture(tmp_path)
+    path = setup.db_path
+    queued = setup.get_queue_draft(draft_id)
+    due = datetime.fromisoformat(plan["scheduled_for"])
+    barrier = threading.Barrier(2)
+    x_client = _PlanXClient(tweet_id="456789")
+    results = {}
+    errors = []
+
+    def publish():
+        try:
+            barrier.wait(timeout=5)
+            results["publish"] = Publisher(
+                Database(path), x_client, dry_run=False, plan_grace_minutes=90,
+            ).publish_plan(plan["id"], now=due)
+        except BaseException as error:
+            errors.append(error)
+
+    def discard():
+        try:
+            barrier.wait(timeout=5)
+            results["discard"] = Database(path).discard_queued_draft_atomic(
+                draft_id, queued["revision"], queued["queue_revision"],
+                "floriano", "due-plan-race",
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    workers = [threading.Thread(target=publish), threading.Thread(target=discard)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert errors == []
+    assert not any(worker.is_alive() for worker in workers)
+    assert results["discard"] == (None, "rejected")
+    assert results["publish"].status == "published"
+    assert len(x_client.calls) == 1
+    stored_plan = Database(path).get_publication_plan(plan["id"])
+    assert stored_plan["status"] == "published"
+    assert stored_plan["position"] == plan["position"]
+
+
 def test_publish_plan_uses_verified_media_stream_and_consumes_reservation(tmp_path):
     db = Database(str(tmp_path / "plan-media.db"))
     media_root = tmp_path / "plan-media-root"
