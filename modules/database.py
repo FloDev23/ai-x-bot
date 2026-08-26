@@ -417,6 +417,15 @@ class Database:
             """)
 
             c.execute("""
+                CREATE TABLE IF NOT EXISTS telegram_child_operations (
+                    token TEXT PRIMARY KEY,
+                    request_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+
+            c.execute("""
                 CREATE TABLE IF NOT EXISTS post_drafts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     publication_key TEXT NOT NULL UNIQUE,
@@ -1108,6 +1117,162 @@ class Database:
                 trust_state=trust_state,
                 verified_by=verified_by,
                 verified_at=verified_at,
+            )
+            return source_id, "created"
+
+    def add_content_source_and_resume_manual_state_atomic(
+        self,
+        *,
+        state_key: str,
+        expected_state_value: str,
+        resumed_state_value: str,
+        child_token: str,
+        source_type: str,
+        text: str,
+        url: Optional[str],
+        metadata: Dict,
+        trust_state: str,
+        verified_by: str,
+    ) -> Tuple[Optional[int], str]:
+        """Save one nested manual source and restore its exact parent session.
+
+        The child token is an operation idempotency key.  A replay of the same
+        child returns its original source id; a changed replay fails closed.
+        """
+        try:
+            request = json.dumps({
+                "state_key": state_key,
+                "expected_state_value": expected_state_value,
+                "resumed_state_value": resumed_state_value,
+                "source_type": source_type,
+                "text": text,
+                "url": url,
+                "metadata": metadata,
+                "trust_state": trust_state,
+                "verified_by": verified_by,
+            }, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            return None, "rejected"
+        if (
+            type(state_key) is not str or not state_key or len(state_key) > 256
+            or type(expected_state_value) is not str or not expected_state_value
+            or type(resumed_state_value) is not str or not resumed_state_value
+            or type(child_token) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", child_token) is None
+            or type(source_type) is not str or not source_type
+            or type(text) is not str or not text.strip()
+            or url is not None and type(url) is not str
+            or type(metadata) is not dict
+            or type(trust_state) is not str or not trust_state
+            or type(verified_by) is not str or not verified_by
+        ):
+            return None, "rejected"
+
+        try:
+            expected = json.loads(expected_state_value)
+            resumed = json.loads(resumed_state_value)
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+            return None, "rejected"
+        expected_child = (
+            expected.get("payload", {}).get("child")
+            if isinstance(expected, dict) and isinstance(expected.get("payload"), dict)
+            else None
+        )
+        if (
+            not isinstance(expected_child, dict)
+            or expected.get("kind") != "manual_post"
+            or not isinstance(expected.get("step"), str)
+            or not expected["step"].startswith("source_child_")
+            or expected_child.get("token") != child_token
+            or expected_child.get("return_step") != "sources"
+            or not isinstance(resumed, dict)
+            or resumed.get("kind") != "manual_post"
+            or resumed.get("step") != "sources"
+            or resumed.get("token") != expected.get("token")
+            or not isinstance(resumed.get("payload"), dict)
+            or "child" in resumed["payload"]
+        ):
+            return None, "rejected"
+
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_operation = conn.execute(
+                "SELECT request_json, result_json FROM telegram_child_operations WHERE token = ?",
+                (child_token,),
+            ).fetchone()
+            if existing_operation is not None:
+                if existing_operation["request_json"] != request:
+                    return None, "child_replay_mismatch"
+                try:
+                    result = json.loads(existing_operation["result_json"])
+                    source_id = result.get("source_id")
+                except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+                    return None, "rejected"
+                if type(source_id) is not int or source_id <= 0:
+                    return None, "rejected"
+                return source_id, "already_applied"
+
+            state = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (state_key,)
+            ).fetchone()
+            if state is None or state["value"] != expected_state_value:
+                return None, "session_conflict"
+
+            candidates = conn.execute(
+                "SELECT id, source_type, text, url, metadata_json, trust_state, verified_by "
+                "FROM content_sources WHERE url IS ? ORDER BY id", (url,),
+            ).fetchall()
+            exact_source = None
+            if candidates:
+                for candidate in candidates:
+                    try:
+                        candidate_metadata = json.loads(candidate["metadata_json"])
+                    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+                        continue
+                    if (
+                        candidate["source_type"] == source_type
+                        and candidate["text"] == text
+                        and candidate["url"] == url
+                        and candidate_metadata == metadata
+                        and candidate["trust_state"] == trust_state
+                        and candidate["verified_by"] == verified_by
+                    ):
+                        exact_source = candidate["id"]
+                        break
+                if url and exact_source is None:
+                    return None, "duplicate"
+            source_id = exact_source or self._insert_content_source_in_conn(
+                conn,
+                source_type=source_type,
+                text=text,
+                url=url,
+                metadata=metadata,
+                trust_state=trust_state,
+                verified_by=verified_by,
+                verified_at=None,
+            )
+            resumed_payload = resumed["payload"]
+            resumed_ids = resumed_payload.get("source_ids")
+            if (
+                type(resumed_ids) is not list
+                or any(type(value) is not int or value <= 0 for value in resumed_ids)
+                or source_id in resumed_ids
+                or len(resumed_ids) >= 3
+            ):
+                return None, "rejected"
+            resumed_payload["source_ids"] = resumed_ids + [source_id]
+            effective_resumed_value = json.dumps(
+                resumed, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            updated = conn.execute(
+                "UPDATE bot_state SET value = ?, updated_at = ? WHERE key = ? AND value = ?",
+                (effective_resumed_value, self._now_iso(), state_key, expected_state_value),
+            )
+            if updated.rowcount != 1:
+                return None, "session_conflict"
+            conn.execute(
+                "INSERT INTO telegram_child_operations (token, request_json, result_json, created_at) VALUES (?, ?, ?, ?)",
+                (child_token, request, json.dumps({"source_id": source_id}), self._now_iso()),
             )
             return source_id, "created"
 

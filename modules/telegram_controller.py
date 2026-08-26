@@ -22,7 +22,7 @@ from config import (
 )
 from modules.media_store import open_verified_media
 from modules.content_planner import PORTFOLIO, SOURCE_TYPES as MANUAL_SOURCE_TYPES
-from modules.source_validation import is_safe_https_url
+from modules.source_validation import is_complete_verified_news, is_safe_https_url
 from modules.telegram_api import (
     TELEGRAM_CAPTION_MAX_CHARS,
     TELEGRAM_CALLBACK_DATA_MAX_BYTES,
@@ -44,7 +44,12 @@ _SESSION_KINDS = {
     "source_intake": {"text", "classification", "news_url", "news_date", "news_source"},
     "draft_edit": {"text"},
     "draft_postpone": {"slot"},
-    "manual_post": {"text", "category", "sources", "media"},
+    "manual_post": {
+        "text", "category", "sources", "media",
+        "source_child_text", "source_child_classification",
+        "source_child_news_url", "source_child_news_date",
+        "source_child_news_source",
+    },
 }
 _SOURCE_TYPES = {
     "founder_note": "Founder note",
@@ -923,7 +928,15 @@ class TelegramController:
         )
         return all(is_safe_https_url(url) for url in urls)
 
-    def _manual_source_markup(self, category: str, selected_ids):
+    def _manual_source_choice_markup(self):
+        return self._callback_markup([
+            [self._callback_button("Scegli fonti esistenti", "manual:sources:existing")],
+            [self._callback_button("Aggiungi una fonte", "manual:sources:add")],
+            [self._callback_button("Nessuna fonte", "manual:sources:none")],
+            [self._callback_button("Annulla", "manual:cancel")],
+        ])
+
+    def _manual_source_markup(self, category: str, selected_ids, page: int = 0):
         allowed_types = MANUAL_SOURCE_TYPES.get(category, set())
         try:
             sources = self.db.get_eligible_sources(now=self._now())
@@ -931,6 +944,7 @@ class TelegramController:
             sources = []
         rows = []
         selected = set(selected_ids)
+        eligible = []
         for source in sources:
             source_id = source.get("id")
             source_type = source.get("source_type")
@@ -940,6 +954,12 @@ class TelegramController:
                 or source_type not in allowed_types
             ):
                 continue
+            eligible.append(source)
+        page_size = 10
+        start = page * page_size
+        for source in eligible[start:start + page_size]:
+            source_id = source["id"]
+            source_type = source["source_type"]
             metadata = source.get("metadata")
             title = ""
             if isinstance(metadata, dict):
@@ -953,12 +973,25 @@ class TelegramController:
             rows.append([
                 self._callback_button(label[:64], f"manual:source:{source_id}")
             ])
-            if len(rows) >= 20:
-                break
+        if page > 0:
+            rows.append([self._callback_button("←", f"manual:sources:page:{page - 1}")])
+        if start + page_size < len(eligible):
+            rows.append([self._callback_button("→", f"manual:sources:page:{page + 1}")])
         rows.append([
             self._callback_button("Fonti selezionate", "manual:sources_done")
         ])
         rows.append([self._callback_button("Annulla", "manual:cancel")])
+        return self._callback_markup(rows)
+
+    def _manual_child_source_markup(self, category: str):
+        rows = [
+            [self._callback_button(label, f"manual:child:source:{source_type}")]
+            for source_type, label in _SOURCE_TYPES.items()
+            if source_type in MANUAL_SOURCE_TYPES.get(category, set())
+        ]
+        rows.append([
+            self._callback_button("Annulla", "manual:sources:child_cancel"),
+        ])
         return self._callback_markup(rows)
 
     def _manual_media_markup(self):
@@ -1016,8 +1049,23 @@ class TelegramController:
         if outcome not in {"created", "already_applied"} or not isinstance(
             draft, dict,
         ):
+            if outcome == "no_eligible_source":
+                if not self._replace_session(
+                    chat_id,
+                    raw,
+                    "manual_post",
+                    "sources",
+                    self._manual_parent_payload(payload),
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                self._send(
+                    chat_id,
+                    "Le fonti selezionate non sono più disponibili. Selezionale di nuovo.",
+                    reply_markup=self._manual_source_choice_markup(),
+                )
+                return "manual_source_stale"
             messages = {
-                "no_eligible_source": "Le fonti selezionate non sono più disponibili.",
                 "media_unavailable": "Il media selezionato non è più disponibile.",
             }
             self._send(
@@ -1031,7 +1079,7 @@ class TelegramController:
         queued = self.db.get_queue_draft(draft.get("id")) or draft
         self._send(
             chat_id,
-            "Post manuale aggiunto alla coda approvata; "
+            "Post approvato e aggiunto alla coda approvata; "
             "traduzione italiana facoltativa in preparazione.",
         )
         self._send_draft_card(chat_id, queued)
@@ -1171,6 +1219,53 @@ class TelegramController:
                 return set(payload) == {"text", "category", "source_ids"}
             if step == "media":
                 return set(payload) == {"text", "category", "source_ids"}
+            child = payload.get("child")
+            if (
+                not isinstance(child, dict)
+                or type(child.get("token")) is not str
+                or _SAFE_TOKEN.fullmatch(child["token"]) is None
+                or child.get("return_step") != "sources"
+            ):
+                return False
+            parent_keys = {"text", "category", "source_ids", "child"}
+            if step == "source_child_text":
+                return set(payload) == parent_keys and set(child) == {"token", "return_step"}
+            child_text = child.get("text")
+            if (
+                type(child_text) is not str
+                or not child_text.strip()
+                or len(child_text) > 2000
+            ):
+                return False
+            if step == "source_child_classification":
+                return set(payload) == parent_keys and set(child) == {
+                    "token", "return_step", "text",
+                }
+            if step == "source_child_news_url":
+                return set(payload) == parent_keys and set(child) == {
+                    "token", "return_step", "text",
+                }
+            child_url = child.get("url")
+            if type(child_url) is not str or not self._trusted_news_url(child_url):
+                return False
+            if step == "source_child_news_date":
+                return set(payload) == parent_keys and set(child) == {
+                    "token", "return_step", "text", "url",
+                }
+            published_at = child.get("published_at")
+            try:
+                published = date.fromisoformat(published_at)
+            except (TypeError, ValueError):
+                return False
+            return (
+                step == "source_child_news_source"
+                and set(payload) == parent_keys
+                and set(child) == {
+                    "token", "return_step", "text", "url", "published_at",
+                }
+                and published_at == published.isoformat()
+                and published <= self._now().date()
+            )
             media_id = payload.get("media_id")
             if media_id is not None and (
                 type(media_id) is not int
@@ -1249,6 +1344,74 @@ class TelegramController:
             self._session_key(chat_id), expected_raw,
         )
 
+    @staticmethod
+    def _manual_parent_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "text": payload["text"],
+            "category": payload["category"],
+            "source_ids": list(payload["source_ids"]),
+        }
+
+    def _replace_manual_child_session(
+        self,
+        chat_id: str,
+        raw: str,
+        step: str,
+        payload: Dict[str, Any],
+        child: Dict[str, Any],
+    ) -> bool:
+        next_payload = self._manual_parent_payload(payload)
+        next_payload["child"] = child
+        return self._replace_session(chat_id, raw, "manual_post", step, next_payload)
+
+    def _resume_manual_after_child(
+        self,
+        chat_id: str,
+        raw: str,
+        session: Dict[str, Any],
+        *,
+        source_type: str,
+        text: str,
+        url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        payload = session["payload"]
+        child = payload["child"]
+        resumed_payload = self._manual_parent_payload(payload)
+        resumed_raw = self._session_value(
+            "manual_post", "sources", resumed_payload, token=session["token"],
+        )
+        source_id, outcome = self.db.add_content_source_and_resume_manual_state_atomic(
+            state_key=self._session_key(chat_id),
+            expected_state_value=raw,
+            resumed_state_value=resumed_raw,
+            child_token=child["token"],
+            source_type=source_type,
+            text=text,
+            url=url,
+            metadata=metadata or {},
+            trust_state="verified",
+            verified_by="floriano",
+        )
+        if outcome == "session_conflict":
+            self._send(chat_id, "Operazione già gestita.")
+            return "session_conflict"
+        if outcome == "child_replay_mismatch":
+            self._send(chat_id, "Operazione non valida.")
+            return "invalid_session"
+        if outcome == "duplicate":
+            self._send(chat_id, "Questa fonte è già presente.")
+            return "duplicate_source"
+        if outcome not in {"created", "already_applied"} or type(source_id) is not int:
+            self._send(chat_id, "Salvataggio fonte non riuscito. La sessione è ancora disponibile.")
+            return "source_save_failed"
+        self._send(
+            chat_id,
+            "Fonte salvata. Scegli altre fonti, oppure continua senza aggiungerne.",
+            reply_markup=self._manual_source_choice_markup(),
+        )
+        return "manual_source_saved"
+
     def _handle_text_input(self, chat_id: str, text: str):
         raw, session, invalid = self._load_session(chat_id)
         if invalid:
@@ -1285,6 +1448,76 @@ class TelegramController:
                     reply_markup=self._manual_category_markup(),
                 )
                 return "manual_category"
+            if step == "source_child_text":
+                if not clean or len(clean) > 2000:
+                    self._send(chat_id, "Testo non valido: massimo 2000 caratteri.")
+                    return "invalid_source_text"
+                child = {**payload["child"], "text": clean}
+                if not self._replace_manual_child_session(
+                    chat_id, raw, "source_child_classification", payload, child,
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                self._send(
+                    chat_id, "Scegli il tipo di fonte.",
+                    reply_markup=self._manual_child_source_markup(payload["category"]),
+                )
+                return "manual_child_classification"
+            if step == "source_child_news_url":
+                if not self._trusted_news_url(clean):
+                    self._send(chat_id, "URL non valido: usa una pagina HTTPS allowlisted.")
+                    return "invalid_news_url"
+                child = {**payload["child"], "url": clean}
+                if not self._replace_manual_child_session(
+                    chat_id, raw, "source_child_news_date", payload, child,
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                self._send(chat_id, "Inserisci la data di pubblicazione: YYYY-MM-DD.")
+                return "manual_child_news_date"
+            if step == "source_child_news_date":
+                try:
+                    published = date.fromisoformat(clean)
+                except (TypeError, ValueError):
+                    published = None
+                if (
+                    published is None or clean != published.isoformat()
+                    or published > self._now().date()
+                ):
+                    self._send(chat_id, "Data non valida: usa YYYY-MM-DD, non futura.")
+                    return "invalid_news_date"
+                child = {**payload["child"], "published_at": clean}
+                if not self._replace_manual_child_session(
+                    chat_id, raw, "source_child_news_source", payload, child,
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                self._send(chat_id, "Inserisci il nome della fonte.")
+                return "manual_child_news_source"
+            if step == "source_child_news_source":
+                source_name = self._clean_text(clean, 120)
+                if not source_name or len(clean) > 120:
+                    self._send(chat_id, "Nome fonte non valido: massimo 120 caratteri.")
+                    return "invalid_news_source"
+                child = payload["child"]
+                metadata = {
+                    "title": self._clean_text(child["text"].splitlines()[0], 200),
+                    "summary": child["text"],
+                    "published_at": child["published_at"],
+                    "source_name": source_name,
+                }
+                candidate = {
+                    "source_type": "verified_news", "text": child["text"],
+                    "url": child["url"], "metadata": metadata,
+                    "trust_state": "verified",
+                }
+                if not is_complete_verified_news(candidate):
+                    self._send(chat_id, "News incompleta o non valida.")
+                    return "invalid_news_source"
+                return self._resume_manual_after_child(
+                    chat_id, raw, session, source_type="verified_news",
+                    text=child["text"], url=child["url"], metadata=metadata,
+                )
         if kind == "source_intake":
             if step == "text":
                 if not clean or len(clean) > 2000:
@@ -1701,10 +1934,113 @@ class TelegramController:
                 return "session_conflict"
             self._send(
                 chat_id,
-                "Scegli fino a tre fonti facoltative, oppure conferma senza fonti.",
-                reply_markup=self._manual_source_markup(category, []),
+                "Scegli fino a tre fonti facoltative. Scegli come procedere.",
+                reply_markup=self._manual_source_choice_markup(),
             )
             return "manual_sources"
+
+        if parts == ["manual", "sources", "existing"]:
+            if step != "sources":
+                self._send(chat_id, "Questa sessione non attende fonti.")
+                return "invalid_session"
+            self._send(
+                chat_id,
+                f"Fonti selezionate: {len(payload['source_ids'])}/3.",
+                reply_markup=self._manual_source_markup(
+                    payload["category"], payload["source_ids"], 0,
+                ),
+            )
+            return "manual_existing_sources"
+
+        if parts == ["manual", "sources", "add"]:
+            if step != "sources":
+                self._send(chat_id, "Questa sessione non attende fonti.")
+                return "invalid_session"
+            child = {"token": uuid4().hex, "return_step": "sources"}
+            if not self._replace_manual_child_session(
+                chat_id, raw, "source_child_text", payload, child,
+            ):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            self._send(
+                chat_id, "Invia il testo della nuova fonte (massimo 2000 caratteri).",
+                reply_markup=self._callback_markup([[
+                    self._callback_button("Annulla", "manual:sources:child_cancel"),
+                ]]),
+            )
+            return "manual_child_text"
+
+        if parts == ["manual", "sources", "none"]:
+            if step != "sources":
+                self._send(chat_id, "Questa sessione non attende fonti.")
+                return "invalid_session"
+            next_payload = self._manual_parent_payload(payload)
+            next_payload["source_ids"] = []
+            if not self._replace_session(
+                chat_id, raw, "manual_post", "media", next_payload,
+            ):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            self._send(
+                chat_id,
+                "Scegli un media disponibile oppure continua senza media.",
+                reply_markup=self._manual_media_markup(),
+            )
+            return "manual_media"
+
+        if parts == ["manual", "sources", "child_cancel"]:
+            if not step.startswith("source_child_"):
+                self._send(chat_id, "Questa sessione non attende una fonte.")
+                return "invalid_session"
+            if not self._replace_session(
+                chat_id, raw, "manual_post", "sources", self._manual_parent_payload(payload),
+            ):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            self._send(
+                chat_id, "Aggiunta fonte annullata.", reply_markup=self._manual_source_choice_markup(),
+            )
+            return "manual_child_cancelled"
+
+        if len(parts) == 4 and parts[:3] == ["manual", "sources", "page"]:
+            raw_page = parts[3]
+            page = int(raw_page) if raw_page.isascii() and raw_page.isdigit() else -1
+            if step != "sources" or page < 0 or page > 100:
+                self._send(chat_id, "Pagina fonti non valida.")
+                return "invalid_callback"
+            self._send(
+                chat_id,
+                f"Fonti selezionate: {len(payload['source_ids'])}/3.",
+                reply_markup=self._manual_source_markup(
+                    payload["category"], payload["source_ids"], page,
+                ),
+            )
+            return "manual_sources_page"
+
+        if len(parts) == 4 and parts[:3] == ["manual", "child", "source"]:
+            source_type = parts[3]
+            if (
+                step != "source_child_classification"
+                or source_type not in _SOURCE_TYPES
+                or source_type not in MANUAL_SOURCE_TYPES[payload["category"]]
+            ):
+                self._send(chat_id, "Classificazione non valida.")
+                return "invalid_callback"
+            child = payload["child"]
+            if source_type == "verified_news":
+                if not self._replace_manual_child_session(
+                    chat_id, raw, "source_child_news_url", payload, child,
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                self._send(chat_id, "Inserisci l'URL HTTPS allowlisted dell'articolo.")
+                return "manual_child_news_url"
+            return self._resume_manual_after_child(
+                chat_id, raw, session, source_type=source_type,
+                text=child["text"], metadata=(
+                    {"publishable": True} if source_type == "founder_note" else {}
+                ),
+            )
 
         if len(parts) == 3 and parts[1] == "source":
             source_id = self._positive_id(parts[2])

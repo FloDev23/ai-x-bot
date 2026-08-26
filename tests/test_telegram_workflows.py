@@ -1403,7 +1403,7 @@ def test_newpost_zero_source_commits_approved_without_editorial_ai(tmp_path):
         message_update(410, "/newpost"),
         message_update(411, "Manual copy enters the approved reserve exactly."),
         callback_update(412, "manual:category:founder_journey"),
-        callback_update(413, "manual:sources_done"),
+        callback_update(413, "manual:sources:none"),
         callback_update(414, "manual:media:none"),
     )
     for update in updates:
