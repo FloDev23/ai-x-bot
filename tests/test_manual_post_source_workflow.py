@@ -129,16 +129,31 @@ def test_existing_sources_paginate_select_exact_ids_without_rendering_bodies(tmp
         ))
     telegram = Telegram(tmp_path)
     bot = start_at_sources(db, telegram)
+    source_bodies = {f"PRIVATE_SOURCE_BODY_{index}" for index in range(12)}
 
     assert bot.process_update(callback(4, "manual:sources:existing")) == "processed"
     rendered = "\n".join(text for _chat, text, _kwargs in telegram.messages)
-    labels = button_texts(telegram)
-    assert "PRIVATE_SOURCE_BODY_0" not in rendered
-    assert all("PRIVATE_SOURCE_BODY_0" not in label for label in labels)
-    assert any("· Verificata" in label for label in labels)
-    assert any(f"#{expected[-1]} founder_note" in label for label in labels)
+    page_zero_labels = button_texts(telegram)
+    assert all(body not in rendered for body in source_bodies)
+    assert all(
+        body not in label
+        for body in source_bodies
+        for label in page_zero_labels
+    )
+    assert any("· Verificata" in label for label in page_zero_labels)
+    assert any(f"#{expected[-1]} founder_note" in label for label in page_zero_labels)
     assert bot.process_update(callback(5, "manual:sources:page:1")) == "processed"
-    assert any(f"#{expected[0]} founder_note" in label for label in button_texts(telegram))
+    page_one_labels = button_texts(telegram)
+    page_one_rendered = "\n".join(
+        text for _chat, text, _kwargs in telegram.messages
+    )
+    assert all(body not in page_one_rendered for body in source_bodies)
+    assert all(
+        body not in label
+        for body in source_bodies
+        for label in page_one_labels
+    )
+    assert any(f"#{expected[0]} founder_note" in label for label in page_one_labels)
     for update_id, source_id in enumerate(expected[-3:], start=6):
         assert bot.process_update(callback(update_id, f"manual:source:{source_id}")) == "processed"
     assert session(db)["payload"]["source_ids"] == expected[-3:]
