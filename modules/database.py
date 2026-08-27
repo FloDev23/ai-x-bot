@@ -680,9 +680,29 @@ class Database:
                     decision TEXT NOT NULL DEFAULT 'new',
                     decision_at TEXT,
                     cooldown_until TEXT,
+                    rank_position INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(observed_on, kind, object_id)
                 )
             """)
+            growth_suggestion_columns = {
+                row["name"] for row in c.execute(
+                    "PRAGMA table_info(growth_suggestions)"
+                )
+            }
+            if "rank_position" not in growth_suggestion_columns:
+                c.execute(
+                    "ALTER TABLE growth_suggestions "
+                    "ADD COLUMN rank_position INTEGER NOT NULL DEFAULT 0"
+                )
+                c.execute("""
+                    UPDATE growth_suggestions AS current
+                    SET rank_position = (
+                        SELECT COUNT(*) FROM growth_suggestions AS prior
+                        WHERE prior.observed_on = current.observed_on
+                          AND prior.kind = current.kind
+                          AND prior.id < current.id
+                    )
+                """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS growth_digest_runs (
                     observed_on TEXT PRIMARY KEY,
@@ -697,11 +717,21 @@ class Database:
                     state TEXT NOT NULL CHECK (
                         state IN ('claimed','completed','failed')
                     ),
+                    claim_token TEXT NOT NULL,
                     claimed_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     PRIMARY KEY (observed_on, query_key)
                 )
             """)
+            growth_read_claim_columns = {
+                row["name"] for row in c.execute(
+                    "PRAGMA table_info(growth_read_claims)"
+                )
+            }
+            if "claim_token" not in growth_read_claim_columns:
+                c.execute(
+                    "ALTER TABLE growth_read_claims ADD COLUMN claim_token TEXT"
+                )
             c.execute("""
                 CREATE INDEX IF NOT EXISTS idx_growth_suggestion_cooldown
                 ON growth_suggestions(kind, object_id, cooldown_until)
@@ -7192,10 +7222,10 @@ class Database:
         rows = conn.execute("""
             SELECT id, kind, object_id, username, payload_json, score,
                    reason_codes_json, suggested_at, decision, decision_at,
-                   cooldown_until
+                   cooldown_until, rank_position
             FROM growth_suggestions
             WHERE observed_on = ?
-            ORDER BY kind, score DESC, object_id ASC
+            ORDER BY kind, rank_position ASC
         """, (observed_on,)).fetchall()
         grouped = {"account": [], "post": [], "reevaluate": []}
         try:
@@ -7205,6 +7235,8 @@ class Database:
                 item["reason_codes"] = json.loads(item.pop("reason_codes_json"))
                 if (
                     item["kind"] not in grouped
+                    or type(item["rank_position"]) is not int
+                    or item["rank_position"] != len(grouped[item["kind"]])
                     or type(item["payload"]) is not dict
                     or type(item["reason_codes"]) is not list
                 ):
@@ -7242,6 +7274,7 @@ class Database:
                     or validated["reason_codes"] != item["reason_codes"]
                 ):
                     return {}
+                item.pop("rank_position")
                 grouped[item["kind"]].append(item)
         except (TypeError, ValueError):
             return {}
@@ -7276,6 +7309,8 @@ class Database:
         post_rows: List[Dict],
         reevaluate_rows: List[Dict],
         completed_at: str,
+        builder_token: Optional[str] = None,
+        query_claim_tokens: Optional[Mapping[str, str]] = None,
     ) -> Tuple[Dict, str]:
         """Commit one exact daily digest or replay the prior committed rows."""
         try:
@@ -7315,14 +7350,70 @@ class Database:
             existing = self._load_growth_digest_conn(conn, observed_on)
             if existing is not None:
                 return (existing, "existing") if existing else ({}, "invalid_existing")
+            if (
+                type(builder_token) is not str
+                or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", builder_token) is None
+                or type(query_claim_tokens) is not dict
+                or not 1 <= len(query_claim_tokens) <= 2
+                or any(
+                    type(key) is not str
+                    or key.startswith("__")
+                    or re.fullmatch(r"[A-Za-z0-9:_-]{1,80}", key) is None
+                    or type(token) is not str
+                    or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token) is None
+                    for key, token in query_claim_tokens.items()
+                )
+            ):
+                return {}, "lost_claim"
+            claims = {
+                row["query_key"]: row
+                for row in conn.execute("""
+                    SELECT query_key, state, claim_token, expires_at
+                    FROM growth_read_claims WHERE observed_on = ?
+                """, (observed_on,)).fetchall()
+            }
+            expected_tokens = {
+                "__digest_build__": builder_token,
+                **query_claim_tokens,
+            }
+            if set(claims) != set(expected_tokens):
+                return {}, "lost_claim"
+            for query_key, token in expected_tokens.items():
+                claim = claims[query_key]
+                expires_at = parse_growth_datetime(claim["expires_at"])
+                if (
+                    claim["state"] != "claimed"
+                    or claim["claim_token"] != token
+                    or expires_at is None
+                    or expires_at < completed
+                ):
+                    return {}, "lost_claim"
+
+            selected = {kind: [] for kind in normalized}
             for kind in ("account", "post", "reevaluate"):
                 for item in normalized[kind]:
+                    prior_rows = conn.execute("""
+                        SELECT cooldown_until FROM growth_suggestions
+                        WHERE kind = ? AND object_id = ?
+                    """, (kind, item["object_id"])).fetchall()
+                    in_cooldown = False
+                    for prior in prior_rows:
+                        prior_until = parse_growth_datetime(
+                            prior["cooldown_until"]
+                        )
+                        if prior_until is None or prior_until > completed:
+                            in_cooldown = True
+                            break
+                    if not in_cooldown:
+                        selected[kind].append(item)
+            for kind in ("account", "post", "reevaluate"):
+                for rank_position, item in enumerate(selected[kind]):
                     conn.execute("""
                         INSERT INTO growth_suggestions (
                             observed_on, kind, object_id, username, payload_json,
                             score, reason_codes_json, suggested_at,
-                            cooldown_until
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            cooldown_until, rank_position
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         observed_on, kind, item["object_id"], item["username"],
                         json.dumps(item["payload"], allow_nan=False,
@@ -7331,8 +7422,17 @@ class Database:
                         json.dumps(item["reason_codes"], allow_nan=False,
                                    separators=(",", ":")),
                         completed.isoformat(), item["cooldown_until"],
+                        rank_position,
                     ))
-            counts = {kind: len(normalized[kind]) for kind in normalized}
+            for query_key, token in expected_tokens.items():
+                cursor = conn.execute("""
+                    UPDATE growth_read_claims SET state = 'completed'
+                    WHERE observed_on = ? AND query_key = ?
+                      AND state = 'claimed' AND claim_token = ?
+                """, (observed_on, query_key, token))
+                if cursor.rowcount != 1:
+                    raise sqlite3.IntegrityError("growth claim ownership lost")
+            counts = {kind: len(selected[kind]) for kind in selected}
             conn.execute("""
                 INSERT INTO growth_digest_runs (
                     observed_on, completed_at, summary_json
@@ -7357,7 +7457,7 @@ class Database:
         expires_at: datetime,
         *,
         budget: int,
-    ) -> str:
+    ) -> Tuple[str, Optional[str]]:
         """Atomically claim one bounded daily X read, recovering stale claims."""
         try:
             valid_date = date.fromisoformat(observed_on).isoformat() == observed_on
@@ -7376,53 +7476,63 @@ class Database:
             or type(budget) is not int
             or not 1 <= budget <= 2
         ):
-            return "invalid"
+            return "invalid", None
         claimed = claimed_at.astimezone(timezone.utc)
         expires = expires_at.astimezone(timezone.utc)
         if expires <= claimed or expires > claimed + timedelta(minutes=15):
-            return "invalid"
+            return "invalid", None
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute("""
-                SELECT state, expires_at FROM growth_read_claims
+                SELECT state, claim_token, expires_at FROM growth_read_claims
                 WHERE observed_on = ? AND query_key = ?
             """, (observed_on, query_key)).fetchone()
             if existing is not None:
                 if existing["state"] == "completed":
-                    return "completed"
+                    return "completed", None
                 if existing["state"] == "failed":
-                    return "failed"
+                    return "failed", None
                 prior_expiry = parse_growth_datetime(existing["expires_at"])
                 if prior_expiry is None:
-                    return "failed"
+                    return "failed", None
                 if prior_expiry > claimed:
-                    return "busy"
+                    return "busy", None
+                claim_token = secrets.token_urlsafe(24)
                 conn.execute("""
                     UPDATE growth_read_claims
-                    SET state = 'claimed', claimed_at = ?, expires_at = ?
+                    SET state = 'claimed', claim_token = ?, claimed_at = ?,
+                        expires_at = ?
                     WHERE observed_on = ? AND query_key = ?
-                """, (claimed.isoformat(), expires.isoformat(), observed_on, query_key))
-                return "claimed"
+                """, (
+                    claim_token, claimed.isoformat(), expires.isoformat(),
+                    observed_on, query_key,
+                ))
+                return "claimed", claim_token
             used = conn.execute(
                 "SELECT COUNT(*) AS count FROM growth_read_claims "
                 "WHERE observed_on = ? AND substr(query_key, 1, 2) != '__'",
                 (observed_on,),
             ).fetchone()["count"]
             if type(used) is not int or used >= budget:
-                return "budget_exhausted"
+                return "budget_exhausted", None
+            claim_token = secrets.token_urlsafe(24)
             conn.execute("""
                 INSERT INTO growth_read_claims (
-                    observed_on, query_key, state, claimed_at, expires_at
-                ) VALUES (?, ?, 'claimed', ?, ?)
-            """, (observed_on, query_key, claimed.isoformat(), expires.isoformat()))
-            return "claimed"
+                    observed_on, query_key, state, claim_token, claimed_at,
+                    expires_at
+                ) VALUES (?, ?, 'claimed', ?, ?, ?)
+            """, (
+                observed_on, query_key, claim_token, claimed.isoformat(),
+                expires.isoformat(),
+            ))
+            return "claimed", claim_token
 
     def claim_growth_digest_build(
         self,
         observed_on: str,
         claimed_at: datetime,
         expires_at: datetime,
-    ) -> str:
+    ) -> Tuple[str, Optional[str]]:
         """Claim the daily builder lease without consuming an X-read budget."""
         query_key = "__digest_build__"
         try:
@@ -7438,66 +7548,64 @@ class Database:
             or expires_at.tzinfo is None
             or expires_at.utcoffset() is None
         ):
-            return "invalid"
+            return "invalid", None
         claimed = claimed_at.astimezone(timezone.utc)
         expires = expires_at.astimezone(timezone.utc)
         if expires <= claimed or expires > claimed + timedelta(minutes=15):
-            return "invalid"
+            return "invalid", None
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute("""
-                SELECT state, expires_at FROM growth_read_claims
+                SELECT state, claim_token, expires_at FROM growth_read_claims
                 WHERE observed_on = ? AND query_key = ?
             """, (observed_on, query_key)).fetchone()
             if existing is None:
+                claim_token = secrets.token_urlsafe(24)
                 conn.execute("""
                     INSERT INTO growth_read_claims (
-                        observed_on, query_key, state, claimed_at, expires_at
-                    ) VALUES (?, ?, 'claimed', ?, ?)
+                        observed_on, query_key, state, claim_token, claimed_at,
+                        expires_at
+                    ) VALUES (?, ?, 'claimed', ?, ?, ?)
                 """, (
-                    observed_on, query_key, claimed.isoformat(), expires.isoformat(),
+                    observed_on, query_key, claim_token, claimed.isoformat(),
+                    expires.isoformat(),
                 ))
-                return "claimed"
+                return "claimed", claim_token
             if existing["state"] == "completed":
-                return "completed"
+                return "completed", None
             if existing["state"] == "failed":
-                return "failed"
+                return "failed", None
             prior_expiry = parse_growth_datetime(existing["expires_at"])
             if prior_expiry is None:
-                return "failed"
+                return "failed", None
             if prior_expiry > claimed:
-                return "busy"
+                return "busy", None
+            claim_token = secrets.token_urlsafe(24)
             conn.execute("""
                 UPDATE growth_read_claims
-                SET state = 'claimed', claimed_at = ?, expires_at = ?
+                SET state = 'claimed', claim_token = ?, claimed_at = ?,
+                    expires_at = ?
                 WHERE observed_on = ? AND query_key = ?
             """, (
-                claimed.isoformat(), expires.isoformat(), observed_on, query_key,
+                claim_token, claimed.isoformat(), expires.isoformat(),
+                observed_on, query_key,
             ))
-            return "claimed"
+            return "claimed", claim_token
 
-    def complete_growth_read_query(
-        self, observed_on: str, query_key: str, completed_at: datetime
+    def fail_growth_read_query(
+        self, observed_on: str, query_key: str, claim_token: str
     ) -> bool:
         if (
-            type(completed_at) is not datetime
-            or completed_at.tzinfo is None
-            or completed_at.utcoffset() is None
+            type(claim_token) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", claim_token) is None
         ):
             return False
         with self._conn() as conn:
             cursor = conn.execute("""
-                UPDATE growth_read_claims SET state = 'completed'
-                WHERE observed_on = ? AND query_key = ? AND state = 'claimed'
-            """, (observed_on, query_key))
-            return cursor.rowcount == 1
-
-    def fail_growth_read_query(self, observed_on: str, query_key: str) -> bool:
-        with self._conn() as conn:
-            cursor = conn.execute("""
                 UPDATE growth_read_claims SET state = 'failed'
                 WHERE observed_on = ? AND query_key = ? AND state = 'claimed'
-            """, (observed_on, query_key))
+                  AND claim_token = ?
+            """, (observed_on, query_key, claim_token))
             return cursor.rowcount == 1
 
     def growth_object_in_cooldown(

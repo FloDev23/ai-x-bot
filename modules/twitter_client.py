@@ -307,39 +307,74 @@ class TwitterClient:
         return normalized
 
     @staticmethod
-    def _safe_post_entities(value: object) -> bool:
+    def _safe_https_url(value: object) -> bool:
+        if type(value) is not str or not 1 <= len(value) <= 2048:
+            return False
+        try:
+            parsed = urlsplit(value)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                return False
+            hostname = parsed.hostname.lower()
+            if (
+                hostname.endswith(".")
+                or hostname in {"localhost", "localhost.localdomain"}
+                or hostname.endswith((".localhost", ".test", ".invalid"))
+            ):
+                return False
+            try:
+                address = ipaddress.ip_address(hostname)
+            except ValueError:
+                address = None
+            return address is None or address.is_global
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _safe_post_entities(cls, value: object, text: str) -> bool:
+        text_urls = [
+            (match.start(), match.end(), match.group(0))
+            for match in re.finditer(r"https?://[^\s]+", text, re.IGNORECASE)
+        ]
         if value is None:
-            return True
+            return not text_urls
         if not isinstance(value, Mapping):
             return False
         urls = value.get("urls", [])
         if not isinstance(urls, (list, tuple)):
             return False
+        entity_urls = []
         for item in urls:
             if not isinstance(item, Mapping):
                 return False
+            start = item.get("start")
+            end = item.get("end")
+            raw_url = item.get("url")
             expanded = item.get("expanded_url")
-            if type(expanded) is not str or not 1 <= len(expanded) <= 2048:
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or not 0 <= start < end <= len(text)
+                or type(raw_url) is not str
+                or text[start:end] != raw_url
+                or not cls._safe_https_url(raw_url)
+                or not cls._safe_https_url(expanded)
+            ):
                 return False
-            try:
-                parsed = urlsplit(expanded)
-                if (
-                    parsed.scheme != "https"
-                    or not parsed.hostname
-                    or parsed.username is not None
-                    or parsed.password is not None
-                ):
-                    return False
-                try:
-                    address = ipaddress.ip_address(parsed.hostname)
-                except ValueError:
-                    address = None
-                if address is not None and not address.is_global:
-                    return False
-                if parsed.hostname.lower() in {"localhost", "localhost.localdomain"}:
-                    return False
-            except (TypeError, ValueError):
-                return False
+            entity_urls.append((start, end, raw_url))
+        if len(set(entity_urls)) != len(entity_urls):
+            return False
+        ordered = sorted(entity_urls)
+        if any(left[1] > right[0] for left, right in zip(ordered, ordered[1:])):
+            return False
+        if ordered != text_urls:
+            return False
+        if any(not cls._safe_https_url(raw_url) for _start, _end, raw_url in text_urls):
+            return False
         return True
 
     @classmethod
@@ -421,11 +456,7 @@ class TwitterClient:
             or created_at > now + timedelta(minutes=5)
             or created_at < now - timedelta(days=30)
             or metrics is None
-            or (
-                re.search(r"(?i)\bhttps?://", text) is not None
-                and entities is None
-            )
-            or not cls._safe_post_entities(entities)
+            or not cls._safe_post_entities(entities, text)
         ):
             return None
         return {
@@ -549,7 +580,8 @@ class TwitterClient:
 
     def search_relevant_posts(self, query: str, limit: int = 25) -> List[Dict]:
         """Compatibility list boundary for normalized read-only post search."""
-        return list(self.read_relevant_posts(query, limit).posts)
+        result = self.read_relevant_posts(query, limit)
+        return list(result.posts) if result.complete is True else []
 
     def get_authenticated_user_id_cached(self) -> Optional[str]:
         """Wrapper con cache in memoria per evitare letture ripetute inutili"""

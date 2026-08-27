@@ -405,18 +405,27 @@ class GrowthDigestService:
                 break
         return rows
 
-    def _read_posts(self, observed_on: str, now: datetime) -> Optional[List[Dict]]:
+    def _fail_claims(self, observed_on: str, tokens: Dict[str, str]) -> None:
+        for query_key, token in tokens.items():
+            self.db.fail_growth_read_query(observed_on, query_key, token)
+
+    def _read_posts(
+        self, observed_on: str, now: datetime
+    ) -> Optional[Tuple[List[Dict], Dict[str, str]]]:
         rows = []
+        claim_tokens = {}
         for query_key, query in POST_QUERY_PORTFOLIO[: self.post_query_budget]:
-            claim = self.db.claim_growth_read_query(
+            claim, claim_token = self.db.claim_growth_read_query(
                 observed_on,
                 query_key,
                 now,
                 now + self.claim_ttl,
                 budget=self.post_query_budget,
             )
-            if claim != "claimed":
+            if claim != "claimed" or claim_token is None:
+                self._fail_claims(observed_on, claim_tokens)
                 return None
+            claim_tokens[query_key] = claim_token
             try:
                 reader = getattr(self.x, "read_relevant_posts", None)
                 if callable(reader):
@@ -424,25 +433,23 @@ class GrowthDigestService:
                     page_rows = getattr(result, "posts", None)
                     complete = getattr(result, "complete", None)
                     if complete is not True or not isinstance(page_rows, (list, tuple)):
-                        self.db.fail_growth_read_query(observed_on, query_key)
+                        self._fail_claims(observed_on, claim_tokens)
                         return None
                     page_rows = list(page_rows)
                 else:
                     page_rows = self.x.search_relevant_posts(query, limit=25)
                     if not isinstance(page_rows, list):
-                        self.db.fail_growth_read_query(observed_on, query_key)
+                        self._fail_claims(observed_on, claim_tokens)
                         return None
             except Exception as error:
                 logger.warning(
                     "growth_digest_post_read_failed error_type=%s",
                     type(error).__name__,
                 )
-                self.db.fail_growth_read_query(observed_on, query_key)
-                return None
-            if not self.db.complete_growth_read_query(observed_on, query_key, now):
+                self._fail_claims(observed_on, claim_tokens)
                 return None
             rows.extend(page_rows)
-        return rows
+        return rows, claim_tokens
 
     def build(self, now: datetime) -> Dict:
         if (
@@ -460,7 +467,7 @@ class GrowthDigestService:
                 if existing
                 else self._empty(observed_on, "invalid_persisted")
             )
-        lease = self.db.claim_growth_digest_build(
+        lease, builder_token = self.db.claim_growth_digest_build(
             observed_on, current, current + self.claim_ttl
         )
         if lease == "busy":
@@ -468,7 +475,7 @@ class GrowthDigestService:
             if persisted:
                 return self._with_outcome(persisted, "existing")
             return self._empty(observed_on, "incomplete")
-        if lease != "claimed":
+        if lease != "claimed" or builder_token is None:
             persisted = self.db.get_growth_digest(observed_on)
             if persisted:
                 return self._with_outcome(persisted, "existing")
@@ -480,12 +487,17 @@ class GrowthDigestService:
                 "growth_digest_accounts_read_failed error_type=%s",
                 type(error).__name__,
             )
-            self.db.fail_growth_read_query(observed_on, "__digest_build__")
+            self.db.fail_growth_read_query(
+                observed_on, "__digest_build__", builder_token
+            )
             return self._empty(observed_on, "incomplete")
-        post_candidates = self._read_posts(observed_on, current)
-        if post_candidates is None:
-            self.db.fail_growth_read_query(observed_on, "__digest_build__")
+        post_read = self._read_posts(observed_on, current)
+        if post_read is None:
+            self.db.fail_growth_read_query(
+                observed_on, "__digest_build__", builder_token
+            )
             return self._empty(observed_on, "incomplete")
+        post_candidates, query_claim_tokens = post_read
         account_rows = self._account_rows(candidates, current)
         post_rows = self._post_rows(post_candidates, current)
         reevaluate_rows = self._reevaluation_rows(
@@ -501,6 +513,8 @@ class GrowthDigestService:
                 post_rows=post_rows,
                 reevaluate_rows=reevaluate_rows,
                 completed_at=current.isoformat(),
+                builder_token=builder_token,
+                query_claim_tokens=query_claim_tokens,
             )
         except Exception as error:
             logger.warning(
@@ -509,17 +523,19 @@ class GrowthDigestService:
             )
             persisted = self.db.get_growth_digest(observed_on)
             if persisted:
-                self.db.complete_growth_read_query(
-                    observed_on, "__digest_build__", current
-                )
                 return self._with_outcome(persisted, "existing")
-            self.db.fail_growth_read_query(observed_on, "__digest_build__")
+            self._fail_claims(observed_on, query_claim_tokens)
+            self.db.fail_growth_read_query(
+                observed_on, "__digest_build__", builder_token
+            )
             return self._empty(observed_on, "incomplete")
         if not persisted:
-            self.db.fail_growth_read_query(observed_on, "__digest_build__")
+            self._fail_claims(observed_on, query_claim_tokens)
+            self.db.fail_growth_read_query(
+                observed_on, "__digest_build__", builder_token
+            )
             return self._empty(
                 observed_on,
                 "invalid_persisted" if outcome == "invalid_existing" else "incomplete",
             )
-        self.db.complete_growth_read_query(observed_on, "__digest_build__", current)
         return self._with_outcome(persisted, outcome)

@@ -11,6 +11,132 @@ from modules.twitter_client import TwitterClient
 from tests.fakes import FakeXClient
 
 
+_PROHIBITED_X_CALLS = {
+    "like_tweet", "favorite_tweet", "follow_user", "unfollow_user",
+    "create_friendship", "destroy_friendship", "reply_to_tweet",
+    "retweet", "repost", "send_dm", "send_direct_message",
+    "bookmark_tweet", "engage", "write",
+}
+_APPROVED_X_CALLS = {
+    "post_tweet": {"modules/publisher.py"},
+    "create_tweet": {"modules/twitter_client.py"},
+    "_upload_media": {"modules/twitter_client.py"},
+    "media_upload": {"modules/twitter_client.py"},
+}
+_GENERIC_X_BOUNDARIES = {
+    "x", "x_client", "twitter", "twitter_client", "client", "_client",
+    "api", "_api",
+}
+
+
+def _attribute_parts(node):
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, ast.Attribute):
+        parts = _attribute_parts(node.value)
+        return [*parts, node.attr] if parts is not None else None
+    return None
+
+
+def _is_generic_x_boundary(node, receiver_aliases=frozenset()):
+    parts = _attribute_parts(node)
+    return bool(
+        parts
+        and (
+            parts[-1] in receiver_aliases
+            or parts[-1].lower() in _GENERIC_X_BOUNDARIES
+        )
+    )
+
+
+def _getattr_capability(node, receiver_aliases=frozenset()):
+    if (
+        not isinstance(node, ast.Call)
+        or not isinstance(node.func, ast.Name)
+        or node.func.id != "getattr"
+        or len(node.args) < 2
+        or not _is_generic_x_boundary(node.args[0], receiver_aliases)
+    ):
+        return None
+    method = node.args[1]
+    if isinstance(method, ast.Constant) and type(method.value) is str:
+        return method.value, True, False
+    return "<dynamic>", True, True
+
+
+def _capability_reference(node, aliases, receiver_aliases=frozenset()):
+    if isinstance(node, ast.Attribute):
+        return (
+            node.attr,
+            _is_generic_x_boundary(node.value, receiver_aliases),
+            False,
+        )
+    dynamic = _getattr_capability(node, receiver_aliases)
+    if dynamic is not None:
+        return dynamic
+    if isinstance(node, ast.Name):
+        return aliases.get(node.id)
+    return None
+
+
+def _scan_x_calls(source, relative):
+    """Find invoked X writes, including aliased and dynamic generic calls."""
+    tree = ast.parse(source, filename=relative)
+    receiver_aliases = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not _is_generic_x_boundary(value, receiver_aliases):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in receiver_aliases:
+                    receiver_aliases.add(target.id)
+                    changed = True
+    aliases = {}
+    for node in ast.walk(tree):
+        value = None
+        targets = []
+        if isinstance(node, ast.Assign):
+            value = node.value
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            value = node.value
+            targets = [node.target]
+        capability = _capability_reference(value, aliases, receiver_aliases)
+        if capability is None:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                aliases[target.id] = capability
+
+    found = {name: set() for name in _APPROVED_X_CALLS}
+    violations = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        dynamic_getattr = _getattr_capability(node, receiver_aliases)
+        if dynamic_getattr is not None and dynamic_getattr[2]:
+            violations.append((relative, node.lineno, "dynamic_getattr"))
+        capability = _capability_reference(node.func, aliases, receiver_aliases)
+        if capability is None:
+            continue
+        method, generic_x_boundary, dynamic = capability
+        if dynamic:
+            violations.append((relative, node.lineno, "dynamic_call"))
+        elif method in _PROHIBITED_X_CALLS and (
+            method != "write" or generic_x_boundary
+        ):
+            violations.append((relative, node.lineno, method))
+        if method in _APPROVED_X_CALLS:
+            found[method].add(relative)
+    return violations, found
+
+
 def _set_valid_runtime_environment(monkeypatch):
     for name in (
         "TWITTER_API_KEY",
@@ -38,6 +164,7 @@ def test_twitter_client_exposes_only_approved_post_write():
         "reply_to_tweet",
         "retweet",
         "send_dm",
+        "write",
     }
     assert prohibited.isdisjoint(set(dir(TwitterClient)))
     assert hasattr(TwitterClient, "post_tweet")
@@ -191,29 +318,37 @@ def test_runtime_x_fake_raises_if_any_engagement_write_is_touched(method_name):
 def test_production_ast_allows_only_the_approved_x_publication_boundary():
     root = Path(__file__).resolve().parents[1]
     production_files = [root / "main.py", *sorted((root / "modules").glob("*.py"))]
-    prohibited = {
-        "like_tweet", "favorite_tweet", "follow_user", "unfollow_user",
-        "create_friendship", "destroy_friendship", "reply_to_tweet",
-        "retweet", "repost", "send_dm", "send_direct_message",
-        "bookmark_tweet", "engage",
-    }
-    approved_locations = {
-        "post_tweet": {"modules/publisher.py"},
-        "create_tweet": {"modules/twitter_client.py"},
-        "_upload_media": {"modules/twitter_client.py"},
-        "media_upload": {"modules/twitter_client.py"},
-    }
-    found = {name: set() for name in approved_locations}
+    found = {name: set() for name in _APPROVED_X_CALLS}
     violations = []
     for path in production_files:
         relative = path.relative_to(root).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Attribute):
-                continue
-            if node.attr in prohibited:
-                violations.append((relative, node.lineno, node.attr))
-            if node.attr in approved_locations:
-                found[node.attr].add(relative)
+        file_violations, file_found = _scan_x_calls(
+            path.read_text(encoding="utf-8"), relative
+        )
+        violations.extend(file_violations)
+        for method, locations in file_found.items():
+            found[method].update(locations)
     assert violations == []
-    assert found == approved_locations
+    assert found == _APPROVED_X_CALLS
+
+
+def test_x_write_static_scan_rejects_generic_and_dynamic_mutations():
+    mutations = {
+        "direct": "client.write('target')",
+        "aliased": "operation = client.write\noperation('target')",
+        "dynamic": "operation = getattr(x_client, method_name)\noperation('target')",
+        "receiver_alias": "x_alias = client\nx_alias.write('target')",
+        "dynamic_receiver_alias": (
+            "x_alias = client\n"
+            "operation = getattr(x_alias, method_name)\n"
+            "operation('target')"
+        ),
+    }
+
+    for name, source in mutations.items():
+        violations, _found = _scan_x_calls(source, f"mutation-{name}.py")
+        assert violations, name
+
+    safe_source = "destination_file.write(b'data')\nos.write(fd, b'data')"
+    violations, _found = _scan_x_calls(safe_source, "safe-files.py")
+    assert violations == []

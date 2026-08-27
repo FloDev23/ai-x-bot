@@ -54,9 +54,7 @@ def _post(post_id="9001", author_id="101", **overrides):
             "impression_count": 5000,
         },
         "referenced_tweets": [],
-        "entities": {
-            "urls": [{"expanded_url": "https://example.com/gym-capacity"}],
-        },
+        "entities": {},
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -151,7 +149,7 @@ def test_relevant_post_read_isolates_malformed_and_unsafe_records():
     ]
 
 
-def test_relevant_post_read_paginates_deduplicates_and_stops_repeated_token():
+def test_relevant_post_read_marks_repeated_token_partial_and_list_fails_closed():
     class Backend:
         def __init__(self):
             self.tokens = []
@@ -172,10 +170,12 @@ def test_relevant_post_read_paginates_deduplicates_and_stops_repeated_token():
             )
 
     backend = Backend()
-    rows = _client(backend).search_relevant_posts("capacity", limit=30)
+    typed = _client(backend).read_relevant_posts("capacity", limit=30)
 
-    assert [row["id"] for row in rows] == ["20", "21"]
+    assert [row["id"] for row in typed.posts] == ["20", "21"]
+    assert typed.complete is False
     assert backend.tokens == [None, "repeat"]
+    assert _client(Backend()).search_relevant_posts("capacity", limit=30) == []
 
 
 def test_relevant_post_read_keeps_safe_partial_page_and_redacts_exception(caplog):
@@ -193,9 +193,11 @@ def test_relevant_post_read_keeps_safe_partial_page_and_redacts_exception(caplog
                 )
             raise RuntimeError("Bearer secret-payload")
 
-    rows = _client(Backend()).search_relevant_posts("pilates", limit=30)
+    typed = _client(Backend()).read_relevant_posts("pilates", limit=30)
 
-    assert [row["id"] for row in rows] == ["30"]
+    assert [row["id"] for row in typed.posts] == ["30"]
+    assert typed.complete is False
+    assert _client(Backend()).search_relevant_posts("pilates", limit=30) == []
     assert "secret-payload" not in caplog.text
     assert "error_type=RuntimeError" in caplog.text
 
@@ -230,6 +232,124 @@ def test_relevant_post_read_isolates_an_author_whose_properties_raise():
 
     assert [row["id"] for row in result.posts] == ["41"]
     assert result.complete is True
+
+
+def test_relevant_post_rejects_unrelated_safe_entity_for_bad_text_url():
+    text = "Gym owners should not trust https://bad.test for class capacity."
+    safe_token = "https://t.co/safe"
+
+    class Backend:
+        def search_recent_tweets(self, **_kwargs):
+            return SimpleNamespace(
+                data=[_post(
+                    "42",
+                    text=text,
+                    entities={"urls": [{
+                        "start": 0,
+                        "end": len(safe_token),
+                        "url": safe_token,
+                        "expanded_url": "https://example.com/safe",
+                    }]},
+                )],
+                includes={"users": [_author()]},
+                meta={},
+            )
+
+    assert _client(Backend()).search_relevant_posts("gym owner") == []
+
+
+def test_relevant_post_accepts_exact_safe_url_entity_correlation():
+    raw_url = "https://t.co/capacity"
+    text = f"Gym owners can fill class capacity: {raw_url}"
+    start = text.index(raw_url)
+
+    class Backend:
+        def search_recent_tweets(self, **_kwargs):
+            return SimpleNamespace(
+                data=[_post(
+                    "43",
+                    text=text,
+                    entities={"urls": [{
+                        "start": start,
+                        "end": start + len(raw_url),
+                        "url": raw_url,
+                        "expanded_url": "https://flexdropin.com/gyms",
+                    }]},
+                )],
+                includes={"users": [_author()]},
+                meta={},
+            )
+
+    result = _client(Backend()).read_relevant_posts("gym owner")
+
+    assert result.complete is True
+    assert [row["id"] for row in result.posts] == ["43"]
+
+
+@pytest.mark.parametrize(
+    "entity",
+    [
+        {"start": True, "end": 22, "url": "https://t.co/capacity",
+         "expanded_url": "https://flexdropin.com/gyms"},
+        {"start": 0, "end": 4, "url": "https://t.co/capacity",
+         "expanded_url": "https://flexdropin.com/gyms"},
+        {"start": 36, "end": 57, "url": "https://t.co/different",
+         "expanded_url": "https://flexdropin.com/gyms"},
+    ],
+)
+def test_relevant_post_rejects_malformed_url_entity_spans(entity):
+    text = "Gym owners can fill class capacity: https://t.co/capacity"
+
+    class Backend:
+        def search_recent_tweets(self, **_kwargs):
+            return SimpleNamespace(
+                data=[_post("44", text=text, entities={"urls": [entity]})],
+                includes={"users": [_author()]},
+                meta={},
+            )
+
+    assert _client(Backend()).search_relevant_posts("gym owner") == []
+
+
+def test_relevant_post_rejects_trailing_dot_local_hostname():
+    raw_url = "https://localhost./capacity"
+    text = f"Gym capacity details: {raw_url}"
+    start = text.index(raw_url)
+
+    class Backend:
+        def search_recent_tweets(self, **_kwargs):
+            return SimpleNamespace(
+                data=[_post(
+                    "45",
+                    text=text,
+                    entities={"urls": [{
+                        "start": start,
+                        "end": start + len(raw_url),
+                        "url": raw_url,
+                        "expanded_url": raw_url,
+                    }]},
+                )],
+                includes={"users": [_author()]},
+                meta={},
+            )
+
+    assert _client(Backend()).search_relevant_posts("gym owner") == []
+
+
+def test_relevant_post_requires_entities_for_mixed_case_url_scheme():
+    class Backend:
+        def search_recent_tweets(self, **_kwargs):
+            return SimpleNamespace(
+                data=[_post(
+                    "46",
+                    text="Gym capacity: HTTPS://example.com/capacity",
+                    entities=None,
+                )],
+                includes={"users": [_author()]},
+                meta={},
+            )
+
+    assert _client(Backend()).search_relevant_posts("gym owner") == []
 
 
 def _account_row(object_id="101", username="gymowner"):
@@ -283,16 +403,242 @@ def _post_row(object_id="9001", username="gymowner"):
     }
 
 
-def test_growth_schema_and_atomic_persist_are_restart_safe(tmp_path):
-    path = str(tmp_path / "digest.db")
-    database = Database(path)
+def _claim_digest_bundle(database, observed_on, claimed_at):
+    builder_state, builder_token = database.claim_growth_digest_build(
+        observed_on, claimed_at, claimed_at + timedelta(minutes=5)
+    )
+    assert builder_state == "claimed"
+    query_tokens = {}
+    for key in ("gym_capacity_dropin", "pilates_martial_operations"):
+        state, token = database.claim_growth_read_query(
+            observed_on,
+            key,
+            claimed_at,
+            claimed_at + timedelta(minutes=5),
+            budget=2,
+        )
+        assert state == "claimed"
+        query_tokens[key] = token
+    return builder_token, query_tokens
+
+
+def test_stale_owners_are_fenced_and_claims_complete_with_digest_commit(tmp_path):
+    database = Database(str(tmp_path / "fencing.db"))
+    expires = NOW + timedelta(seconds=1)
+    builder_state, old_builder = database.claim_growth_digest_build(
+        "2026-08-26", NOW, expires
+    )
+    query_state, old_query = database.claim_growth_read_query(
+        "2026-08-26", "gym_capacity_dropin", NOW, expires, budget=2
+    )
+    assert (builder_state, query_state) == ("claimed", "claimed")
+    reclaimed_at = NOW + timedelta(seconds=2)
+    builder_state, new_builder = database.claim_growth_digest_build(
+        "2026-08-26", reclaimed_at, reclaimed_at + timedelta(minutes=5)
+    )
+    query_state, new_query = database.claim_growth_read_query(
+        "2026-08-26", "gym_capacity_dropin", reclaimed_at,
+        reclaimed_at + timedelta(minutes=5), budget=2
+    )
+    second_state, second_query = database.claim_growth_read_query(
+        "2026-08-26", "pilates_martial_operations", reclaimed_at,
+        reclaimed_at + timedelta(minutes=5), budget=2
+    )
+    assert old_builder != new_builder
+    assert old_query != new_query
+    assert (builder_state, query_state, second_state) == (
+        "claimed", "claimed", "claimed"
+    )
+    lost, lost_outcome = database.persist_growth_digest_atomic(
+        observed_on="2026-08-26",
+        account_rows=[_account_row()],
+        post_rows=[_post_row()],
+        reevaluate_rows=[],
+        completed_at=reclaimed_at.isoformat(),
+        builder_token=old_builder,
+        query_claim_tokens={
+            "gym_capacity_dropin": old_query,
+            "pilates_martial_operations": second_query,
+        },
+    )
+    assert (lost, lost_outcome) == ({}, "lost_claim")
+    with database._conn() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM growth_digest_runs").fetchone()[0] == 0
+        assert {
+            row[0] for row in connection.execute(
+                "SELECT state FROM growth_read_claims"
+            ).fetchall()
+        } == {"claimed"}
 
     digest, outcome = database.persist_growth_digest_atomic(
         observed_on="2026-08-26",
         account_rows=[_account_row()],
         post_rows=[_post_row()],
         reevaluate_rows=[],
+        completed_at=reclaimed_at.isoformat(),
+        builder_token=new_builder,
+        query_claim_tokens={
+            "gym_capacity_dropin": new_query,
+            "pilates_martial_operations": second_query,
+        },
+    )
+    assert outcome == "created"
+    assert len(digest["posts"]) == 1
+    with database._conn() as connection:
+        states = connection.execute(
+            "SELECT query_key, state FROM growth_read_claims"
+        ).fetchall()
+        assert {row["state"] for row in states} == {"completed"}
+        assert len(states) == 3
+
+
+def test_final_transaction_rechecks_cooldown_across_rome_midnight(tmp_path):
+    path = str(tmp_path / "midnight-cooldown.db")
+    Database(path)
+    instants = [
+        datetime(2026, 8, 26, 21, 59, tzinfo=timezone.utc),
+        datetime(2026, 8, 26, 22, 1, tzinfo=timezone.utc),
+    ]
+    days = ["2026-08-26", "2026-08-27"]
+    bundles = [
+        _claim_digest_bundle(Database(path), day, instant)
+        for day, instant in zip(days, instants)
+    ]
+    barrier = ThreadPoolExecutor(max_workers=2)
+
+    def persist(index):
+        builder_token, query_tokens = bundles[index]
+        post_row = _post_row()
+        account_row = _account_row()
+        cooldown = (instants[index] + timedelta(days=30)).isoformat()
+        post_row["cooldown_until"] = cooldown
+        account_row["cooldown_until"] = cooldown
+        return Database(path).persist_growth_digest_atomic(
+            observed_on=days[index],
+            account_rows=[account_row],
+            post_rows=[post_row],
+            reevaluate_rows=[],
+            completed_at=instants[index].isoformat(),
+            builder_token=builder_token,
+            query_claim_tokens=query_tokens,
+        )
+
+    results = list(barrier.map(persist, range(2)))
+    barrier.shutdown()
+
+    assert [outcome for _digest, outcome in results] == ["created", "created"]
+    assert sum(len(digest["accounts"]) for digest, _outcome in results) == 1
+    assert sum(len(digest["posts"]) for digest, _outcome in results) == 1
+    with Database(path)._conn() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM growth_suggestions "
+            "WHERE kind = 'account' AND object_id = '101'"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM growth_suggestions "
+            "WHERE kind = 'post' AND object_id = '9001'"
+        ).fetchone()[0] == 1
+
+
+def test_replay_preserves_persisted_post_rank_for_equal_scores(tmp_path):
+    path = str(tmp_path / "rank.db")
+    database = Database(path)
+    builder_token, query_tokens = _claim_digest_bundle(
+        database, "2026-08-26", NOW
+    )
+    newer = _post_row("9999")
+    older = _post_row("1001")
+    newer["score"] = older["score"] = 80
+    newer["payload"]["created_at"] = (NOW - timedelta(hours=1)).isoformat()
+    older["payload"]["created_at"] = (NOW - timedelta(hours=3)).isoformat()
+
+    created, outcome = database.persist_growth_digest_atomic(
+        observed_on="2026-08-26",
+        account_rows=[],
+        post_rows=[newer, older],
+        reevaluate_rows=[],
         completed_at=NOW.isoformat(),
+        builder_token=builder_token,
+        query_claim_tokens=query_tokens,
+    )
+    replay = Database(path).get_growth_digest("2026-08-26")
+
+    assert outcome == "created"
+    assert [row["object_id"] for row in created["posts"]] == ["9999", "1001"]
+    assert replay == created
+
+
+def test_rank_migration_preserves_legacy_insertion_order(tmp_path):
+    path = str(tmp_path / "legacy-rank.db")
+    rows = [_post_row("9999"), _post_row("1001")]
+    with sqlite3.connect(path) as connection:
+        connection.execute("""
+            CREATE TABLE growth_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                observed_on TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                reason_codes_json TEXT NOT NULL,
+                suggested_at TEXT NOT NULL,
+                decision TEXT NOT NULL DEFAULT 'new',
+                decision_at TEXT,
+                cooldown_until TEXT,
+                UNIQUE(observed_on, kind, object_id)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE growth_digest_runs (
+                observed_on TEXT PRIMARY KEY,
+                completed_at TEXT NOT NULL,
+                summary_json TEXT NOT NULL
+            )
+        """)
+        for row in rows:
+            connection.execute("""
+                INSERT INTO growth_suggestions (
+                    observed_on, kind, object_id, username, payload_json,
+                    score, reason_codes_json, suggested_at, cooldown_until
+                ) VALUES (?, 'post', ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                "2026-08-26", row["object_id"], row["username"],
+                json.dumps(row["payload"]), row["score"],
+                json.dumps(row["reason_codes"]), NOW.isoformat(),
+                row["cooldown_until"],
+            ))
+        connection.execute(
+            "INSERT INTO growth_digest_runs VALUES (?, ?, ?)",
+            (
+                "2026-08-26", NOW.isoformat(),
+                json.dumps({
+                    "observed_on": "2026-08-26",
+                    "counts": {"account": 0, "post": 2, "reevaluate": 0},
+                }),
+            ),
+        )
+
+    replay = Database(path).get_growth_digest("2026-08-26")
+
+    assert [row["object_id"] for row in replay["posts"]] == ["9999", "1001"]
+
+
+def test_growth_schema_and_atomic_persist_are_restart_safe(tmp_path):
+    path = str(tmp_path / "digest.db")
+    database = Database(path)
+
+    builder_token, query_tokens = _claim_digest_bundle(
+        database, "2026-08-26", NOW
+    )
+    digest, outcome = database.persist_growth_digest_atomic(
+        observed_on="2026-08-26",
+        account_rows=[_account_row()],
+        post_rows=[_post_row()],
+        reevaluate_rows=[],
+        completed_at=NOW.isoformat(),
+        builder_token=builder_token,
+        query_claim_tokens=query_tokens,
     )
     replay, replay_outcome = Database(path).persist_growth_digest_atomic(
         observed_on="2026-08-26",
@@ -310,7 +656,10 @@ def test_growth_schema_and_atomic_persist_are_restart_safe(tmp_path):
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM growth_digest_runs").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM growth_suggestions").fetchone()[0] == 2
-        assert connection.execute("SELECT COUNT(*) FROM growth_read_claims").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM growth_read_claims").fetchone()[0] == 3
+        assert connection.execute(
+            "SELECT COUNT(*) FROM growth_read_claims WHERE state = 'completed'"
+        ).fetchone()[0] == 3
 
 
 def test_growth_persist_rejects_open_or_secret_bearing_payloads(tmp_path):
@@ -336,6 +685,9 @@ def test_growth_persist_rejects_open_or_secret_bearing_payloads(tmp_path):
 def test_growth_persist_rolls_back_all_rows_and_retries_after_write_error(tmp_path):
     path = str(tmp_path / "rollback.db")
     database = Database(path)
+    builder_token, query_tokens = _claim_digest_bundle(
+        database, "2026-08-26", NOW
+    )
     with database._conn() as connection:
         connection.execute("""
             CREATE TRIGGER fail_post BEFORE INSERT ON growth_suggestions
@@ -348,6 +700,8 @@ def test_growth_persist_rolls_back_all_rows_and_retries_after_write_error(tmp_pa
             post_rows=[_post_row()],
             reevaluate_rows=[],
             completed_at=NOW.isoformat(),
+            builder_token=builder_token,
+            query_claim_tokens=query_tokens,
         )
     with database._conn() as connection:
         assert connection.execute("SELECT COUNT(*) FROM growth_suggestions").fetchone()[0] == 0
@@ -360,6 +714,8 @@ def test_growth_persist_rolls_back_all_rows_and_retries_after_write_error(tmp_pa
         post_rows=[_post_row()],
         reevaluate_rows=[],
         completed_at=NOW.isoformat(),
+        builder_token=builder_token,
+        query_claim_tokens=query_tokens,
     )
     assert outcome == "created"
     assert len(digest["accounts"]) == len(digest["posts"]) == 1
@@ -367,7 +723,10 @@ def test_growth_persist_rolls_back_all_rows_and_retries_after_write_error(tmp_pa
 
 def test_growth_persist_has_one_cross_connection_winner(tmp_path):
     path = str(tmp_path / "race.db")
-    Database(path)
+    database = Database(path)
+    builder_token, query_tokens = _claim_digest_bundle(
+        database, "2026-08-26", NOW
+    )
 
     def persist():
         return Database(path).persist_growth_digest_atomic(
@@ -376,6 +735,8 @@ def test_growth_persist_has_one_cross_connection_winner(tmp_path):
             post_rows=[_post_row()],
             reevaluate_rows=[],
             completed_at=NOW.isoformat(),
+            builder_token=builder_token,
+            query_claim_tokens=query_tokens,
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -390,35 +751,36 @@ def test_read_claim_budget_completion_and_stale_recovery_survive_restart(tmp_pat
     database = Database(path)
     expires = NOW + timedelta(minutes=5)
 
-    assert database.claim_growth_read_query(
+    assert not hasattr(database, "complete_growth_read_query")
+
+    first_state, first_token = database.claim_growth_read_query(
         "2026-08-26", "gym", NOW, expires, budget=2
-    ) == "claimed"
+    )
+    assert first_state == "claimed"
+    assert first_token
     assert Database(path).claim_growth_read_query(
         "2026-08-26", "gym", NOW + timedelta(minutes=1), expires, budget=2
-    ) == "busy"
-    assert database.complete_growth_read_query("2026-08-26", "gym", NOW) is True
-    assert Database(path).claim_growth_read_query(
-        "2026-08-26", "gym", NOW + timedelta(minutes=6),
-        NOW + timedelta(minutes=11), budget=2
-    ) == "completed"
+    ) == ("busy", None)
     assert database.claim_growth_read_query(
         "2026-08-26", "pilates", NOW, expires, budget=2
-    ) == "claimed"
+    )[0] == "claimed"
     assert database.claim_growth_read_query(
         "2026-08-26", "martial", NOW, expires, budget=2
-    ) == "budget_exhausted"
+    ) == ("budget_exhausted", None)
 
     stale_day = "2026-08-27"
-    assert database.claim_growth_read_query(
+    first_stale_state, first_stale_token = database.claim_growth_read_query(
         stale_day, "gym", NOW, expires, budget=2
-    ) == "claimed"
-    assert Database(path).claim_growth_read_query(
+    )
+    second_stale_state, second_stale_token = Database(path).claim_growth_read_query(
         stale_day,
         "gym",
         NOW + timedelta(minutes=6),
         NOW + timedelta(minutes=11),
         budget=2,
-    ) == "claimed"
+    )
+    assert first_stale_state == second_stale_state == "claimed"
+    assert first_stale_token != second_stale_token
 
 
 def test_reevaluation_requires_complete_absent_snapshot_after_fourteen_days(tmp_path):
@@ -775,12 +1137,17 @@ def test_service_fails_closed_on_malformed_completed_run_without_reads(tmp_path)
 def test_service_fails_closed_on_open_persisted_payload_without_leaking_it(tmp_path):
     path = str(tmp_path / "malformed-payload.db")
     database = Database(path)
+    builder_token, query_tokens = _claim_digest_bundle(
+        database, "2026-08-26", NOW
+    )
     database.persist_growth_digest_atomic(
         observed_on="2026-08-26",
         account_rows=[],
         post_rows=[_post_row()],
         reevaluate_rows=[],
         completed_at=NOW.isoformat(),
+        builder_token=builder_token,
+        query_claim_tokens=query_tokens,
     )
     with database._conn() as connection:
         payload = json.loads(connection.execute(
@@ -820,16 +1187,26 @@ def _process_claim_then_crash(path):
     database.claim_growth_digest_build(
         "2026-08-26", NOW, NOW + timedelta(seconds=1)
     )
+    for query_key in ("gym_capacity_dropin", "pilates_martial_operations"):
+        database.claim_growth_read_query(
+            "2026-08-26", query_key, NOW, NOW + timedelta(seconds=1), budget=2
+        )
     os._exit(23)
 
 
 def _process_commit_then_crash(path):
-    Database(path).persist_growth_digest_atomic(
+    database = Database(path)
+    builder_token, query_tokens = _claim_digest_bundle(
+        database, "2026-08-26", NOW
+    )
+    database.persist_growth_digest_atomic(
         observed_on="2026-08-26",
         account_rows=[_account_row()],
         post_rows=[_post_row()],
         reevaluate_rows=[],
         completed_at=NOW.isoformat(),
+        builder_token=builder_token,
+        query_claim_tokens=query_tokens,
     )
     os._exit(29)
 
@@ -879,6 +1256,10 @@ def test_hard_crash_before_commit_recovers_only_after_lease_expiry(tmp_path):
 
     assert before_expiry["outcome"] == "incomplete"
     assert recovered["outcome"] == "created"
+    with Database(path)._conn() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM growth_read_claims WHERE state = 'completed'"
+        ).fetchone()[0] == 3
 
 
 def test_hard_crash_after_commit_replays_without_any_read(tmp_path):
