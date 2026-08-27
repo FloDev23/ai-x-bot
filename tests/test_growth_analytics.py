@@ -1276,12 +1276,11 @@ def test_stats_growth_and_weekly_push_share_the_weekly_formatter(tmp_path):
     stats_text = telegram.messages[-1][1]
     assert controller.push_weekly_report(NOW) == "weekly_report_sent"
     push_text = telegram.messages[-1][1]
-    assert controller._growth("42") == "growth_empty"
-    growth_text = telegram.messages[-2][1]
+    assert controller._growth("42") == "growth_digest_empty"
 
-    assert stats_text == push_text == growth_text
+    assert stats_text == push_text
     assert stats_text == controller.format_weekly_report(report)
-    assert telegram.messages[-1][1] == "Nessun candidato growth disponibile."
+    assert telegram.messages[-1][1] == "Nessun nuovo suggerimento."
     assert all(message[2]["parse_mode"] is None for message in telegram.messages)
 
 

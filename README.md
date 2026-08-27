@@ -40,7 +40,7 @@ automaticamente l'ora legale statunitense. Il processo registra soltanto:
 - retry delle traduzioni italiane ogni 30 minuti;
 - creazione/riconciliazione dei piani USA ogni 15 minuti;
 - controllo dei piani dovuti ogni 5 minuti;
-- discovery growth read-only alle 11:00;
+- digest growth read-only alle 09:00 `Europe/Rome`;
 - snapshot follower alle 23:15;
 - metriche dei post propri alle 23:30;
 - report growth Telegram il lunedì alle 09:00.
@@ -68,12 +68,32 @@ Telegram long polling gira in un thread daemon nominato. Scheduler e polling con
 8. Con `DRY_RUN=true` il piano diventa `simulated`, la bozza resta approvata e
    non viene eseguita alcuna chiamata di scrittura X.
 
-I comandi Telegram includono `/status`, `/posts`, `/growth`, `/stats`, `/ideas`,
-`/newpost`, `/pause`, `/resume`, `/errors` e `/help`. `/newpost` conserva il
-testo inglese esatto, fa scegliere categoria, 1–3 fonti e un media facoltativo,
-poi prepara o acquisisce la traduzione italiana prima di creare una sola bozza
-in revisione. Il refresh riuscito o senza novità è silenzioso; `/errors` mostra
-solo codici di errore sistemici sanitizzati.
+I comandi Telegram includono `/status`, `/posts`, `/media`, `/growth`, `/stats`,
+`/ideas`, `/newpost`, `/pause`, `/resume`, `/errors` e `/help`.
+
+`/newpost` conserva il testo inglese esatto dell'operatore, fa scegliere
+categoria, zero o fino a tre fonti opzionali e un media opzionale sfogliabile da
+una libreria verificata; la copia è immediatamente approvata senza passare per
+generazione, fact-check, scoring o novità. La traduzione italiana è privata e
+solo consultiva: non blocca né rimuove il post dalla coda.
+
+Le bozze generate automaticamente richiedono ancora traduzione pronta, approvazione
+Telegram e tutti i gate editoriali.
+
+`/posts` è un indice compatto (≤ 8 righe per pagina); il dettaglio si apre su
+richiesta con il testo inglese completo e la traduzione. La rimozione di un post
+approvato è recuperabile; la sua eliminazione definitiva non esiste.
+
+`/media` apre il browser media verificato: archivia, ripristina, o elimina
+definitivamente (doppia conferma, solo per media mai usato). Nessun percorso
+raw raggiunge mai Telegram.
+
+Il digest growth arriva alle 09:00 `Europe/Rome` con al massimo 5 account, 10
+post e 5 da rivalutare. Ogni azione di follow, unfollow o like resta manuale su
+X; il bot marca solo la decisione locale in SQLite.
+
+Il refresh riuscito o senza novità è silenzioso; `/errors` mostra solo codici di
+errore sistemici sanitizzati.
 
 ## Fonti automatiche
 

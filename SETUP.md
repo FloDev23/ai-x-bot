@@ -87,11 +87,16 @@ MEDIA_MATCH_THRESHOLD=80
 TELEGRAM_POLL_TIMEOUT=25
 TELEGRAM_MAX_IMAGE_BYTES=10485760
 TELEGRAM_MAX_VIDEO_BYTES=52428800
+GROWTH_DIGEST_TIME=09:00
+GROWTH_ACCOUNT_SUGGESTION_LIMIT=5
+GROWTH_POST_SUGGESTION_LIMIT=10
+GROWTH_POST_QUERY_BUDGET=2
+GROWTH_SUGGESTION_COOLDOWN_DAYS=30
+GROWTH_UNFOLLOW_REVIEW_DAYS=14
 GROWTH_SCORE_THRESHOLD=75
 GROWTH_QUERY_BUDGET=3
 GROWTH_NEW_PROFILE_BUDGET=25
 GROWTH_PROFILE_CACHE_DAYS=7
-GROWTH_DIGEST_LIMIT=5
 GROWTH_SEED_ACCOUNTS=
 NEWS_TRUSTED_DOMAINS=
 ```
@@ -131,17 +136,23 @@ python main.py
 Completare e annotare tutta la checklist:
 
 - [ ] autorizzazione Telegram: la chat corretta funziona e una chat diversa è ignorata;
-- [ ] inserimento e classificazione di una fonte testuale;
-- [ ] `/newpost`: testo inglese esatto, categoria, 1–3 fonti, media facoltativo
-      e traduzione manuale/automatica producono una sola card bilingue;
-- [ ] upload di una foto senza creazione automatica di una bozza;
-- [ ] upload di un video senza creazione automatica di una bozza;
-- [ ] ricezione della preview della bozza e del media abbinato;
-- [ ] ogni card mostra l'inglese completo e la traduzione italiana completa;
-- [ ] prova di tutti i pulsanti bozza: `Approva`, `Rigenera`, `Modifica`, `Scegli media`, `Solo testo`, `Posticipa` e `Scarta`;
+- [ ] inserimento e classificazione di una fonte testuale via `/ideas`;
+- [ ] `/newpost` senza fonte né media: testo inglese esatto → categoria → `Nessuna fonte` → `Nessun media` → post immediatamente approvato e advisory;
+- [ ] `/newpost` con fonte esistente: selezione da elenco compatto (#ID + tipo + trust);
+- [ ] `/newpost` con nuova fonte inline: `Aggiungi una fonte` → testo → tipo → URL/data → fonte atomica aggiunta e parent ripristinato;
+- [ ] `/newpost` con media: `Sfoglia media` → preview verificato → `Usa questo` → post approvato con media riservato;
+- [ ] `/newpost` source opzionale: annullare il child mantiene il parent invariato;
+- [ ] upload di una foto o un video senza creazione automatica di una bozza;
+- [ ] `/posts` mostra indice compatto (≤ 8 righe): nessun testo completo finché non si apre il dettaglio;
+- [ ] dettaglio post: inglese completo + italiano (o "non ancora disponibile"), pulsante `Rimuovi dalla coda` per post approvati;
+- [ ] rimozione con conferma: il post diventa `discarded`; `Ripristina` lo riporta a `approved/advisory`;
+- [ ] `/media`: browser verifica stream, mostra `Archivia`/`Ripristina`/`Elimina definitivamente` secondo lo stato;
+- [ ] eliminazione definitiva: doppia conferma obbligatoria, solo per media mai usato; media riservato o usato non è eliminabile;
+- [ ] digest growth alle 09:00 Rome: al massimo 5 account, 10 post, 5 da rivalutare; ogni azione (follow, like) resta manuale su X;
+- [ ] `Segnala come seguito` aggiorna solo SQLite; zero chiamate di engagement X;
+- [ ] pulsanti post/account del digest aprono URL X per azione manuale; nessun callback di follow/like sui post;
 - [ ] `/pause` impedisce la pubblicazione e `/resume` la riabilita;
 - [ ] reinvio dello stesso callback senza doppia mutazione;
-- [ ] digest growth con link/username e sole azioni manuali;
 - [ ] snapshot follower e report `/stats` coerenti;
 - [ ] riserva `approved/planned` pari a 14 e non più di 5 card in revisione;
 - [ ] due giornate `America/New_York` con almeno 2 piani `simulated` al giorno;

@@ -1288,3 +1288,257 @@ def test_falsey_component_override_is_preserved(
     agent = FlexDropinGrowthAgent(dependencies)
 
     assert getattr(agent, agent_attribute) is injected
+
+
+def test_operator_acceptance_story_dry_run(tmp_path):
+    """Acceptance story: manual posts, source intake, media browser, growth digest, dry-run simulation."""
+    from tests.test_growth_digest_telegram import _seed_digest
+    from modules.media_processor import MediaProcessor
+
+    _JPEG = b"\xff\xd8\xff\xe0" + b"acceptance-test-jpeg"
+    ACCEPTANCE_NOW = datetime(2026, 8, 26, 9, 0, tzinfo=ROME)
+
+    dependencies = dependency_bundle(tmp_path, clock=lambda: ACCEPTANCE_NOW)
+    agent = FlexDropinGrowthAgent(dependencies)
+    db = agent.db
+    api = dependencies["telegram_api"]
+    uids = iter(range(1, 10000))
+
+    def msg(text):
+        return {"update_id": next(uids), "message": {"chat": {"id": 42}, "text": text}}
+
+    def cb(data):
+        uid = next(uids)
+        return callback_update(uid, data)
+
+    def btn(message_tuple, label):
+        markup = message_tuple[2].get("reply_markup") or {"inline_keyboard": []}
+        for row in markup["inline_keyboard"]:
+            for b in row:
+                if b.get("text") == label:
+                    return b["callback_data"]
+        raise AssertionError(f"button {label!r} not found in: {message_tuple[1][:80]!r}")
+
+    def media_btn(label):
+        markup = api.media_messages[-1][3].get("reply_markup") or {"inline_keyboard": []}
+        for row in markup["inline_keyboard"]:
+            for b in row:
+                if b.get("text") == label:
+                    return b["callback_data"]
+        raise AssertionError(f"media button {label!r} not found")
+
+    def latest_btn(label):
+        """Check the most recently added text or media message for a button."""
+        if api.media_messages:
+            markup = api.media_messages[-1][3].get("reply_markup") or {"inline_keyboard": []}
+            for row in markup["inline_keyboard"]:
+                for b in row:
+                    if b.get("text") == label:
+                        return b["callback_data"]
+        if api.messages:
+            markup = api.messages[-1][2].get("reply_markup") or {"inline_keyboard": []}
+            for row in markup["inline_keyboard"]:
+                for b in row:
+                    if b.get("text") == label:
+                        return b["callback_data"]
+        return None
+
+    def make_media(name, description):
+        media_dir = tmp_path / f"media-stage-{name}"
+        media_dir.mkdir(mode=0o700)
+        staged = media_dir / f"{name}.jpg"
+        staged.write_bytes(_JPEG)
+        return MediaProcessor(db).process_new_file(
+            str(staged), f"{name}.jpg", "image/jpeg", len(_JPEG), description,
+        )
+
+    # ── Step 1: /newpost with no source, no media → approved/advisory ───────
+    TEXT_A = "Empty class spots are perishable inventory."
+    for upd in [
+        msg("/newpost"), msg(TEXT_A),
+        cb("manual:category:fitness_business_insight"),
+        cb("manual:sources:none"), cb("manual:media:none"),
+    ]:
+        assert agent.telegram_controller.process_update(upd) == "processed"
+
+    drafts = db.list_post_drafts(["approved"])
+    assert len(drafts) == 1
+    post_a_id = drafts[0]["id"]
+    queued_a = db.get_queue_draft(post_a_id)
+    assert queued_a["text"] == TEXT_A
+    assert queued_a["origin"] == "manual_operator"
+    assert queued_a["translation_policy"] == "advisory"
+    assert queued_a["source_ids"] == []
+    assert queued_a["status"] == "approved"
+    assert dependencies["x_client"].posts == []
+    assert dependencies["x_client"].engagement_writes == []
+
+    # ── Step 2: /newpost with nested founder_note source + media browser ─────
+    media_b = make_media("photo-b", "Studio B interior.")
+    media_b_id = media_b["id"]
+
+    TEXT_B = "Drop-in spots create revenue without long-term commitments."
+    for upd in [
+        msg("/newpost"), msg(TEXT_B),
+        cb("manual:category:gym_strategy"),
+        cb("manual:sources:add"),
+        msg("Studios report measurable drop-in growth."),
+        cb("manual:child:source:founder_note"),
+        cb("manual:sources_done"),
+        cb("manual:media:browse"),
+    ]:
+        assert agent.telegram_controller.process_update(upd) == "processed"
+
+    use_cb = media_btn("Usa questo")
+    assert agent.telegram_controller.process_update(cb(use_cb)) == "processed"
+
+    all_approved = db.list_post_drafts(["approved"])
+    assert len(all_approved) == 2
+    post_b = next(d for d in all_approved if d["id"] != post_a_id)
+    assert post_b["text"] == TEXT_B
+    assert post_b["media_id"] == media_b_id
+    assert db.get_media_by_id(media_b_id)["lifecycle_state"] == "reserved"
+
+    # ── Step 3: /posts compact index → first post detail with full English ───
+    assert agent.telegram_controller.process_update(msg("/posts")) == "processed"
+
+    index_msg = api.messages[-1]
+    parent_token = None
+    detail_cb_data = None
+    for row in index_msg[2]["reply_markup"]["inline_keyboard"]:
+        for b in row:
+            d = b.get("callback_data", "")
+            if d.startswith("posts:") and parent_token is None:
+                parent_token = d.split(":")[1]
+            if d.startswith("post:") and f":{post_a_id}:" in d:
+                detail_cb_data = d
+    if detail_cb_data is None and parent_token:
+        qr = db.get_queue_draft(post_a_id)
+        detail_cb_data = f"post:{parent_token}:{post_a_id}:{qr['revision']}"
+    assert detail_cb_data is not None, "post_a detail callback not found in /posts index"
+
+    msg_count_before_detail = len(api.messages)
+    assert agent.telegram_controller.process_update(
+        cb(detail_cb_data)
+    ) == "processed"
+    detail_messages = api.messages[msg_count_before_detail:]
+    assert any(TEXT_A in m[1] for m in detail_messages), \
+        f"Full text not found in detail messages: {[m[1][:60] for m in detail_messages]}"
+    detail_action_msg = api.messages[-1]
+
+    # ── Step 4: Remove post_a and restore it ─────────────────────────────────
+    remove_cb_data = btn(detail_action_msg, "Rimuovi dalla coda")
+    assert agent.telegram_controller.process_update(cb(remove_cb_data)) == "processed"
+
+    confirm_cb_data = btn(api.messages[-1], "Conferma rimozione")
+    assert agent.telegram_controller.process_update(cb(confirm_cb_data)) == "processed"
+    assert db.get_queue_draft(post_a_id)["status"] == "discarded"
+
+    restore_cb_data = btn(api.messages[-1], "Ripristina")
+    assert agent.telegram_controller.process_update(cb(restore_cb_data)) == "processed"
+    restored_a = db.get_queue_draft(post_a_id)
+    assert restored_a["status"] == "approved"
+    assert restored_a["translation_policy"] == "advisory"
+
+    # ── Step 5: /media archive/restore + double-confirm permanent delete ──────
+    media_del = make_media("photo-del", "Disposable unused item.")
+    media_del_id = media_del["id"]
+
+    assert agent.telegram_controller.process_update(msg("/media")) == "processed"
+
+    # Navigate until we find an archiveable item (available, unreserved)
+    archive_cb_data = None
+    for _ in range(8):
+        archive_cb_data = latest_btn("Archivia")
+        if archive_cb_data:
+            break
+        next_data = latest_btn("Successivo")
+        if not next_data:
+            break
+        agent.telegram_controller.process_update(cb(next_data))
+
+    assert archive_cb_data is not None, "Archivia button not found"
+    archived_media_id = int(archive_cb_data.split(":")[3])
+    assert agent.telegram_controller.process_update(
+        cb(archive_cb_data)
+    ) == "processed"
+    assert db.get_media_by_id(archived_media_id)["lifecycle_state"] == "archived"
+
+    # Restore the archived item
+    assert agent.telegram_controller.process_update(msg("/media")) == "processed"
+    restore_media_data = None
+    for _ in range(8):
+        restore_media_data = latest_btn("Ripristina")
+        if restore_media_data:
+            break
+        next_data = latest_btn("Successivo")
+        if not next_data:
+            break
+        agent.telegram_controller.process_update(cb(next_data))
+
+    assert restore_media_data is not None, "Ripristina button not found"
+    assert agent.telegram_controller.process_update(
+        cb(restore_media_data)
+    ) == "processed"
+    assert db.get_media_by_id(archived_media_id)["lifecycle_state"] == "available"
+
+    # Permanently delete the never-used item (two-step confirmation)
+    assert agent.telegram_controller.process_update(msg("/media")) == "processed"
+    delete_cb_data = None
+    for _ in range(12):
+        cand = latest_btn("Elimina definitivamente")
+        if cand and int(cand.split(":")[3]) == media_del_id:
+            delete_cb_data = cand
+            break
+        next_data = latest_btn("Successivo")
+        if not next_data:
+            break
+        agent.telegram_controller.process_update(cb(next_data))
+
+    assert delete_cb_data is not None, f"Elimina button for media_del_id={media_del_id} not found"
+    assert agent.telegram_controller.process_update(cb(delete_cb_data)) == "processed"
+    confirm_del_data = btn(api.messages[-1], "Conferma eliminazione")
+    assert agent.telegram_controller.process_update(cb(confirm_del_data)) == "processed"
+    assert db.get_media_by_id(media_del_id)["lifecycle_state"] == "deleted"
+
+    # ── Step 6: Growth digest + mark account followed locally (no X write) ───
+    digest = _seed_digest(db)
+    assert digest["accounts"] and digest["posts"] and digest["reevaluate"]
+
+    assert agent.telegram_controller.process_update(msg("/growth")) == "processed"
+    digest_msg = api.messages[-1]
+    assert "Growth giornaliero" in digest_msg[1]
+
+    account_nav = btn(digest_msg, "Account")
+    assert agent.telegram_controller.process_update(cb(account_nav)) == "processed"
+    account_detail = api.messages[-1]
+    assert "@studio_owner" in account_detail[1]
+
+    follow_cb_data = btn(account_detail, "Segnala come seguito")
+    assert agent.telegram_controller.process_update(cb(follow_cb_data)) == "processed"
+    assert dependencies["x_client"].engagement_writes == []
+
+    post_nav = btn(digest_msg, "Post")
+    assert agent.telegram_controller.process_update(cb(post_nav)) == "processed"
+    post_detail_msg = api.messages[-1]
+    all_btns = [
+        b for row in post_detail_msg[2].get("reply_markup", {}).get("inline_keyboard", [])
+        for b in row
+    ]
+    assert any(b.get("url", "").startswith("https://x.com/") for b in all_btns)
+    assert all("gda" not in (b.get("callback_data") or "") for b in all_btns)
+
+    # ── Step 7: Adaptive planning + dry-run simulation ────────────────────────
+    plan_time = ACCEPTANCE_NOW.replace(hour=12)
+    plans = agent.publication_planning_cycle(now=plan_time)
+    assert len(plans) >= 1
+    assert all(p["status"] == "planned" for p in plans)
+
+    due = datetime.fromisoformat(plans[0]["scheduled_for"])
+    simulated = agent.adaptive_publish_cycle(now=due)
+    assert simulated
+    assert all(s.get("status") == "simulated" for s in simulated)
+
+    # ── Final: no X writes anywhere ───────────────────────────────────────────
+    assert dependencies["x_client"].posts == []
+    assert dependencies["x_client"].engagement_writes == []
