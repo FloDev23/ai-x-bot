@@ -110,6 +110,13 @@ class FakeEditorialFeedClient:
 class FakeXClient:
     """No-network X boundary for orchestration tests."""
 
+    _FORBIDDEN_ENGAGEMENT_METHODS = frozenset({
+        "like_tweet", "favorite_tweet", "follow_user", "unfollow_user",
+        "create_friendship", "destroy_friendship", "reply_to_tweet",
+        "retweet", "repost", "send_dm", "send_direct_message",
+        "bookmark_tweet", "write", "engage",
+    })
+
     def __init__(self):
         self.posts = []
         self.engagement_writes = []
@@ -118,6 +125,13 @@ class FakeXClient:
     def post_tweet(self, text, **kwargs):
         self.posts.append((text, kwargs))
         return SimpleNamespace(data={"id": "9001"})
+
+    def __getattr__(self, name):
+        if name in self._FORBIDDEN_ENGAGEMENT_METHODS:
+            def forbidden(*_args, **_kwargs):
+                raise AssertionError("read-only X boundary forbids engagement writes")
+            return forbidden
+        raise AttributeError(name)
 
     def get_followers_profiles(self):
         return list(self.followers)
@@ -140,6 +154,14 @@ class FakeXClient:
     def search_tweets(self, _query, limit=10):
         del limit
         return []
+
+    def search_relevant_posts(self, _query, limit=25):
+        del limit
+        return []
+
+    def read_relevant_posts(self, _query, limit=25):
+        del limit
+        return SimpleNamespace(posts=(), complete=True)
 
 
 class FakeGroundedGenerator:

@@ -126,6 +126,25 @@ _OPERATOR_QUEUE_RESULTS = {
     "discard": "discarded",
     "restore": "restored",
 }
+_GROWTH_ACCOUNT_REASONS = frozenset({
+    "primary_operator_role", "amplifier_role", "relevant_end_user",
+    "multiple_operating_topics", "one_operating_topic",
+    "active_within_7_days", "active_within_30_days", "english_market",
+    "plausible_public_metrics", "direct_drop_in_affinity",
+    "no_follow_back_after_14_days",
+})
+_GROWTH_POST_REASONS = frozenset({
+    "gym_owner", "empty_capacity", "drop_in", "functional_fitness",
+    "crossfit", "pilates", "martial_arts", "fitness_operations",
+    "recent", "credible_author",
+})
+_GROWTH_PUBLIC_METRIC_KEYS = frozenset({
+    "followers_count", "following_count", "tweet_count", "listed_count",
+})
+_GROWTH_POST_METRIC_KEYS = frozenset({
+    "like_count", "retweet_count", "reply_count", "quote_count",
+    "impression_count",
+})
 
 
 @dataclass(frozen=True)
@@ -644,6 +663,49 @@ class Database:
                         f"ALTER TABLE follower_snapshot_runs "
                         f"ADD COLUMN {column} {definition}"
                     )
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS growth_suggestions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observed_on TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (
+                        kind IN ('account','post','reevaluate')
+                    ),
+                    object_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    reason_codes_json TEXT NOT NULL,
+                    suggested_at TEXT NOT NULL,
+                    decision TEXT NOT NULL DEFAULT 'new',
+                    decision_at TEXT,
+                    cooldown_until TEXT,
+                    UNIQUE(observed_on, kind, object_id)
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS growth_digest_runs (
+                    observed_on TEXT PRIMARY KEY,
+                    completed_at TEXT NOT NULL,
+                    summary_json TEXT NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS growth_read_claims (
+                    observed_on TEXT NOT NULL,
+                    query_key TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN ('claimed','completed','failed')
+                    ),
+                    claimed_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    PRIMARY KEY (observed_on, query_key)
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_growth_suggestion_cooldown
+                ON growth_suggestions(kind, object_id, cooldown_until)
+            """)
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS telegram_updates (
@@ -6967,6 +7029,590 @@ class Database:
         """
         del media_id
         return False
+
+    # ---------- Daily growth suggestions ----------
+
+    @staticmethod
+    def _canonical_growth_object_id(value: Any) -> bool:
+        return (
+            type(value) is str
+            and value.isascii()
+            and value.isdigit()
+            and not value.startswith("0")
+            and len(value) <= 20
+            and int(value) <= (1 << 64) - 1
+        )
+
+    @staticmethod
+    def _growth_metrics_are_closed(value: Any, keys: frozenset) -> bool:
+        return (
+            type(value) is dict
+            and frozenset(value) == keys
+            and all(
+                type(metric) is int and 0 <= metric <= 1_000_000_000_000
+                for metric in value.values()
+            )
+        )
+
+    @classmethod
+    def _normalize_growth_suggestion_row(
+        cls,
+        kind: str,
+        row: Any,
+        completed_at: datetime,
+    ) -> Optional[Dict]:
+        expected_row_keys = {
+            "object_id", "username", "payload", "score", "reason_codes",
+            "cooldown_until",
+        }
+        if type(row) is not dict or set(row) != expected_row_keys:
+            return None
+        object_id = row.get("object_id")
+        username = row.get("username")
+        payload = row.get("payload")
+        score = row.get("score")
+        reasons = row.get("reason_codes")
+        cooldown_raw = row.get("cooldown_until")
+        allowed_reasons = (
+            _GROWTH_POST_REASONS if kind == "post" else _GROWTH_ACCOUNT_REASONS
+        )
+        if (
+            not cls._canonical_growth_object_id(object_id)
+            or type(username) is not str
+            or re.fullmatch(r"[A-Za-z0-9_]{1,15}", username) is None
+            or type(score) is not int
+            or not 0 <= score <= 100
+            or type(reasons) is not list
+            or not reasons
+            or len(reasons) > 10
+            or len(set(reasons)) != len(reasons)
+            or any(type(reason) is not str or reason not in allowed_reasons for reason in reasons)
+            or type(payload) is not dict
+        ):
+            return None
+        if cooldown_raw is None:
+            cooldown_iso = None
+        else:
+            try:
+                cooldown = parse_growth_datetime(cooldown_raw)
+            except (TypeError, ValueError):
+                cooldown = None
+            if cooldown is None or cooldown < completed_at:
+                return None
+            cooldown_iso = cooldown.isoformat()
+
+        if kind == "post":
+            if set(payload) != {
+                "id", "author_id", "author_username", "excerpt", "created_at",
+                "public_metrics", "reason_codes",
+            }:
+                return None
+            created_at = parse_growth_datetime(payload.get("created_at"))
+            if (
+                payload.get("id") != object_id
+                or not cls._canonical_growth_object_id(payload.get("author_id"))
+                or payload.get("author_username") != username
+                or type(payload.get("excerpt")) is not str
+                or not payload["excerpt"].strip()
+                or len(payload["excerpt"]) > 500
+                or created_at is None
+                or created_at > completed_at + timedelta(minutes=5)
+                or not cls._growth_metrics_are_closed(
+                    payload.get("public_metrics"), _GROWTH_POST_METRIC_KEYS
+                )
+                or payload.get("reason_codes") != reasons
+            ):
+                return None
+        else:
+            if set(payload) != {
+                "user_id", "username", "public_metrics", "latest_activity_id",
+                "latest_activity_at", "segment", "reason_codes",
+            }:
+                return None
+            activity_at = parse_growth_datetime(payload.get("latest_activity_at"))
+            if (
+                payload.get("user_id") != object_id
+                or payload.get("username") != username
+                or not cls._growth_metrics_are_closed(
+                    payload.get("public_metrics"), _GROWTH_PUBLIC_METRIC_KEYS
+                )
+                or not cls._canonical_growth_object_id(
+                    payload.get("latest_activity_id")
+                )
+                or activity_at is None
+                or activity_at > completed_at + timedelta(minutes=5)
+                or payload.get("segment") not in {
+                    "primary", "amplifier", "end_user",
+                }
+                or payload.get("reason_codes") != reasons
+            ):
+                return None
+        try:
+            safe_payload = json.loads(json.dumps(payload, allow_nan=False))
+            safe_reasons = json.loads(json.dumps(reasons, allow_nan=False))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return {
+            "object_id": object_id,
+            "username": username,
+            "payload": safe_payload,
+            "score": score,
+            "reason_codes": safe_reasons,
+            "cooldown_until": cooldown_iso,
+        }
+
+    @classmethod
+    def _load_growth_digest_conn(
+        cls,
+        conn: sqlite3.Connection,
+        observed_on: str,
+    ) -> Optional[Dict]:
+        run = conn.execute(
+            "SELECT summary_json FROM growth_digest_runs WHERE observed_on = ?",
+            (observed_on,),
+        ).fetchone()
+        if run is None:
+            return None
+        try:
+            summary = json.loads(run["summary_json"])
+        except (TypeError, ValueError):
+            return {}
+        if (
+            type(summary) is not dict
+            or set(summary) != {"observed_on", "counts"}
+            or summary.get("observed_on") != observed_on
+            or type(summary.get("counts")) is not dict
+            or set(summary["counts"]) != {"account", "post", "reevaluate"}
+            or any(
+                type(count) is not int or count < 0
+                for count in summary["counts"].values()
+            )
+        ):
+            return {}
+        rows = conn.execute("""
+            SELECT id, kind, object_id, username, payload_json, score,
+                   reason_codes_json, suggested_at, decision, decision_at,
+                   cooldown_until
+            FROM growth_suggestions
+            WHERE observed_on = ?
+            ORDER BY kind, score DESC, object_id ASC
+        """, (observed_on,)).fetchall()
+        grouped = {"account": [], "post": [], "reevaluate": []}
+        try:
+            for row in rows:
+                item = dict(row)
+                item["payload"] = json.loads(item.pop("payload_json"))
+                item["reason_codes"] = json.loads(item.pop("reason_codes_json"))
+                if (
+                    item["kind"] not in grouped
+                    or type(item["payload"]) is not dict
+                    or type(item["reason_codes"]) is not list
+                ):
+                    return {}
+                suggested_at = parse_growth_datetime(item["suggested_at"])
+                decision_at = (
+                    parse_growth_datetime(item["decision_at"])
+                    if item["decision_at"] is not None
+                    else None
+                )
+                if (
+                    suggested_at is None
+                    or item["decision"] not in {
+                        "new", "saved", "followed_manually", "dismissed",
+                        "still_relevant",
+                    }
+                    or (item["decision_at"] is not None and decision_at is None)
+                ):
+                    return {}
+                validated = cls._normalize_growth_suggestion_row(
+                    item["kind"],
+                    {
+                        "object_id": item["object_id"],
+                        "username": item["username"],
+                        "payload": item["payload"],
+                        "score": item["score"],
+                        "reason_codes": item["reason_codes"],
+                        "cooldown_until": item["cooldown_until"],
+                    },
+                    suggested_at,
+                )
+                if (
+                    validated is None
+                    or validated["payload"] != item["payload"]
+                    or validated["reason_codes"] != item["reason_codes"]
+                ):
+                    return {}
+                grouped[item["kind"]].append(item)
+        except (TypeError, ValueError):
+            return {}
+        expected_counts = {
+            "account": len(grouped["account"]),
+            "post": len(grouped["post"]),
+            "reevaluate": len(grouped["reevaluate"]),
+        }
+        if summary["counts"] != expected_counts:
+            return {}
+        return {
+            "observed_on": observed_on,
+            "accounts": grouped["account"],
+            "posts": grouped["post"],
+            "reevaluate": grouped["reevaluate"],
+        }
+
+    def get_growth_digest(self, observed_on: str) -> Optional[Dict]:
+        try:
+            if date.fromisoformat(observed_on).isoformat() != observed_on:
+                return None
+        except (TypeError, ValueError):
+            return None
+        with self._conn() as conn:
+            return self._load_growth_digest_conn(conn, observed_on)
+
+    def persist_growth_digest_atomic(
+        self,
+        *,
+        observed_on: str,
+        account_rows: List[Dict],
+        post_rows: List[Dict],
+        reevaluate_rows: List[Dict],
+        completed_at: str,
+    ) -> Tuple[Dict, str]:
+        """Commit one exact daily digest or replay the prior committed rows."""
+        try:
+            if date.fromisoformat(observed_on).isoformat() != observed_on:
+                return {}, "invalid"
+            completed = parse_growth_datetime(completed_at)
+        except (TypeError, ValueError):
+            return {}, "invalid"
+        if (
+            completed is None
+            or completed.astimezone(ZoneInfo("Europe/Rome")).date().isoformat()
+            != observed_on
+            or type(account_rows) is not list
+            or type(post_rows) is not list
+            or type(reevaluate_rows) is not list
+            or len(account_rows) > 5
+            or len(post_rows) > 10
+            or len(reevaluate_rows) > 5
+        ):
+            return {}, "invalid"
+        normalized = {}
+        for kind, rows in (
+            ("account", account_rows),
+            ("post", post_rows),
+            ("reevaluate", reevaluate_rows),
+        ):
+            normalized[kind] = []
+            seen = set()
+            for row in rows:
+                item = self._normalize_growth_suggestion_row(kind, row, completed)
+                if item is None or item["object_id"] in seen:
+                    return {}, "invalid"
+                seen.add(item["object_id"])
+                normalized[kind].append(item)
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = self._load_growth_digest_conn(conn, observed_on)
+            if existing is not None:
+                return (existing, "existing") if existing else ({}, "invalid_existing")
+            for kind in ("account", "post", "reevaluate"):
+                for item in normalized[kind]:
+                    conn.execute("""
+                        INSERT INTO growth_suggestions (
+                            observed_on, kind, object_id, username, payload_json,
+                            score, reason_codes_json, suggested_at,
+                            cooldown_until
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        observed_on, kind, item["object_id"], item["username"],
+                        json.dumps(item["payload"], allow_nan=False,
+                                   separators=(",", ":"), sort_keys=True),
+                        item["score"],
+                        json.dumps(item["reason_codes"], allow_nan=False,
+                                   separators=(",", ":")),
+                        completed.isoformat(), item["cooldown_until"],
+                    ))
+            counts = {kind: len(normalized[kind]) for kind in normalized}
+            conn.execute("""
+                INSERT INTO growth_digest_runs (
+                    observed_on, completed_at, summary_json
+                ) VALUES (?, ?, ?)
+            """, (
+                observed_on, completed.isoformat(),
+                json.dumps(
+                    {"observed_on": observed_on, "counts": counts},
+                    allow_nan=False, separators=(",", ":"), sort_keys=True,
+                ),
+            ))
+            result = self._load_growth_digest_conn(conn, observed_on)
+            if not result:
+                raise sqlite3.IntegrityError("growth digest verification failed")
+            return result, "created"
+
+    def claim_growth_read_query(
+        self,
+        observed_on: str,
+        query_key: str,
+        claimed_at: datetime,
+        expires_at: datetime,
+        *,
+        budget: int,
+    ) -> str:
+        """Atomically claim one bounded daily X read, recovering stale claims."""
+        try:
+            valid_date = date.fromisoformat(observed_on).isoformat() == observed_on
+        except (TypeError, ValueError):
+            valid_date = False
+        if (
+            not valid_date
+            or type(query_key) is not str
+            or re.fullmatch(r"[A-Za-z0-9:_-]{1,80}", query_key) is None
+            or type(claimed_at) is not datetime
+            or claimed_at.tzinfo is None
+            or claimed_at.utcoffset() is None
+            or type(expires_at) is not datetime
+            or expires_at.tzinfo is None
+            or expires_at.utcoffset() is None
+            or type(budget) is not int
+            or not 1 <= budget <= 2
+        ):
+            return "invalid"
+        claimed = claimed_at.astimezone(timezone.utc)
+        expires = expires_at.astimezone(timezone.utc)
+        if expires <= claimed or expires > claimed + timedelta(minutes=15):
+            return "invalid"
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("""
+                SELECT state, expires_at FROM growth_read_claims
+                WHERE observed_on = ? AND query_key = ?
+            """, (observed_on, query_key)).fetchone()
+            if existing is not None:
+                if existing["state"] == "completed":
+                    return "completed"
+                if existing["state"] == "failed":
+                    return "failed"
+                prior_expiry = parse_growth_datetime(existing["expires_at"])
+                if prior_expiry is None:
+                    return "failed"
+                if prior_expiry > claimed:
+                    return "busy"
+                conn.execute("""
+                    UPDATE growth_read_claims
+                    SET state = 'claimed', claimed_at = ?, expires_at = ?
+                    WHERE observed_on = ? AND query_key = ?
+                """, (claimed.isoformat(), expires.isoformat(), observed_on, query_key))
+                return "claimed"
+            used = conn.execute(
+                "SELECT COUNT(*) AS count FROM growth_read_claims "
+                "WHERE observed_on = ? AND substr(query_key, 1, 2) != '__'",
+                (observed_on,),
+            ).fetchone()["count"]
+            if type(used) is not int or used >= budget:
+                return "budget_exhausted"
+            conn.execute("""
+                INSERT INTO growth_read_claims (
+                    observed_on, query_key, state, claimed_at, expires_at
+                ) VALUES (?, ?, 'claimed', ?, ?)
+            """, (observed_on, query_key, claimed.isoformat(), expires.isoformat()))
+            return "claimed"
+
+    def claim_growth_digest_build(
+        self,
+        observed_on: str,
+        claimed_at: datetime,
+        expires_at: datetime,
+    ) -> str:
+        """Claim the daily builder lease without consuming an X-read budget."""
+        query_key = "__digest_build__"
+        try:
+            valid_date = date.fromisoformat(observed_on).isoformat() == observed_on
+        except (TypeError, ValueError):
+            valid_date = False
+        if (
+            not valid_date
+            or type(claimed_at) is not datetime
+            or claimed_at.tzinfo is None
+            or claimed_at.utcoffset() is None
+            or type(expires_at) is not datetime
+            or expires_at.tzinfo is None
+            or expires_at.utcoffset() is None
+        ):
+            return "invalid"
+        claimed = claimed_at.astimezone(timezone.utc)
+        expires = expires_at.astimezone(timezone.utc)
+        if expires <= claimed or expires > claimed + timedelta(minutes=15):
+            return "invalid"
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("""
+                SELECT state, expires_at FROM growth_read_claims
+                WHERE observed_on = ? AND query_key = ?
+            """, (observed_on, query_key)).fetchone()
+            if existing is None:
+                conn.execute("""
+                    INSERT INTO growth_read_claims (
+                        observed_on, query_key, state, claimed_at, expires_at
+                    ) VALUES (?, ?, 'claimed', ?, ?)
+                """, (
+                    observed_on, query_key, claimed.isoformat(), expires.isoformat(),
+                ))
+                return "claimed"
+            if existing["state"] == "completed":
+                return "completed"
+            if existing["state"] == "failed":
+                return "failed"
+            prior_expiry = parse_growth_datetime(existing["expires_at"])
+            if prior_expiry is None:
+                return "failed"
+            if prior_expiry > claimed:
+                return "busy"
+            conn.execute("""
+                UPDATE growth_read_claims
+                SET state = 'claimed', claimed_at = ?, expires_at = ?
+                WHERE observed_on = ? AND query_key = ?
+            """, (
+                claimed.isoformat(), expires.isoformat(), observed_on, query_key,
+            ))
+            return "claimed"
+
+    def complete_growth_read_query(
+        self, observed_on: str, query_key: str, completed_at: datetime
+    ) -> bool:
+        if (
+            type(completed_at) is not datetime
+            or completed_at.tzinfo is None
+            or completed_at.utcoffset() is None
+        ):
+            return False
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                UPDATE growth_read_claims SET state = 'completed'
+                WHERE observed_on = ? AND query_key = ? AND state = 'claimed'
+            """, (observed_on, query_key))
+            return cursor.rowcount == 1
+
+    def fail_growth_read_query(self, observed_on: str, query_key: str) -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                UPDATE growth_read_claims SET state = 'failed'
+                WHERE observed_on = ? AND query_key = ? AND state = 'claimed'
+            """, (observed_on, query_key))
+            return cursor.rowcount == 1
+
+    def growth_object_in_cooldown(
+        self, kind: str, object_id: str, now: datetime
+    ) -> bool:
+        if (
+            kind not in {"account", "post", "reevaluate"}
+            or not self._canonical_growth_object_id(object_id)
+            or type(now) is not datetime
+            or now.tzinfo is None
+            or now.utcoffset() is None
+        ):
+            return True
+        current = now.astimezone(timezone.utc)
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT cooldown_until FROM growth_suggestions
+                WHERE kind = ? AND object_id = ?
+            """, (kind, object_id)).fetchall()
+        for row in rows:
+            until = parse_growth_datetime(row["cooldown_until"])
+            if until is None or until > current:
+                return True
+        return False
+
+    def get_growth_reevaluation_candidates(
+        self, now: datetime, *, limit: int = 5
+    ) -> List[Dict]:
+        if (
+            type(now) is not datetime
+            or now.tzinfo is None
+            or now.utcoffset() is None
+            or type(limit) is not int
+            or limit <= 0
+        ):
+            return []
+        current = now.astimezone(timezone.utc)
+        maturity_cutoff = current - timedelta(days=14)
+        with self._conn() as conn:
+            candidates = conn.execute("""
+                SELECT * FROM growth_candidates
+                WHERE decision = 'followed_manually'
+                  AND manual_followed_at IS NOT NULL
+                  AND followed_back_at IS NULL
+            """).fetchall()
+            runs = conn.execute("""
+                SELECT observed_on, captured_at FROM follower_snapshot_runs
+                WHERE completed = 1
+            """).fetchall()
+            valid_runs = []
+            for run in runs:
+                captured = parse_growth_datetime(run["captured_at"])
+                if captured is not None and captured <= current:
+                    valid_runs.append((captured, run["observed_on"]))
+            if not valid_runs:
+                return []
+            present_by_date = {}
+            for snapshot in conn.execute("""
+                SELECT observed_on, user_id FROM follower_snapshots
+                WHERE captured_at IS NOT NULL
+            """).fetchall():
+                if type(snapshot["user_id"]) is str:
+                    present_by_date.setdefault(
+                        snapshot["observed_on"], set()
+                    ).add(snapshot["user_id"])
+        eligible = []
+        for row in candidates:
+            followed_at = parse_growth_datetime(row["manual_followed_at"])
+            if followed_at is None or followed_at > maturity_cutoff:
+                continue
+            matured_at = followed_at + timedelta(days=14)
+            qualifying_runs = [
+                item for item in valid_runs if item[0] >= matured_at
+            ]
+            if not qualifying_runs:
+                continue
+            latest_observed_on = max(qualifying_runs)[1]
+            if row["user_id"] in present_by_date.get(latest_observed_on, set()):
+                continue
+            decoded = self.get_growth_candidate(row["user_id"])
+            if decoded is None:
+                continue
+            profile = decoded.get("profile") or {}
+            latest = decoded.get("latest_post") or {}
+            score_data = decoded.get("score_data") or {}
+            metrics = {
+                key: profile.get(key) for key in _GROWTH_PUBLIC_METRIC_KEYS
+            }
+            if (
+                not self._canonical_growth_object_id(row["user_id"])
+                or not self._canonical_growth_object_id(latest.get("id"))
+                or not self._growth_metrics_are_closed(
+                    metrics, _GROWTH_PUBLIC_METRIC_KEYS
+                )
+                or parse_growth_datetime(latest.get("created_at")) is None
+                or score_data.get("audience_segment") not in {
+                    "primary", "amplifier", "end_user",
+                }
+            ):
+                continue
+            eligible.append({
+                "user_id": row["user_id"],
+                "username": row["username"],
+                "public_metrics": metrics,
+                "latest_activity_id": latest["id"],
+                "latest_activity_at": parse_growth_datetime(
+                    latest["created_at"]
+                ).isoformat(),
+                "segment": score_data["audience_segment"],
+                "score": row["score"] if type(row["score"]) is int else 0,
+                "reason_codes": ["no_follow_back_after_14_days"],
+                "manual_followed_at": followed_at.isoformat(),
+            })
+        eligible.sort(key=lambda item: (item["manual_followed_at"], item["user_id"]))
+        return eligible[: min(limit, 5)]
 
     # ---------- Growth candidates and follower snapshots ----------
 

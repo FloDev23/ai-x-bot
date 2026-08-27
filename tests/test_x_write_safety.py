@@ -1,11 +1,14 @@
 import importlib
 import inspect
+import ast
+from pathlib import Path
 
 import pytest
 
 import config
 import dotenv
 from modules.twitter_client import TwitterClient
+from tests.fakes import FakeXClient
 
 
 def _set_valid_runtime_environment(monkeypatch):
@@ -167,3 +170,50 @@ def test_source_refresh_modules_have_no_x_write_capability(module_name):
         "media_upload",
     )
     assert all(capability not in source for capability in prohibited)
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "like_tweet", "favorite_tweet", "follow_user", "unfollow_user",
+        "create_friendship", "destroy_friendship", "reply_to_tweet",
+        "retweet", "repost", "send_dm", "send_direct_message",
+        "bookmark_tweet", "write", "engage",
+    ],
+)
+def test_runtime_x_fake_raises_if_any_engagement_write_is_touched(method_name):
+    fake = FakeXClient()
+    with pytest.raises(AssertionError, match="read-only X boundary"):
+        getattr(fake, method_name)("target")
+    assert fake.engagement_writes == []
+
+
+def test_production_ast_allows_only_the_approved_x_publication_boundary():
+    root = Path(__file__).resolve().parents[1]
+    production_files = [root / "main.py", *sorted((root / "modules").glob("*.py"))]
+    prohibited = {
+        "like_tweet", "favorite_tweet", "follow_user", "unfollow_user",
+        "create_friendship", "destroy_friendship", "reply_to_tweet",
+        "retweet", "repost", "send_dm", "send_direct_message",
+        "bookmark_tweet", "engage",
+    }
+    approved_locations = {
+        "post_tweet": {"modules/publisher.py"},
+        "create_tweet": {"modules/twitter_client.py"},
+        "_upload_media": {"modules/twitter_client.py"},
+        "media_upload": {"modules/twitter_client.py"},
+    }
+    found = {name: set() for name in approved_locations}
+    violations = []
+    for path in production_files:
+        relative = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+            if node.attr in prohibited:
+                violations.append((relative, node.lineno, node.attr))
+            if node.attr in approved_locations:
+                found[node.attr].add(relative)
+    assert violations == []
+    assert found == approved_locations

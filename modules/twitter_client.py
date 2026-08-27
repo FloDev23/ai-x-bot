@@ -2,8 +2,10 @@ import logging
 import os
 import re
 import tweepy
+import ipaddress
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from requests import exceptions as requests_exceptions
 from config import (
     TWITTER_API_KEY,
@@ -13,6 +15,7 @@ from config import (
     TWITTER_BEARER_TOKEN
 )
 from typing import BinaryIO, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,14 @@ class FollowerProfilesRead:
     """One paginated follower traversal and whether it reached the end."""
 
     profiles: Tuple[Dict, ...]
+    complete: bool
+
+
+@dataclass(frozen=True)
+class RelevantPostsRead:
+    """One normalized recent-search traversal and its completion state."""
+
+    posts: Tuple[Dict, ...]
     complete: bool
 
 
@@ -272,6 +283,273 @@ class TwitterClient:
         except Exception as e:
             logger.error(f"❌ Errore nella ricerca dei tweet: {e}")
             return []
+
+    @staticmethod
+    def _canonical_read_id(value: object) -> Optional[str]:
+        if type(value) is int and 0 < value <= _X_TWEET_ID_MAX:
+            return str(value)
+        if is_valid_x_tweet_id(value):
+            return value
+        return None
+
+    @staticmethod
+    def _bounded_metrics(value: object, names: Tuple[str, ...]) -> Optional[Dict]:
+        if not isinstance(value, Mapping):
+            return None
+        normalized = {}
+        for name in names:
+            if name not in value:
+                return None
+            metric = value[name]
+            if type(metric) is not int or not 0 <= metric <= 1_000_000_000_000:
+                return None
+            normalized[name] = metric
+        return normalized
+
+    @staticmethod
+    def _safe_post_entities(value: object) -> bool:
+        if value is None:
+            return True
+        if not isinstance(value, Mapping):
+            return False
+        urls = value.get("urls", [])
+        if not isinstance(urls, (list, tuple)):
+            return False
+        for item in urls:
+            if not isinstance(item, Mapping):
+                return False
+            expanded = item.get("expanded_url")
+            if type(expanded) is not str or not 1 <= len(expanded) <= 2048:
+                return False
+            try:
+                parsed = urlsplit(expanded)
+                if (
+                    parsed.scheme != "https"
+                    or not parsed.hostname
+                    or parsed.username is not None
+                    or parsed.password is not None
+                ):
+                    return False
+                try:
+                    address = ipaddress.ip_address(parsed.hostname)
+                except ValueError:
+                    address = None
+                if address is not None and not address.is_global:
+                    return False
+                if parsed.hostname.lower() in {"localhost", "localhost.localdomain"}:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    @classmethod
+    def _relevant_author_dict(cls, user: object) -> Optional[Dict]:
+        user_id = cls._canonical_read_id(getattr(user, "id", None))
+        username = getattr(user, "username", None)
+        protected = getattr(user, "protected", None)
+        metrics = cls._bounded_metrics(
+            getattr(user, "public_metrics", None),
+            ("followers_count", "following_count", "tweet_count", "listed_count"),
+        )
+        if (
+            user_id is None
+            or type(username) is not str
+            or re.fullmatch(r"[A-Za-z0-9_]{1,15}", username) is None
+            or type(protected) is not bool
+            or protected
+            or metrics is None
+        ):
+            return None
+        return {"id": user_id, "username": username, "public_metrics": metrics}
+
+    @classmethod
+    def _relevant_post_dict(
+        cls,
+        tweet: object,
+        authors: Dict[str, Dict],
+        now: datetime,
+    ) -> Optional[Dict]:
+        tweet_id = cls._canonical_read_id(getattr(tweet, "id", None))
+        author_id = cls._canonical_read_id(getattr(tweet, "author_id", None))
+        author = authors.get(author_id) if author_id is not None else None
+        text = getattr(tweet, "text", None)
+        lang = getattr(tweet, "lang", None)
+        created_raw = getattr(tweet, "created_at", None)
+        if type(created_raw) is str:
+            try:
+                created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        elif type(created_raw) is datetime:
+            created_at = created_raw
+        else:
+            return None
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            return None
+        created_at = created_at.astimezone(timezone.utc)
+        referenced = getattr(tweet, "referenced_tweets", None)
+        if referenced is None:
+            referenced = []
+        if not isinstance(referenced, (list, tuple)):
+            return None
+        for reference in referenced:
+            reference_type = (
+                reference.get("type")
+                if isinstance(reference, Mapping)
+                else getattr(reference, "type", None)
+            )
+            if reference_type in {"retweeted", "replied_to"}:
+                return None
+            if type(reference_type) is not str:
+                return None
+        metrics = cls._bounded_metrics(
+            getattr(tweet, "public_metrics", None),
+            (
+                "like_count", "retweet_count", "reply_count", "quote_count",
+                "impression_count",
+            ),
+        )
+        entities = getattr(tweet, "entities", None)
+        if (
+            tweet_id is None
+            or author is None
+            or type(text) is not str
+            or not text.strip()
+            or len(text) > 1000
+            or type(lang) is not str
+            or re.fullmatch(r"[A-Za-z]{2,10}", lang) is None
+            or created_at > now + timedelta(minutes=5)
+            or created_at < now - timedelta(days=30)
+            or metrics is None
+            or (
+                re.search(r"(?i)\bhttps?://", text) is not None
+                and entities is None
+            )
+            or not cls._safe_post_entities(entities)
+        ):
+            return None
+        return {
+            "id": tweet_id,
+            "text": text.strip(),
+            "author_id": author_id,
+            "author_username": author["username"],
+            "created_at": created_at.isoformat(),
+            "lang": lang.lower(),
+            "public_metrics": metrics,
+            "author_public_metrics": author["public_metrics"],
+        }
+
+    def read_relevant_posts(
+        self, query: str, limit: int = 25
+    ) -> RelevantPostsRead:
+        """Read and normalize public original posts without exposing Tweepy."""
+        if (
+            type(query) is not str
+            or not query.strip()
+            or type(limit) is not int
+            or limit <= 0
+        ):
+            return RelevantPostsRead((), False)
+        requested = min(limit, 100)
+        rows = []
+        seen_ids = set()
+        seen_tokens = set()
+        next_token = None
+        now = datetime.now(timezone.utc)
+        while len(rows) < requested:
+            if next_token is not None:
+                if next_token in seen_tokens:
+                    return RelevantPostsRead(tuple(rows), False)
+                seen_tokens.add(next_token)
+            params = {
+                "query": query.strip(),
+                "max_results": max(10, min(requested - len(rows), 100)),
+                "tweet_fields": [
+                    "id", "text", "author_id", "created_at", "lang",
+                    "public_metrics", "referenced_tweets", "entities",
+                ],
+                "expansions": ["author_id"],
+                "user_fields": [
+                    "id", "username", "protected", "public_metrics",
+                ],
+            }
+            if next_token is not None:
+                params["next_token"] = next_token
+            try:
+                response = self._client.search_recent_tweets(**params)
+            except Exception as error:
+                logger.warning(
+                    "x_relevant_posts_read_failed error_type=%s",
+                    type(error).__name__,
+                )
+                return RelevantPostsRead(tuple(rows), False)
+            try:
+                response_rows = getattr(response, "data", None)
+                includes = getattr(response, "includes", None)
+                metadata = getattr(response, "meta", None)
+                if (
+                    response_rows is None
+                    and isinstance(metadata, Mapping)
+                    and metadata.get("result_count") == 0
+                ):
+                    response_rows = []
+                if not isinstance(response_rows, (list, tuple)):
+                    raise ValueError("malformed post page")
+                if includes is None and not response_rows:
+                    includes = {}
+                if not isinstance(includes, Mapping):
+                    raise ValueError("incomplete post includes")
+                users = includes.get("users")
+                if users is None and not response_rows:
+                    users = []
+                if not isinstance(users, (list, tuple)):
+                    raise ValueError("incomplete author includes")
+                if not isinstance(metadata, Mapping):
+                    raise ValueError("malformed post metadata")
+                authors = {}
+                for user in users:
+                    try:
+                        normalized = self._relevant_author_dict(user)
+                    except Exception as error:
+                        logger.warning(
+                            "x_relevant_post_author_skipped error_type=%s",
+                            type(error).__name__,
+                        )
+                        continue
+                    if normalized is not None:
+                        authors[normalized["id"]] = normalized
+            except Exception as error:
+                logger.warning(
+                    "x_relevant_posts_page_skipped error_type=%s",
+                    type(error).__name__,
+                )
+                return RelevantPostsRead(tuple(rows), False)
+            for tweet in response_rows:
+                try:
+                    normalized = self._relevant_post_dict(tweet, authors, now)
+                except Exception as error:
+                    logger.warning(
+                        "x_relevant_post_record_skipped error_type=%s",
+                        type(error).__name__,
+                    )
+                    continue
+                if normalized is None or normalized["id"] in seen_ids:
+                    continue
+                seen_ids.add(normalized["id"])
+                rows.append(normalized)
+                if len(rows) >= requested:
+                    break
+            token = metadata.get("next_token")
+            if token is None:
+                return RelevantPostsRead(tuple(rows), True)
+            if type(token) is not str or not token:
+                return RelevantPostsRead(tuple(rows), False)
+            next_token = token
+        return RelevantPostsRead(tuple(rows), True)
+
+    def search_relevant_posts(self, query: str, limit: int = 25) -> List[Dict]:
+        """Compatibility list boundary for normalized read-only post search."""
+        return list(self.read_relevant_posts(query, limit).posts)
 
     def get_authenticated_user_id_cached(self) -> Optional[str]:
         """Wrapper con cache in memoria per evitare letture ripetute inutili"""
