@@ -681,6 +681,7 @@ class Database:
                     decision_at TEXT,
                     cooldown_until TEXT,
                     rank_position INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(observed_on, kind, object_id)
                 )
             """)
@@ -703,6 +704,11 @@ class Database:
                           AND prior.id < current.id
                     )
                 """)
+            if "revision" not in growth_suggestion_columns:
+                c.execute(
+                    "ALTER TABLE growth_suggestions "
+                    "ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+                )
             c.execute("""
                 CREATE TABLE IF NOT EXISTS growth_digest_runs (
                     observed_on TEXT PRIMARY KEY,
@@ -7222,7 +7228,7 @@ class Database:
         rows = conn.execute("""
             SELECT id, kind, object_id, username, payload_json, score,
                    reason_codes_json, suggested_at, decision, decision_at,
-                   cooldown_until, rank_position
+                   cooldown_until, rank_position, revision
             FROM growth_suggestions
             WHERE observed_on = ?
             ORDER BY kind, rank_position ASC
@@ -7237,6 +7243,8 @@ class Database:
                     item["kind"] not in grouped
                     or type(item["rank_position"]) is not int
                     or item["rank_position"] != len(grouped[item["kind"]])
+                    or type(item["revision"]) is not int
+                    or item["revision"] < 0
                     or type(item["payload"]) is not dict
                     or type(item["reason_codes"]) is not list
                 ):
@@ -7300,6 +7308,104 @@ class Database:
             return None
         with self._conn() as conn:
             return self._load_growth_digest_conn(conn, observed_on)
+
+    def get_growth_suggestion(
+        self, suggestion_id: int, expected_revision: int
+    ) -> Optional[Dict]:
+        if (
+            type(suggestion_id) is not int
+            or suggestion_id <= 0
+            or type(expected_revision) is not int
+            or expected_revision < 0
+        ):
+            return None
+        with self._conn() as conn:
+            identity = conn.execute(
+                "SELECT observed_on FROM growth_suggestions WHERE id = ?",
+                (suggestion_id,),
+            ).fetchone()
+            if identity is None:
+                return None
+            digest = self._load_growth_digest_conn(conn, identity["observed_on"])
+        if not digest:
+            return None
+        for collection in ("accounts", "posts", "reevaluate"):
+            for suggestion in digest[collection]:
+                if (
+                    suggestion["id"] == suggestion_id
+                    and suggestion["revision"] == expected_revision
+                ):
+                    return {
+                        **suggestion,
+                        "observed_on": identity["observed_on"],
+                    }
+        return None
+
+    def mark_growth_suggestion_decision(
+        self,
+        suggestion_id: int,
+        expected_revision: int,
+        decision: str,
+        *,
+        decided_at: Optional[datetime] = None,
+    ) -> str:
+        allowed = {
+            "account": {"followed_manually"},
+            "reevaluate": {"still_relevant", "dismissed"},
+        }
+        if (
+            type(suggestion_id) is not int
+            or suggestion_id <= 0
+            or type(expected_revision) is not int
+            or expected_revision < 0
+            or decision not in {"followed_manually", "still_relevant", "dismissed"}
+        ):
+            return "invalid"
+        current = datetime.now(timezone.utc) if decided_at is None else decided_at
+        if (
+            type(current) is not datetime
+            or current.tzinfo is None
+            or current.utcoffset() is None
+        ):
+            return "invalid"
+        decided_iso = current.astimezone(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT kind, object_id, decision, revision
+                FROM growth_suggestions WHERE id = ?
+                """,
+                (suggestion_id,),
+            ).fetchone()
+            if row is None or decision not in allowed.get(row["kind"], set()):
+                return "invalid"
+            if row["decision"] == decision:
+                return "duplicate"
+            if row["decision"] != "new" or row["revision"] != expected_revision:
+                return "rejected"
+            cursor = conn.execute(
+                """
+                UPDATE growth_suggestions
+                SET decision = ?, decision_at = ?, revision = revision + 1
+                WHERE id = ? AND decision = 'new' AND revision = ?
+                """,
+                (decision, decided_iso, suggestion_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                return "rejected"
+            if decision == "followed_manually":
+                conn.execute(
+                    """
+                    UPDATE growth_candidates
+                    SET decision = 'followed_manually', decision_at = ?,
+                        manual_followed_at = COALESCE(manual_followed_at, ?),
+                        rejection_reason = NULL, suppressed_until = NULL
+                    WHERE user_id = ? AND decision IN ('new', 'saved')
+                    """,
+                    (decided_iso, decided_iso, row["object_id"]),
+                )
+            return "updated"
 
     def persist_growth_digest_atomic(
         self,

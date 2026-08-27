@@ -718,7 +718,7 @@ def test_register_jobs_uses_rome_timezone_and_only_safe_jobs(agent_and_fakes):
         "translation_retry",
         "publication_planning",
         "adaptive_publish",
-        "growth_discovery",
+        "growth_digest",
         "follower_snapshot",
         "performance_metrics",
         "weekly_growth_report",
@@ -734,7 +734,7 @@ def test_register_jobs_uses_rome_timezone_and_only_safe_jobs(agent_and_fakes):
     }
     assert schedule == {
         "source_refresh": ("*", "10", "30"),
-        "growth_discovery": ("*", "11", "0"),
+        "growth_digest": ("*", "9", "0"),
         "follower_snapshot": ("*", "23", "15"),
         "performance_metrics": ("*", "23", "30"),
         "weekly_growth_report": ("mon", "9", "0"),
@@ -751,6 +751,23 @@ def test_register_jobs_uses_rome_timezone_and_only_safe_jobs(agent_and_fakes):
     }
     assert all(job.coalesce is True for job in jobs if job.id in intervals)
     assert all(job.max_instances == 1 for job in jobs if job.id in intervals)
+    growth_job = next(job for job in jobs if job.id == "growth_digest")
+    assert growth_job.coalesce is True
+    assert growth_job.max_instances == 1
+    assert growth_job.misfire_grace_time == 300
+    before_dst = datetime(2026, 3, 28, 9, 1, tzinfo=ROME)
+    first_after_dst = growth_job.trigger.get_next_fire_time(None, before_dst)
+    second_after_dst = growth_job.trigger.get_next_fire_time(
+        first_after_dst, first_after_dst,
+    )
+    assert (
+        first_after_dst.date().isoformat(), first_after_dst.hour,
+        first_after_dst.utcoffset().total_seconds(),
+    ) == ("2026-03-29", 9, 7200)
+    assert (
+        second_after_dst.date().isoformat(), second_after_dst.hour,
+        second_after_dst.utcoffset().total_seconds(),
+    ) == ("2026-03-30", 9, 7200)
     assert not any(job.id.startswith(("draft_", "publish_")) for job in jobs)
     assert not any(job.id.startswith(
         ("engagement_", "follow_", "unfollow_", "human_", "build_")
@@ -762,6 +779,123 @@ def test_register_jobs_uses_rome_timezone_and_only_safe_jobs(agent_and_fakes):
     assert source_job.trigger.fields[5].expressions[0].first == 10
     assert source_job.trigger.fields[6].expressions[0].first == 30
     assert not any(job.id == "verified_news_refresh" for job in jobs)
+
+
+def test_daily_growth_digest_restart_and_all_callbacks_never_write_x(tmp_path):
+    from tests.test_growth_digest_telegram import _buttons, _seed_digest
+
+    dependencies = dependency_bundle(tmp_path)
+    digest_now = datetime(2026, 8, 26, 9, 0, tzinfo=ROME)
+    dependencies["clock"] = lambda: digest_now
+    digest = _seed_digest(dependencies["db"])
+    agent = FlexDropinGrowthAgent(dependencies)
+
+    first_jobs = agent.register_jobs()
+    second_jobs = agent.register_jobs()
+    assert len(first_jobs) == len(second_jobs) == 9
+    growth_job = next(job for job in second_jobs if job.id == "growth_digest")
+    assert growth_job.func(now=digest_now) == "growth_digest_silent"
+    assert agent.db.get_growth_reevaluation_candidates(digest_now, limit=5) == []
+
+    assert agent.telegram_controller.process_update({
+        "update_id": 760,
+        "message": {"chat": {"id": 42}, "text": "/growth"},
+    }) == "processed"
+    navigation = {
+        button["text"]: button["callback_data"]
+        for button in _buttons(dependencies["telegram_api"].messages[-1])
+    }
+
+    assert agent.telegram_controller.process_update(
+        callback_update(761, navigation["Account"])
+    ) == "processed"
+    account_action = _buttons(dependencies["telegram_api"].messages[-1])[1][
+        "callback_data"
+    ]
+    assert agent.telegram_controller.process_update(
+        callback_update(762, account_action)
+    ) == "processed"
+
+    assert agent.telegram_controller.process_update(
+        callback_update(763, navigation["Post"])
+    ) == "processed"
+    assert agent.telegram_controller.process_update(
+        callback_update(764, navigation["Da rivalutare"])
+    ) == "processed"
+    reevaluate_actions = _buttons(dependencies["telegram_api"].messages[-1])
+    assert agent.telegram_controller.process_update(
+        callback_update(765, reevaluate_actions[1]["callback_data"])
+    ) == "processed"
+    assert agent.telegram_controller.process_update(
+        callback_update(766, reevaluate_actions[2]["callback_data"])
+    ) == "processed"
+    assert agent.telegram_controller.process_update(
+        callback_update(767, account_action, chat_id=999)
+    ) == "unauthorized"
+
+    restart_dependencies = dict(dependencies)
+    restart_dependencies["db"] = Database(dependencies["db"].db_path)
+    restart_dependencies["telegram_api"] = FakeTelegramApi(
+        tmp_path / "restart-media"
+    )
+    restarted = FlexDropinGrowthAgent(restart_dependencies)
+    restarted.register_jobs()
+    assert restarted.telegram_controller.process_update(
+        callback_update(768, account_action)
+    ) == "processed"
+    assert "nessuna azione" in restart_dependencies["telegram_api"].messages[-1][
+        1
+    ].lower()
+
+    assert digest["accounts"] and digest["posts"] and digest["reevaluate"]
+    assert dependencies["x_client"].engagement_writes == []
+    assert dependencies["x_client"].posts == []
+
+
+def test_growth_digest_cycle_reads_clock_once_and_reuses_controller_formatter(
+    tmp_path,
+):
+    empty = {
+        "observed_on": "2026-08-11", "accounts": [], "posts": [],
+        "reevaluate": [], "outcome": "created",
+    }
+
+    class CountingClock:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            return NOW
+
+    class Digest:
+        def __init__(self):
+            self.calls = []
+
+        def build(self, current):
+            self.calls.append(current)
+            return empty
+
+    class Controller:
+        def __init__(self):
+            self.calls = []
+
+        def push_growth_digest(self, digest, *, explicit):
+            self.calls.append((digest, explicit))
+            return "growth_digest_silent"
+
+    clock, digest, controller = CountingClock(), Digest(), Controller()
+    agent = FlexDropinGrowthAgent(dependency_bundle(
+        tmp_path,
+        clock=clock,
+        growth_digest=digest,
+        telegram_controller=controller,
+    ))
+
+    assert agent.growth_digest_cycle() == "growth_digest_silent"
+    assert clock.calls == 1
+    assert digest.calls == [NOW]
+    assert controller.calls == [(empty, False)]
 
 
 def test_adaptive_cycles_use_one_clock_read_and_stop_event(tmp_path):
@@ -1137,6 +1271,7 @@ def test_falsey_required_boundary_is_used_without_production_fallback(
         ("publisher", "publisher"),
         ("analytics", "analytics"),
         ("growth_discovery", "growth_discovery"),
+        ("growth_digest", "growth_digest"),
         ("telegram_controller", "telegram_controller"),
     ),
 )

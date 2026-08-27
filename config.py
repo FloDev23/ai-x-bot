@@ -72,6 +72,7 @@ _TIME_WINDOW_FORMAT = re.compile(
     r"^(?P<start_hour>[01][0-9]|2[0-3]):(?P<start_minute>[0-5][0-9])-"
     r"(?P<end_hour>[01][0-9]|2[0-3]):(?P<end_minute>[0-5][0-9])$"
 )
+_CLOCK_TIME_FORMAT = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 
 
 def _strict_positive_int_env(name, default):
@@ -90,6 +91,23 @@ def _strict_positive_int_env(name, default):
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _bounded_positive_int_env(name, default, maximum):
+    value = _strict_positive_int_env(name, default)
+    if value > maximum:
+        raise ValueError(f"{name} must be between 1 and {maximum}")
+    return value
+
+
+def _strict_clock_time_env(name, default):
+    raw_value = os.getenv(name, default)
+    if (
+        not isinstance(raw_value, str)
+        or _CLOCK_TIME_FORMAT.fullmatch(raw_value) is None
+    ):
+        raise ValueError(f"{name} must use HH:MM")
+    return raw_value
 
 
 def _strict_time_window_env(name, default):
@@ -201,7 +219,41 @@ def _adaptive_configuration():
     }
 
 
+def _growth_digest_configuration():
+    digest_time = _strict_clock_time_env("GROWTH_DIGEST_TIME", "09:00")
+    account_limit = _bounded_positive_int_env(
+        "GROWTH_ACCOUNT_SUGGESTION_LIMIT", 5, 5,
+    )
+    post_limit = _bounded_positive_int_env(
+        "GROWTH_POST_SUGGESTION_LIMIT", 10, 10,
+    )
+    post_query_budget = _bounded_positive_int_env(
+        "GROWTH_POST_QUERY_BUDGET", 2, 2,
+    )
+    cooldown_days = _strict_positive_int_env(
+        "GROWTH_SUGGESTION_COOLDOWN_DAYS", 30,
+    )
+    if cooldown_days != 30:
+        raise ValueError(
+            "GROWTH_SUGGESTION_COOLDOWN_DAYS must be exactly 30 for this release"
+        )
+    review_days = _strict_positive_int_env("GROWTH_UNFOLLOW_REVIEW_DAYS", 14)
+    if review_days != 14:
+        raise ValueError(
+            "GROWTH_UNFOLLOW_REVIEW_DAYS must be exactly 14 for this release"
+        )
+    return {
+        "GROWTH_DIGEST_TIME": digest_time,
+        "GROWTH_ACCOUNT_SUGGESTION_LIMIT": account_limit,
+        "GROWTH_POST_SUGGESTION_LIMIT": post_limit,
+        "GROWTH_POST_QUERY_BUDGET": post_query_budget,
+        "GROWTH_SUGGESTION_COOLDOWN_DAYS": cooldown_days,
+        "GROWTH_UNFOLLOW_REVIEW_DAYS": review_days,
+    }
+
+
 _ADAPTIVE_CONFIGURATION = _adaptive_configuration()
+_GROWTH_DIGEST_CONFIGURATION = _growth_digest_configuration()
 POSTS_PER_DAY = _ADAPTIVE_CONFIGURATION["POSTS_PER_DAY"]
 THIRD_POST_DAYS_PER_WEEK = _ADAPTIVE_CONFIGURATION["THIRD_POST_DAYS_PER_WEEK"]
 APPROVED_QUEUE_TARGET = _ADAPTIVE_CONFIGURATION["APPROVED_QUEUE_TARGET"]
@@ -219,6 +271,22 @@ THIRD_POST_TIMING_MIN_POSTS = _ADAPTIVE_CONFIGURATION[
 ]
 PUBLICATION_PLAN_GRACE_MINUTES = _ADAPTIVE_CONFIGURATION[
     "PUBLICATION_PLAN_GRACE_MINUTES"
+]
+GROWTH_DIGEST_TIME = _GROWTH_DIGEST_CONFIGURATION["GROWTH_DIGEST_TIME"]
+GROWTH_ACCOUNT_SUGGESTION_LIMIT = _GROWTH_DIGEST_CONFIGURATION[
+    "GROWTH_ACCOUNT_SUGGESTION_LIMIT"
+]
+GROWTH_POST_SUGGESTION_LIMIT = _GROWTH_DIGEST_CONFIGURATION[
+    "GROWTH_POST_SUGGESTION_LIMIT"
+]
+GROWTH_POST_QUERY_BUDGET = _GROWTH_DIGEST_CONFIGURATION[
+    "GROWTH_POST_QUERY_BUDGET"
+]
+GROWTH_SUGGESTION_COOLDOWN_DAYS = _GROWTH_DIGEST_CONFIGURATION[
+    "GROWTH_SUGGESTION_COOLDOWN_DAYS"
+]
+GROWTH_UNFOLLOW_REVIEW_DAYS = _GROWTH_DIGEST_CONFIGURATION[
+    "GROWTH_UNFOLLOW_REVIEW_DAYS"
 ]
 
 
@@ -392,5 +460,8 @@ def validate_config():
 
     if current_adaptive_configuration != _ADAPTIVE_CONFIGURATION:
         raise ValueError("Adaptive publishing configuration changed after import")
+
+    if _growth_digest_configuration() != _GROWTH_DIGEST_CONFIGURATION:
+        raise ValueError("Growth digest configuration changed after import")
 
     print("✅ Configurazione validata con successo!")

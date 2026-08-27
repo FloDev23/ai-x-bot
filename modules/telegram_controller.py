@@ -67,12 +67,6 @@ _MANUAL_CATEGORY_LABELS = {
     "product_proof": "Prodotto",
     "founder_journey": "Percorso founder",
 }
-_GROWTH_REASONS = {
-    "not_relevant": "Non pertinente",
-    "low_quality": "Qualità bassa",
-    "already_known": "Già noto",
-}
-_SAFE_USERNAME = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 _SAFE_CALLBACK_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,4096}$")
 _PREVIEW_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
@@ -97,6 +91,7 @@ class TelegramController:
         media_processor=None,
         media_matcher=None,
         analytics=None,
+        growth_digest=None,
         scheduler_status=None,
         queue_service=None,
         dry_run: Optional[bool] = None,
@@ -113,6 +108,7 @@ class TelegramController:
         self.media_processor = media_processor
         self.media_matcher = media_matcher
         self.analytics = analytics
+        self.growth_digest = growth_digest
         self.scheduler_status = scheduler_status
         self.queue_service = queue_service
         self.dry_run = DRY_RUN if dry_run is None else bool(dry_run)
@@ -766,72 +762,204 @@ class TelegramController:
         return "post_detail"
 
     @staticmethod
-    def _candidate_url(candidate: Dict[str, Any]) -> Optional[str]:
-        profile = candidate.get("profile") or {}
-        username = candidate.get("username") or (
-            profile.get("username") if isinstance(profile, dict) else None
-        )
-        if not isinstance(username, str) or _SAFE_USERNAME.fullmatch(username) is None:
+    def _growth_digest_collections(digest: Any):
+        if type(digest) is not dict:
             return None
-        latest = candidate.get("latest_post") or {}
-        tweet_id = None
-        if isinstance(latest, dict):
-            tweet_id = latest.get("id") or latest.get("tweet_id")
-        if isinstance(tweet_id, str) and tweet_id.isascii() and tweet_id.isdigit():
-            return f"https://x.com/{username}/status/{tweet_id}"
-        return f"https://x.com/{username}"
+        limits = {"accounts": 5, "posts": 10, "reevaluate": 5}
+        collections = {}
+        for name, limit in limits.items():
+            rows = digest.get(name)
+            if type(rows) is not list:
+                return None
+            safe_rows = []
+            for row in rows[:limit]:
+                if (
+                    type(row) is not dict
+                    or type(row.get("id")) is not int
+                    or row["id"] <= 0
+                    or type(row.get("revision")) is not int
+                    or row["revision"] < 0
+                ):
+                    return None
+                safe_rows.append(row)
+            collections[name] = safe_rows
+        return collections
 
-    def _growth_card(self, candidate: Dict[str, Any]):
-        profile = candidate.get("profile") or {}
-        latest = candidate.get("latest_post") or {}
-        username = self._clean_text(candidate.get("username"), 40) or "sconosciuto"
-        bio = self._clean_text(
-            profile.get("description") if isinstance(profile, dict) else None, 400,
-        )
-        followers = profile.get("followers_count") if isinstance(profile, dict) else None
-        latest_text = self._clean_text(
-            latest.get("text") if isinstance(latest, dict) else None, 500,
-        )
+    def push_growth_digest(self, digest: Dict[str, Any], *, explicit: bool = False):
+        """Send one bounded summary; detail callbacks reload SQLite rows."""
+        collections = self._growth_digest_collections(digest)
+        if collections is None:
+            if explicit:
+                self._send(self.authorized_chat_id, "Nessun nuovo suggerimento.")
+                return "growth_digest_empty"
+            return "growth_digest_silent"
+        total = sum(len(rows) for rows in collections.values())
+        if not explicit and (not total or digest.get("outcome") != "created"):
+            return "growth_digest_silent"
+        if not total:
+            self._send(self.authorized_chat_id, "Nessun nuovo suggerimento.")
+            return "growth_digest_empty"
+
         lines = [
-            f"Candidato #{candidate.get('id')} — @{username}",
-            f"score: {candidate.get('score')}",
-            f"fonte: {self._clean_text(candidate.get('discovery_source'), 80) or 'n/d'}",
-            f"follower: {followers if type(followers) is int else 'n/d'}",
+            "Growth giornaliero — azioni solo manuali",
+            f"Account: {len(collections['accounts'])}",
+            f"Post: {len(collections['posts'])}",
+            f"Da rivalutare: {len(collections['reevaluate'])}",
         ]
-        if bio:
-            lines.append(f"bio: {bio}")
-        if latest_text:
-            lines.append(f"segnale: {latest_text}")
-        candidate_id = candidate.get("id")
         rows = []
-        direct_url = self._candidate_url(candidate)
-        if direct_url:
-            rows.append([{"text": "Open on X", "url": direct_url}])
-        if type(candidate_id) is int:
-            rows.extend([
-                [
-                    self._callback_button("Salva", f"growth:save:{candidate_id}"),
-                    self._callback_button(
-                        "Seguito su X", f"growth:followed:{candidate_id}",
-                    ),
-                ],
-                [self._callback_button("Scarta", f"growth:discard:{candidate_id}")],
-            ])
-        return "\n".join(lines), self._callback_markup(rows) if rows else None
+        for collection, label, code in (
+            ("accounts", "Account", "a"),
+            ("posts", "Post", "p"),
+            ("reevaluate", "Da rivalutare", "r"),
+        ):
+            if not collections[collection]:
+                continue
+            first = collections[collection][0]
+            rows.append([self._callback_button(
+                label, f"gd:{code}:{first['id']}:{first['revision']}",
+            )])
+        self._send(
+            self.authorized_chat_id,
+            "\n".join(lines),
+            reply_markup=self._callback_markup(rows),
+        )
+        return "growth_digest"
 
     def _growth(self, chat_id: str):
-        report = self._build_weekly_analytics_report(self._now())
-        if isinstance(report, dict) and report:
-            self._send(chat_id, self.format_weekly_report(report))
-        candidates = self.db.get_digest_candidates(limit=5)
-        if not candidates:
-            self._send(chat_id, "Nessun candidato growth disponibile.")
-            return "growth_empty"
-        self._send(chat_id, f"Growth: {len(candidates)} candidati. Azioni solo manuali.")
-        for candidate in candidates:
-            text, markup = self._growth_card(candidate)
-            self._send(chat_id, text, reply_markup=markup)
-        return "growth"
+        del chat_id
+        if self.growth_digest is None:
+            self._send(self.authorized_chat_id, "Nessun nuovo suggerimento.")
+            return "growth_digest_empty"
+        digest = self.growth_digest.build(self._now())
+        return self.push_growth_digest(digest, explicit=True)
+
+    def _growth_digest_detail(self, chat_id: str, parts):
+        if len(parts) != 4 or parts[1] not in {"a", "p", "r"}:
+            self._send(chat_id, "Suggerimento non valido o scaduto.")
+            return "growth_digest_unavailable"
+        suggestion_id = self._positive_id(parts[2])
+        revision = self._nonnegative_id(parts[3])
+        if suggestion_id is None or revision is None:
+            self._send(chat_id, "Suggerimento non valido o scaduto.")
+            return "growth_digest_unavailable"
+        suggestion = self.db.get_growth_suggestion(suggestion_id, revision)
+        expected_kind = {"a": "account", "p": "post", "r": "reevaluate"}[
+            parts[1]
+        ]
+        if suggestion is None or suggestion.get("kind") != expected_kind:
+            self._send(chat_id, "Suggerimento non valido o scaduto.")
+            return "growth_digest_unavailable"
+        username = suggestion["username"]
+        payload = suggestion["payload"]
+        reason = ", ".join(suggestion["reason_codes"])
+        if expected_kind == "post":
+            text = "\n".join([
+                f"Post di @{username}",
+                f"Estratto: {self._clean_text(payload.get('excerpt'), 500)}",
+                f"Motivo: {reason}",
+            ])
+            rows = [[{
+                "text": "Apri post su X",
+                "url": f"https://x.com/{username}/status/{suggestion['object_id']}",
+            }]]
+        else:
+            metrics = payload["public_metrics"]
+            text = "\n".join([
+                (
+                    f"{'Account' if expected_kind == 'account' else 'Da rivalutare'} "
+                    f"@{username}"
+                ),
+                f"follower: {metrics['followers_count']}",
+                f"following: {metrics['following_count']}",
+                f"post: {metrics['tweet_count']}",
+                f"liste: {metrics['listed_count']}",
+                f"Motivo: {reason}",
+            ])
+            rows = [[{
+                "text": "Apri account su X",
+                "url": f"https://x.com/{username}",
+            }]]
+            if expected_kind == "account":
+                rows.append([self._callback_button(
+                    "Segnala come seguito",
+                    f"gda:a:{suggestion_id}:{revision}",
+                )])
+            else:
+                rows.append([
+                    self._callback_button(
+                        "Segna ancora pertinente",
+                        f"gda:r:{suggestion_id}:{revision}",
+                    ),
+                    self._callback_button(
+                        "Ignora suggerimento",
+                        f"gda:d:{suggestion_id}:{revision}",
+                    ),
+                ])
+        digest = self.db.get_growth_digest(suggestion["observed_on"])
+        collection_name = {
+            "account": "accounts", "post": "posts", "reevaluate": "reevaluate",
+        }[expected_kind]
+        siblings = digest.get(collection_name, []) if isinstance(digest, dict) else []
+        position = next(
+            (
+                index for index, sibling in enumerate(siblings)
+                if sibling.get("id") == suggestion_id
+            ),
+            None,
+        )
+        if position is not None and len(siblings) > 1:
+            navigation = []
+            if position > 0:
+                previous = siblings[position - 1]
+                navigation.append(self._callback_button(
+                    "Precedente",
+                    f"gd:{parts[1]}:{previous['id']}:{previous['revision']}",
+                ))
+            if position + 1 < len(siblings):
+                following = siblings[position + 1]
+                navigation.append(self._callback_button(
+                    "Successivo",
+                    f"gd:{parts[1]}:{following['id']}:{following['revision']}",
+                ))
+            if navigation:
+                rows.append(navigation)
+        self._send(chat_id, text, reply_markup=self._callback_markup(rows))
+        return "growth_digest_detail"
+
+    def _growth_digest_action(self, chat_id: str, parts):
+        decisions = {
+            "a": "followed_manually",
+            "r": "still_relevant",
+            "d": "dismissed",
+        }
+        if len(parts) != 4 or parts[1] not in decisions:
+            self._send(chat_id, "Azione locale non valida.")
+            return "growth_digest_action_invalid"
+        suggestion_id = self._positive_id(parts[2])
+        revision = self._nonnegative_id(parts[3])
+        if suggestion_id is None or revision is None:
+            self._send(chat_id, "Azione locale non valida.")
+            return "growth_digest_action_invalid"
+        outcome = self.db.mark_growth_suggestion_decision(
+            suggestion_id,
+            revision,
+            decisions[parts[1]],
+            decided_at=self._now(),
+        )
+        if outcome not in {"updated", "duplicate"}:
+            self._send(chat_id, "Azione non disponibile o già sostituita.")
+            return "growth_digest_action_rejected"
+        if parts[1] == "a":
+            self._send(
+                chat_id,
+                "Seguito registrato solo localmente; nessuna azione è stata inviata a X.",
+            )
+            return "followed_manually"
+        if parts[1] == "r":
+            self._send(chat_id, "Pertinenza registrata solo localmente.")
+            return "still_relevant"
+        self._send(chat_id, "Suggerimento ignorato solo localmente.")
+        return "dismissed"
 
     def _build_weekly_analytics_report(self, end_date):
         report = None
@@ -1838,8 +1966,10 @@ class TelegramController:
             draft_id = self._positive_id(parts[2])
             if draft_id is not None:
                 return self._draft_callback(chat_id, parts[1], draft_id)
-        if parts[0] == "growth":
-            return self._growth_callback(chat_id, parts)
+        if parts[0] == "gd":
+            return self._growth_digest_detail(chat_id, parts)
+        if parts[0] == "gda":
+            return self._growth_digest_action(chat_id, parts)
         if parts[0] == "input":
             return self._input_callback(chat_id, parts)
         if parts[0] == "manual":
@@ -2496,47 +2626,6 @@ class TelegramController:
             )
 
         self._send(chat_id, "Azione manuale non valida.")
-        return "invalid_callback"
-
-    def _growth_callback(self, chat_id: str, parts):
-        if len(parts) == 3 and parts[1] in {"save", "followed", "discard"}:
-            candidate_id = self._positive_id(parts[2])
-            if candidate_id is None:
-                self._send(chat_id, "Candidato non valido.")
-                return "invalid_callback"
-            if parts[1] == "discard":
-                rows = [[
-                    self._callback_button(
-                        label, f"growth:reason:{candidate_id}:{reason}",
-                    )
-                ] for reason, label in _GROWTH_REASONS.items()]
-                self._send(
-                    chat_id,
-                    "Perché vuoi scartarlo?",
-                    reply_markup=self._callback_markup(rows),
-                )
-                return "growth_discard_reason"
-            decision = "saved" if parts[1] == "save" else "followed_manually"
-            if not self.db.mark_candidate_decision(candidate_id, decision):
-                self._send(chat_id, "Decisione già registrata o non valida.")
-                return "growth_decision_rejected"
-            message = "Candidato salvato." if decision == "saved" else (
-                "Azione manuale registrata; nessuna azione è stata inviata a X."
-            )
-            self._send(chat_id, message)
-            return decision
-        if len(parts) == 4 and parts[1] == "reason":
-            candidate_id = self._positive_id(parts[2])
-            reason = parts[3]
-            if candidate_id is None or reason not in _GROWTH_REASONS:
-                self._send(chat_id, "Motivo non valido.")
-                return "invalid_callback"
-            if not self.db.mark_candidate_decision(candidate_id, "discarded", reason):
-                self._send(chat_id, "Decisione già registrata o non valida.")
-                return "growth_decision_rejected"
-            self._send(chat_id, "Candidato scartato per 30 giorni.")
-            return "growth_discarded"
-        self._send(chat_id, "Azione growth non valida.")
         return "invalid_callback"
 
     def _ingest_media(self, chat_id: str, message: Dict[str, Any]):

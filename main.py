@@ -25,7 +25,11 @@ from config import (
     DRAFT_SCORE_THRESHOLD,
     DRY_RUN,
     ENABLE_LEAD_DISCOVERY,
-    GROWTH_DIGEST_LIMIT,
+    GROWTH_ACCOUNT_SUGGESTION_LIMIT,
+    GROWTH_DIGEST_TIME,
+    GROWTH_POST_QUERY_BUDGET,
+    GROWTH_POST_SUGGESTION_LIMIT,
+    GROWTH_SUGGESTION_COOLDOWN_DAYS,
     LEAD_NOTIFY_MIN_SCORE,
     MEDIA_LIBRARY_DIR,
     MEDIA_MATCH_THRESHOLD,
@@ -56,6 +60,7 @@ from modules.draft_pipeline import DraftPipeline
 from modules.editorial_feed import FlexDropinEditorialFeedClient
 from modules.fact_guard import FactGuard
 from modules.growth_discovery import GrowthDiscovery
+from modules.growth_digest import GrowthDigestService
 from modules.lead_finder import LeadFinder
 from modules.media_matcher import MediaMatcher
 from modules.media_processor import MediaProcessor
@@ -107,6 +112,7 @@ class FlexDropinGrowthAgent:
         "fact_guard",
         "generator",
         "growth_discovery",
+        "growth_digest",
         "lead_discovery_enabled",
         "lead_cycle_times",
         "lead_finder",
@@ -364,6 +370,18 @@ class FlexDropinGrowthAgent:
             "growth_discovery",
             lambda: GrowthDiscovery(self.twitter_client, self.db),
         )
+        self.growth_digest = resolve(
+            "growth_digest",
+            lambda: GrowthDigestService(
+                self.twitter_client,
+                self.db,
+                discovery=self.growth_discovery,
+                account_limit=GROWTH_ACCOUNT_SUGGESTION_LIMIT,
+                post_limit=GROWTH_POST_SUGGESTION_LIMIT,
+                post_query_budget=GROWTH_POST_QUERY_BUDGET,
+                cooldown_days=GROWTH_SUGGESTION_COOLDOWN_DAYS,
+            ),
+        )
         self.lead_finder = resolve(
             "lead_finder",
             lambda: LeadFinder(
@@ -389,6 +407,7 @@ class FlexDropinGrowthAgent:
                 media_processor=self.media_processor,
                 media_matcher=self.media_matcher,
                 analytics=self.analytics,
+                growth_digest=self.growth_digest,
                 scheduler_status=self.scheduler_status,
                 queue_service=self.queue_replenisher,
                 dry_run=self.dry_run,
@@ -604,29 +623,16 @@ class FlexDropinGrowthAgent:
             self._notify_error("adaptive_publish_cycle", error)
             return []
 
-    def growth_discovery_cycle(self, now=None):
+    def growth_digest_cycle(self, now=None):
         try:
-            candidates = self.growth_discovery.run(
-                self._now() if now is None else now
+            current = self._now() if now is None else now
+            digest = self.growth_digest.build(current)
+            return self.telegram_controller.push_growth_digest(
+                digest, explicit=False,
             )
-            if not candidates:
-                return []
-            candidates = candidates[:GROWTH_DIGEST_LIMIT]
-            self.telegram_controller._send(
-                self.authorized_chat_id,
-                f"Growth: {len(candidates)} candidati. Azioni solo manuali.",
-            )
-            for candidate in candidates:
-                text, markup = self.telegram_controller._growth_card(candidate)
-                self.telegram_controller._send(
-                    self.authorized_chat_id,
-                    text,
-                    reply_markup=markup,
-                )
-            return candidates
         except Exception as error:
-            self._notify_error("cycle", error)
-            return []
+            self._notify_error("growth_digest_cycle", error)
+            return "growth_digest_failed"
 
     def follower_snapshot_cycle(self, now=None):
         try:
@@ -675,11 +681,15 @@ class FlexDropinGrowthAgent:
         minute,
         args=None,
         day_of_week=None,
+        timezone=None,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=300,
     ):
         trigger_options = {
             "hour": hour,
             "minute": minute,
-            "timezone": self.timezone,
+            "timezone": self.timezone if timezone is None else timezone,
         }
         if day_of_week is not None:
             trigger_options["day_of_week"] = day_of_week
@@ -690,6 +700,9 @@ class FlexDropinGrowthAgent:
             name=name,
             args=args,
             replace_existing=True,
+            coalesce=coalesce,
+            max_instances=max_instances,
+            misfire_grace_time=misfire_grace_time,
         )
 
     def _add_interval_job(self, function, *, job_id, name, minutes):
@@ -739,12 +752,14 @@ class FlexDropinGrowthAgent:
             name="Publish due approved plan",
             minutes=5,
         )
+        growth_hour, growth_minute = self._slot_parts(GROWTH_DIGEST_TIME)
         self._add_cron_job(
-            self.growth_discovery_cycle,
-            job_id="growth_discovery",
-            name="Read-only growth discovery",
-            hour=11,
-            minute=0,
+            self.growth_digest_cycle,
+            job_id="growth_digest",
+            name="Daily manual growth digest",
+            hour=growth_hour,
+            minute=growth_minute,
+            timezone=ZoneInfo("Europe/Rome"),
         )
         self._add_cron_job(
             self.follower_snapshot_cycle,
