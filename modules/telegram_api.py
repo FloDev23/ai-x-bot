@@ -704,6 +704,14 @@ class TelegramApi:
             timeout=REQUEST_TIMEOUT,
         )
 
+    def set_my_commands(self, commands: list) -> bool:
+        """Register bot commands so they appear in the Telegram '/' menu."""
+        try:
+            self._post("setMyCommands", {"commands": commands}, timeout=REQUEST_TIMEOUT)
+            return True
+        except Exception:
+            return False
+
     @staticmethod
     def _validate_remote_file_path(file_path: str) -> str:
         if not isinstance(file_path, str) or not file_path:

@@ -810,11 +810,33 @@ class FlexDropinGrowthAgent:
             })
         return result
 
+    def _register_telegram_commands(self):
+        register = getattr(self.telegram_api, "set_my_commands", None)
+        if not callable(register):
+            return
+        commands = [
+            {"command": "posts",   "description": "Bozze in coda e pianificate"},
+            {"command": "newpost", "description": "Crea nuovo post manuale"},
+            {"command": "media",   "description": "Libreria media"},
+            {"command": "status",  "description": "Stato bot e conteggi coda"},
+            {"command": "growth",  "description": "Digest crescita giornaliero"},
+            {"command": "errors",  "description": "Errori recenti"},
+            {"command": "stats",   "description": "Report settimanale analytics"},
+            {"command": "ideas",   "description": "Aggiungi fonte di contenuto"},
+            {"command": "pause",   "description": "Pausa scheduler"},
+            {"command": "resume",  "description": "Riprendi scheduler"},
+            {"command": "help",    "description": "Aiuto comandi"},
+        ]
+        ok = register(commands)
+        if not ok:
+            logger.warning("set_my_commands failed — menu buttons not registered")
+
     def start(self, block=True):
         """Start the scheduler and one stoppable Telegram polling thread."""
         if self._scheduler_started:
             raise RuntimeError("agent already started")
         self.stop_event.clear()
+        self._register_telegram_commands()
         self.register_jobs()
         self.scheduler.start()
         self._scheduler_started = True
