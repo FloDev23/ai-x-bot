@@ -10,6 +10,7 @@ from uuid import uuid4
 from modules.scoring import SCORE_AXES, semantic_similarity
 from modules.fact_guard import INCIDENT_SUBTYPES, SUPPORTED_CLAIM_TYPES
 from modules.manual_post_service import ManualPostService
+from modules.content_planner import PORTFOLIO
 
 
 _REASON_CODE = re.compile(r"^[a-z0-9_:-]+$")
@@ -632,6 +633,23 @@ class DraftPipeline:
             approved_by.strip(),
             now.isoformat(),
         )
+
+    def suggest_from_media_context(self, context: str, category: str) -> Optional[str]:
+        """Generate tweet text from operator's media context. Returns text or None."""
+        if (
+            type(context) is not str
+            or not context.strip()
+            or len(context) > 500
+            or type(category) is not str
+            or category not in PORTFOLIO
+        ):
+            return None
+        if not callable(getattr(self.generator, "generate_from_media_context", None)):
+            return None
+        try:
+            return self.generator.generate_from_media_context(context.strip(), category)
+        except Exception:
+            return None
 
     def regenerate(self, draft_id) -> Optional[Dict]:
         prior = self.db.get_post_draft(draft_id)

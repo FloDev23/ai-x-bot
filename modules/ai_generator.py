@@ -290,6 +290,31 @@ Reply only with the post text, without quotes or explanation."""
         text = text.strip()
         return {"text": text, "agent_used": agent_name}
 
+    def generate_from_media_context(self, context: str, category: str) -> Optional[str]:
+        """Generate an X post using operator's media caption as creative brief."""
+        agent_name = _category_agents(category)[0]
+        category_instruction = _category_instruction(category)
+        prompt = (
+            f'Write ONE English X post for category "{category}".\n'
+            "Maximum 280 characters. Draw inspiration from MEDIA_CONTEXT below.\n"
+            "Do not add external facts, statistics or events not present in MEDIA_CONTEXT.\n"
+            f"{category_instruction}\n\n"
+            "MEDIA_CONTEXT (operator description of the uploaded visual):\n"
+            f"{context[:500]}\n\n"
+            "Reply only with the post text, without quotes or explanation."
+        )
+        text = self._complete(
+            _agent_prompt(agent_name),
+            prompt,
+            max_tokens=_GROUNDED_COMPLETION_MAX_TOKENS,
+        )
+        if not isinstance(text, str) or not text.strip():
+            return None
+        text = text.strip()
+        if len(text) > 280:
+            return None
+        return text
+
     def translate_review_copy(self, english_text: str) -> Optional[str]:
         """Translate canonical English copy for review without changing facts."""
         if (

@@ -2644,7 +2644,10 @@ class Database:
             sort_keys=True,
             separators=(",", ":"),
         )
-        normalized_slot = self._normalize_datetime_iso(intended_slot)
+        try:
+            normalized_slot = self._normalize_datetime_iso(intended_slot)
+        except (TypeError, ValueError):
+            return None, "rejected"
         if normalized_slot is None:
             return None, "rejected"
         now = self._now_iso()
@@ -2678,8 +2681,9 @@ class Database:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO editorial_queue (
-                    draft_id, translation_status, created_at, updated_at
-                ) VALUES (?, 'pending', ?, ?)
+                    draft_id, translation_status, created_at, updated_at,
+                    translation_policy
+                ) VALUES (?, 'pending', ?, ?, 'advisory')
                 """,
                 (draft_id, now, now),
             )
@@ -3001,7 +3005,7 @@ class Database:
     ) -> Optional[List[int]]:
         if origin == "generated":
             return cls._decode_source_ids(raw_value)
-        if origin != "manual_operator":
+        if origin not in {"manual_operator", "media_suggested"}:
             return None
         try:
             decoded = json.loads(raw_value)
@@ -3042,7 +3046,7 @@ class Database:
         if (
             source_ids is None
             or type(score_data) is not dict
-            or record.get("origin") not in {"generated", "manual_operator"}
+            or record.get("origin") not in {"generated", "manual_operator", "media_suggested"}
             or record.get("translation_policy") not in {"required", "advisory"}
             or record.get("translation_status") not in queue_statuses
             or record.get("status") not in draft_statuses
@@ -3530,7 +3534,7 @@ class Database:
                 conn, source_ids, validation_time
             ):
                 return False
-            if not source_ids and current["origin"] != "manual_operator":
+            if not source_ids and current["origin"] not in {"manual_operator", "media_suggested"}:
                 return False
             if not self._queue_media_binding_valid_in_conn(conn, current):
                 return False

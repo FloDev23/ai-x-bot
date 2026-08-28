@@ -1142,6 +1142,84 @@ class TelegramController:
         rows.append([self._callback_button("Annulla", "manual:cancel")])
         return self._callback_markup(rows)
 
+    def _msugg_category_markup(self, media_id: int):
+        rows = [
+            [self._callback_button(label, f"msugg:{media_id}:{cat}")]
+            for cat, label in _MANUAL_CATEGORY_LABELS.items()
+        ]
+        rows.append([self._callback_button("Salta", "msugg:skip")])
+        return self._callback_markup(rows)
+
+    def _msugg_callback(self, chat_id: str, parts) -> str:
+        if len(parts) == 2 and parts[1] == "skip":
+            return "msugg_skipped"
+        if len(parts) == 4 and parts[1] == "ok":
+            media_id = self._positive_id(parts[2])
+            category = parts[3]
+            if media_id is None or category not in _MANUAL_CATEGORY_LABELS:
+                self._send(chat_id, "Azione non valida.")
+                return "invalid_callback"
+            state_key = f"media_suggest:{media_id}:{category}"
+            text = self.db.get_state(state_key)
+            if not isinstance(text, str) or not text.strip() or len(text) > 280:
+                self._send(chat_id, "Testo non più disponibile. Rigenera.")
+                return "msugg_state_missing"
+            slot = (self._now() + timedelta(days=3)).replace(
+                hour=12, minute=0, second=0, microsecond=0,
+            )
+            draft, outcome = self.db.create_media_suggested_draft(
+                text=text.strip(),
+                category=category,
+                publication_key=f"media-suggest:{uuid4().hex}",
+                intended_slot=slot.isoformat(),
+            )
+            if outcome not in {"created", "existing"} or draft is None:
+                self._send(chat_id, "Creazione bozza non riuscita.")
+                return "msugg_draft_failed"
+            queued = self.db.get_queue_draft(draft.get("id")) or draft
+            self._send(chat_id, "Bozza creata — approvazione in attesa.")
+            self._send_draft_card(chat_id, queued)
+            return "msugg_confirmed"
+        if len(parts) == 3:
+            media_id = self._positive_id(parts[1])
+            category = parts[2]
+            if media_id is None or category not in _MANUAL_CATEGORY_LABELS:
+                self._send(chat_id, "Azione non valida.")
+                return "invalid_callback"
+            media = self.db.get_media_by_id(media_id)
+            context = (
+                media.get("user_context", "") if isinstance(media, dict) else ""
+            )
+            if not isinstance(context, str) or not context.strip():
+                self._send(chat_id, "Contesto media non disponibile. Aggiungi una didascalia al prossimo upload.")
+                return "msugg_no_context"
+            suggest = getattr(self.draft_pipeline, "suggest_from_media_context", None)
+            if not callable(suggest):
+                self._send(chat_id, "Generazione non disponibile.")
+                return "msugg_unavailable"
+            text = suggest(context.strip(), category)
+            if not isinstance(text, str) or not text.strip():
+                self._send(chat_id, "Generazione non riuscita. Riprova più tardi.")
+                return "msugg_failed"
+            text = text.strip()
+            state_key = f"media_suggest:{media_id}:{category}"
+            self.db.set_state(state_key, text)
+            self._send(chat_id, f"Post generato:\n\n{text}")
+            self._send(
+                chat_id,
+                "Conferma o rigenera:",
+                reply_markup=self._callback_markup([
+                    [
+                        self._callback_button("Conferma", f"msugg:ok:{media_id}:{category}"),
+                        self._callback_button("Rigenera", f"msugg:{media_id}:{category}"),
+                    ],
+                    [self._callback_button("Salta", "msugg:skip")],
+                ]),
+            )
+            return "msugg_generated"
+        self._send(chat_id, "Azione non valida.")
+        return "invalid_callback"
+
     @staticmethod
     def _manual_text_urls_are_safe(text: str) -> bool:
         urls = tuple(
@@ -1974,6 +2052,8 @@ class TelegramController:
             return self._input_callback(chat_id, parts)
         if parts[0] == "manual":
             return self._manual_callback(chat_id, parts)
+        if parts[0] == "msugg":
+            return self._msugg_callback(chat_id, parts)
         self._send(chat_id, "Azione non valida.")
         return "invalid_callback"
 
@@ -2701,6 +2781,16 @@ class TelegramController:
             f"tag: {tags}",
             f"contesto: {context}",
         ]))
+        if (
+            caption.strip()
+            and type(record.get("id")) is int
+            and callable(getattr(self.draft_pipeline, "suggest_from_media_context", None))
+        ):
+            self._send(
+                chat_id,
+                "Vuoi generare un post da questa immagine?\nScegli la categoria:",
+                reply_markup=self._msugg_category_markup(record["id"]),
+            )
         return "media_saved"
 
     @staticmethod
