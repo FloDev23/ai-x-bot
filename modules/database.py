@@ -2620,6 +2620,74 @@ class Database:
         except (RuntimeError, sqlite3.IntegrityError):
             raise
 
+    def create_media_suggested_draft(
+        self,
+        *,
+        text: str,
+        category: str,
+        publication_key: str,
+        intended_slot: str,
+    ) -> Tuple[Optional[Dict], str]:
+        """Create a pending_approval draft from AI-suggested text for a media item."""
+        if (
+            type(text) is not str
+            or not text.strip()
+            or len(text) > 280
+            or type(category) is not str
+            or re.fullmatch(r"[a-z][a-z0-9_]{1,63}", category) is None
+            or type(publication_key) is not str
+            or not publication_key
+        ):
+            return None, "rejected"
+        score_json = json.dumps(
+            {"total": 65, "authority": "media_suggested"},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        normalized_slot = self._normalize_datetime_iso(intended_slot)
+        if normalized_slot is None:
+            return None, "rejected"
+        now = self._now_iso()
+        with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM post_drafts WHERE publication_key = ?",
+                (publication_key,),
+            ).fetchone()
+            if existing:
+                return self._decode_post_draft(existing), "existing"
+            cursor = conn.execute(
+                """
+                INSERT INTO post_drafts (
+                    publication_key, text, category, source_ids_json,
+                    score_json, intended_slot, status, created_at, updated_at,
+                    origin
+                ) VALUES (?, ?, ?, '[]', ?, ?, 'pending_approval', ?, ?,
+                          'media_suggested')
+                """,
+                (
+                    publication_key,
+                    text.strip(),
+                    category,
+                    score_json,
+                    normalized_slot,
+                    now,
+                    now,
+                ),
+            )
+            draft_id = cursor.lastrowid
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO editorial_queue (
+                    draft_id, translation_status, created_at, updated_at
+                ) VALUES (?, 'pending', ?, ?)
+                """,
+                (draft_id, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+            return self._decode_post_draft(row), "created"
+
     def _decode_post_draft(self, row: sqlite3.Row) -> Dict:
         return self._decode_json_fields(row, {
             "source_ids_json": "source_ids",
@@ -3453,10 +3521,16 @@ class Database:
                 or not current["translation_it"].strip()
             ):
                 return False
-            source_ids = self._decode_source_ids(current["source_ids_json"])
-            if source_ids is None or not self._eligible_content_sources_in_conn(
+            source_ids = self._decode_queue_source_ids(
+                current["source_ids_json"], current["origin"]
+            )
+            if source_ids is None:
+                return False
+            if source_ids and not self._eligible_content_sources_in_conn(
                 conn, source_ids, validation_time
             ):
+                return False
+            if not source_ids and current["origin"] != "manual_operator":
                 return False
             if not self._queue_media_binding_valid_in_conn(conn, current):
                 return False

@@ -1317,3 +1317,47 @@ def test_media_only_attach_and_detach_preserve_translation(tmp_path):
     assert detached["revision"] == attached["revision"] + 1
     assert detached["translation_it"] == before["translation_it"]
     assert detached["translation_status"] == "ready"
+
+
+def test_manual_operator_queue_approval_succeeds_with_empty_source_ids(tmp_path):
+    """Regression: approve_queued_draft_atomic must accept source_ids=[] for manual_operator."""
+    db = Database(str(tmp_path / "manual-empty-sources.db"))
+    state_key = "telegram_session:newpost-no-source"
+    state = json.dumps({"token": "manualOpToken_abcdef01", "v": 1}, sort_keys=True, separators=(",", ":"))
+    db.set_state(state_key, state)
+    draft, outcome = db.create_manual_approved_draft_consuming_state_atomic(
+        text="Manual post with no sources attached.",
+        category="gym_strategy",
+        source_ids=[],
+        intended_slot="2020-03-01T14:00:00+00:00",
+        media_id=None,
+        state_key=state_key,
+        expected_state_value=state,
+        session_token="manualOpToken_abcdef01",
+        operator="floriano",
+        now=datetime(2020, 3, 1, 13, 0, tzinfo=timezone.utc),
+    )
+    assert outcome == "created"
+    draft_id = draft["id"]
+
+    queue = db.get_queue_draft(draft_id)
+    assert queue is not None
+    assert queue["origin"] == "manual_operator"
+    assert queue["source_ids"] == []
+    assert queue["translation_policy"] == "advisory"
+
+    assert db.save_review_translation(draft_id, draft["revision"], "Post manuale senza fonti.")
+    ready = db.get_queue_draft(draft_id)
+    assert ready["translation_status"] == "ready"
+
+    approved = db.approve_queued_draft_atomic(
+        draft_id,
+        ready["revision"],
+        ready["queue_revision"],
+        "floriano",
+        datetime.now(timezone.utc).isoformat(),
+    )
+    assert approved, "approve_queued_draft_atomic must succeed for manual_operator with source_ids=[]"
+    final = db.get_queue_draft(draft_id)
+    assert final["status"] == "approved"
+    assert final["approved_queue_at"] is not None
