@@ -615,11 +615,13 @@ class TelegramController:
         return True
 
     def _posts(self, chat_id: str):
-        rows, next_cursor, _previous = self.db.list_post_index_page(cursor=None)
+        rows, next_cursor, _previous = self.db.list_post_index_page(
+            cursor=None, exclude_published=True,
+        )
         token = self.db.create_telegram_view(
             chat_id, self.post_browser.view_kind,
             {"target_ids": [row["id"] for row in rows], "direction": "current",
-             "filters": {"discarded": 0}, "last_message_id": None,
+             "filters": {"discarded": 0, "published": 0}, "last_message_id": None,
              "cursor": None, "previous_cursor": None,
              "next_cursor": next_cursor, "history": []},
         )
@@ -650,6 +652,7 @@ class TelegramController:
             return False
         state = dict(view["state"])
         include_discarded = state["filters"].get("discarded") == 1
+        exclude_published = state["filters"].get("published") == 0
         cursor = state.get("cursor")
         next_cursor = state.get("next_cursor")
         history = list(state.get("history") or [])
@@ -662,6 +665,7 @@ class TelegramController:
             page_cursor = next_cursor
             rows, new_next, _back = self.db.list_post_index_page(
                 cursor=page_cursor, include_discarded=include_discarded,
+                exclude_published=exclude_published,
             )
         elif action == "prev":
             if not history:
@@ -671,20 +675,25 @@ class TelegramController:
             page_cursor = prior["cursor"]
             rows = self.db.get_post_index_rows(
                 prior["target_ids"], include_discarded=include_discarded,
+                exclude_published=exclude_published,
             )
         elif action == "refresh":
             page_cursor = cursor
             new_next = next_cursor
             rows = self.db.get_post_index_rows(
                 state["target_ids"], include_discarded=include_discarded,
+                exclude_published=exclude_published,
             )
         else:
             return False
+        new_filters: dict = {"discarded": int(include_discarded)}
+        if exclude_published:
+            new_filters["published"] = 0
         state.update(
             target_ids=[row["id"] for row in rows], cursor=page_cursor,
             previous_cursor=history[-1]["cursor"] if history else None,
             next_cursor=new_next, history=history,
-            filters={"discarded": int(include_discarded)},
+            filters=new_filters,
         )
         if not self.db.update_telegram_view(
             token, chat_id, self.post_browser.view_kind, view["revision"], state,
@@ -1430,7 +1439,7 @@ class TelegramController:
         self._send(chat_id, "\n".join([
             "Comandi",
             "/status — stato e prossimi job",
-            "/posts — bozze e pubblicati",
+            "/posts — bozze in coda (no pubblicati)",
             "/growth — candidati manuali",
             "/stats — riepilogo performance",
             "/ideas — aggiungi una fonte",

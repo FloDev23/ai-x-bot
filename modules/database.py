@@ -2809,11 +2809,13 @@ class Database:
         cursor: Optional[Dict],
         limit: int = 8,
         include_discarded: bool = False,
+        exclude_published: bool = False,
     ) -> Tuple[List[Dict], Optional[Dict], Optional[Dict]]:
         """Return one stable keyset page for the compact Telegram index."""
         if (
             type(limit) is not int or not 1 <= limit <= 8
             or type(include_discarded) is not bool
+            or type(exclude_published) is not bool
         ):
             return [], None, None
         cursor_rank = cursor_updated = cursor_id = None
@@ -2841,6 +2843,8 @@ class Database:
             WHEN d.status = 'discarded' THEN 4
             ELSE 5 END"""
         clauses = ["d.status != 'discarded'" if not include_discarded else "1=1"]
+        if exclude_published:
+            clauses.append("d.status != 'published'")
         values: List[Any] = []
         if cursor is not None:
             clauses.append(
@@ -2880,6 +2884,7 @@ class Database:
 
     def get_post_index_rows(
         self, target_ids: List[int], *, include_discarded: bool = False,
+        exclude_published: bool = False,
     ) -> List[Dict]:
         """Reload one persisted compact page without changing its keyset order."""
         if (
@@ -2887,12 +2892,16 @@ class Database:
             or len(target_ids) != len(set(target_ids))
             or any(not self._exact_positive_identifier(value) for value in target_ids)
             or type(include_discarded) is not bool
+            or type(exclude_published) is not bool
         ):
             return []
         if not target_ids:
             return []
         placeholders = ", ".join("?" for _ in target_ids)
-        discarded = "1=1" if include_discarded else "d.status != 'discarded'"
+        parts = ["1=1" if include_discarded else "d.status != 'discarded'"]
+        if exclude_published:
+            parts.append("d.status != 'published'")
+        discarded = " AND ".join(parts)
         with self._conn() as conn:
             rows = conn.execute(f"""
                 SELECT d.id, d.text, d.category, d.status, d.media_id, d.revision,
