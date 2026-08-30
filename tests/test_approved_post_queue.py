@@ -1361,3 +1361,46 @@ def test_manual_operator_queue_approval_succeeds_with_empty_source_ids(tmp_path)
     final = db.get_queue_draft(draft_id)
     assert final["status"] == "approved"
     assert final["approved_queue_at"] is not None
+
+
+def test_get_content_source_usage_not_none_when_approved_manual_drafts_present(tmp_path):
+    """Regression: get_content_source_usage must not return None when approved manual_operator
+    drafts with source_ids=[] coexist with real content sources."""
+    db = Database(str(tmp_path / "source-usage-empty.db"))
+
+    # Add a real content source
+    import sqlite3 as _sqlite3
+    with db._conn() as conn:
+        conn.execute(
+            "INSERT INTO content_sources (source_type, text, trust_state, created_at, updated_at)"
+            " VALUES ('product_fact', 'FlexDropin allows drop-in bookings.', 'verified',"
+            " '2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')"
+        )
+        source_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    # Create a manual_operator approved draft (source_ids=[])
+    state_key = "telegram_session:source-usage-test"
+    state = json.dumps({"token": "sourceUsageToken1234", "v": 1}, sort_keys=True, separators=(",", ":"))
+    db.set_state(state_key, state)
+    draft, outcome = db.create_manual_approved_draft_consuming_state_atomic(
+        text="Manual post for source usage test.",
+        category="gym_strategy",
+        source_ids=[],
+        intended_slot="2020-03-01T14:00:00+00:00",
+        media_id=None,
+        state_key=state_key,
+        expected_state_value=state,
+        session_token="sourceUsageToken1234",
+        operator="floriano",
+        now=datetime(2020, 3, 1, 13, 0, tzinfo=timezone.utc),
+    )
+    assert outcome == "created"
+
+    # Usage must be a dict, never None — empty source_ids in approved draft must not break it
+    usage = db.get_content_source_usage([source_id])
+    assert usage is not None, (
+        "get_content_source_usage returned None — empty source_ids_json in "
+        "manual_operator draft broke the usage query"
+    )
+    assert source_id in usage
+    assert usage[source_id]["bound_to_live_draft"] is False

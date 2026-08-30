@@ -27,10 +27,12 @@ from modules.growth_candidate_schema import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOPIC_QUERIES = (
-    '("gym owner" OR "studio owner" OR "box owner") '
-    '(class OR schedule OR member OR booking) lang:en -is:retweet',
-    '(pilates OR yoga OR fitness) (studio OR gym OR coach) '
-    '(booking OR retention OR occupancy OR "drop-in") lang:en -is:retweet',
+    '("gym owner" OR "studio owner" OR "fitness studio" OR "box owner") '
+    '("drop-in" OR booking OR scheduling OR "class management" OR "no-show") '
+    'lang:en -is:retweet',
+    '(pilates OR yoga OR crossfit OR "martial arts" OR BJJ OR fitness) '
+    '(studio OR gym) (owner OR founder OR manager OR operator) '
+    '(booking OR "drop-in" OR capacity OR software OR app) lang:en -is:retweet',
 )
 _PRIMARY_ROLE_TERMS = ("owner", "founder", "manager")
 _AMPLIFIER_ROLE_TERMS = (

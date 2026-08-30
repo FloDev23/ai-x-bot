@@ -1866,10 +1866,12 @@ class Database:
                 decoded_ids = json.loads(draft["source_ids_json"])
             except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
                 return None
+            if type(decoded_ids) is not list:
+                return None
+            if not decoded_ids:
+                continue
             if (
-                type(decoded_ids) is not list
-                or not decoded_ids
-                or any(
+                any(
                     type(source_id) is not int or source_id <= 0
                     for source_id in decoded_ids
                 )
