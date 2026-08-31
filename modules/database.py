@@ -534,7 +534,8 @@ class Database:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     revision INTEGER NOT NULL DEFAULT 0,
-                    origin TEXT NOT NULL DEFAULT 'generated'
+                    origin TEXT NOT NULL DEFAULT 'generated',
+                    thread_tweets_json TEXT
                 )
             """)
             draft_columns = {
@@ -550,6 +551,11 @@ class Database:
                 c.execute(
                     "ALTER TABLE post_drafts "
                     "ADD COLUMN origin TEXT NOT NULL DEFAULT 'generated'"
+                )
+            if "thread_tweets_json" not in draft_columns:
+                c.execute(
+                    "ALTER TABLE post_drafts "
+                    "ADD COLUMN thread_tweets_json TEXT"
                 )
             for draft in c.execute(
                 "SELECT id, intended_slot FROM post_drafts"
@@ -2698,6 +2704,7 @@ class Database:
         return self._decode_json_fields(row, {
             "source_ids_json": "source_ids",
             "score_json": "score_data",
+            "thread_tweets_json": "thread_tweets",
         })
 
     @staticmethod

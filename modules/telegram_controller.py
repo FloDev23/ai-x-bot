@@ -536,8 +536,21 @@ class TelegramController:
             else None
         )
         self._send_draft_preview(chat_id, draft)
-        text = draft.get("text") if isinstance(draft.get("text"), str) else ""
-        self._send_complete_section(chat_id, "Tweet da pubblicare", text)
+        thread_tweets = draft.get("thread_tweets")
+        if isinstance(thread_tweets, list) and len(thread_tweets) >= 2:
+            thread_body = "\n\n".join(
+                f"[{i + 1}/{len(thread_tweets)}]\n{t}"
+                for i, t in enumerate(thread_tweets)
+                if isinstance(t, str)
+            )
+            self._send_complete_section(
+                chat_id,
+                f"Thread ({len(thread_tweets)} tweet) da pubblicare",
+                thread_body,
+            )
+        else:
+            text = draft.get("text") if isinstance(draft.get("text"), str) else ""
+            self._send_complete_section(chat_id, "Tweet da pubblicare", text)
         translation = draft.get("translation_it")
         if queue_status == "ready" and isinstance(translation, str):
             self._send_complete_section(

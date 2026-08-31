@@ -472,6 +472,24 @@ class Publisher:
         if self._publication_is_paused():
             return _XTransportOutcome("paused")
 
+        thread_tweets = draft.get("thread_tweets")
+        if isinstance(thread_tweets, list) and len(thread_tweets) >= 2:
+            try:
+                tweet_ids = self._call_post_thread(thread_tweets)
+            except XPublicationPaused:
+                return _XTransportOutcome("paused")
+            except XPublicationRejected as error:
+                return _XTransportOutcome("rejected", error=error)
+            except (XPublicationUnknown, TimeoutError, ConnectionError) as error:
+                return _XTransportOutcome("unknown", error=error)
+            except Exception as error:
+                return _XTransportOutcome("unknown", error=error)
+            if not tweet_ids:
+                return _XTransportOutcome(
+                    "unknown", error=ValueError("thread_published_no_ids"),
+                )
+            return _XTransportOutcome("confirmed", tweet_id=tweet_ids[0])
+
         try:
             response = self._call_post_tweet(
                 draft["text"], media_file, media_type, media_filename
@@ -528,6 +546,22 @@ class Publisher:
                 claim, RuntimeError("publication_finalization_conflict")
             )
         return PublishResult("published", outcome.tweet_id)
+
+    def _call_post_thread(self, tweets):
+        method = self.x_client.post_thread
+        try:
+            parameters = inspect.signature(method).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        names = {parameter.name for parameter in parameters}
+        accepts_keywords = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        kwargs = {}
+        if accepts_keywords or "before_write" in names:
+            kwargs["before_write"] = self._publication_gate_open
+        return method(tweets, **kwargs)
 
     def _call_post_tweet(
         self, text, media_file, media_type, media_filename

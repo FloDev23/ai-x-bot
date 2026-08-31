@@ -126,6 +126,10 @@ class FakeXClient:
         self.posts.append((text, kwargs))
         return SimpleNamespace(data={"id": "9001"})
 
+    def post_thread(self, tweets, **kwargs):
+        self.posts.append((tweets, kwargs))
+        return [str(9001 + i) for i in range(len(tweets))]
+
     def __getattr__(self, name):
         if name in self._FORBIDDEN_ENGAGEMENT_METHODS:
             def forbidden(*_args, **_kwargs):

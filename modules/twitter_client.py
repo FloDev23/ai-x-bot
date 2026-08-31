@@ -232,7 +232,52 @@ class TwitterClient:
             raise XPublicationUnknown("x_publication_response_missing_id")
         logger.info("x_tweet_published tweet_id=%s", tweet_id)
         return response
-    
+
+    def post_thread(
+        self,
+        tweets: List[str],
+        *,
+        before_write: Optional[Callable[[], bool]] = None,
+    ) -> List[str]:
+        """Post a sequence of tweets as a thread; returns their IDs in order.
+
+        ``before_write`` is checked once, before the first tweet is sent.
+        If it returns anything other than True, XPublicationPaused is raised
+        and no tweet is written.
+        """
+        if not isinstance(tweets, list) or len(tweets) < 2:
+            raise XPublicationRejected("thread_requires_at_least_two_tweets")
+        if before_write is not None:
+            try:
+                allowed = before_write()
+            except Exception as error:
+                raise XPublicationPaused("publication_gate_unavailable") from error
+            if allowed is not True:
+                raise XPublicationPaused("publication_paused")
+        tweet_ids: List[str] = []
+        reply_to_id: Optional[str] = None
+        for index, text in enumerate(tweets):
+            params: dict = {"text": text}
+            if reply_to_id is not None:
+                params["in_reply_to_tweet_id"] = reply_to_id
+            try:
+                response = self._client.create_tweet(**params)
+            except Exception as error:
+                logger.error(
+                    "x_thread_tweet_write_failed tweet_index=%d error_type=%s",
+                    index,
+                    type(error).__name__,
+                )
+                _raise_publication_error(error)
+            data = getattr(response, "data", response)
+            tweet_id = data.get("id") if isinstance(data, dict) else None
+            if not is_valid_x_tweet_id(tweet_id):
+                raise XPublicationUnknown("x_thread_response_missing_id")
+            tweet_ids.append(tweet_id)
+            reply_to_id = tweet_id
+            logger.info("x_thread_tweet_published tweet_id=%s index=%d", tweet_id, index)
+        return tweet_ids
+
     def search_tweets(self, query: str, limit: int = 10) -> List[Dict]:
         """
         Cerca tweet su X
