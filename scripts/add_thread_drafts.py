@@ -59,13 +59,16 @@ def main():
     conn.execute("PRAGMA journal_mode=WAL")
     added = 0
     skipped = 0
-    for thread in THREADS:
+    for index, thread in enumerate(THREADS):
         title = thread["title"]
         tweets = thread["tweets"]
         category = thread["category"]
         first_tweet = tweets[0]
         thread_tweets_json = json.dumps(tweets, ensure_ascii=False, separators=(",", ":"))
         pub_key = "thread-operator:" + secrets.token_urlsafe(12)
+        intended_slot = datetime(
+            2030, 1, 1, 10, index, 0, tzinfo=timezone.utc
+        ).isoformat()
 
         existing = conn.execute(
             "SELECT id FROM post_drafts WHERE thread_tweets_json = ?",
@@ -87,7 +90,7 @@ def main():
                 category,
                 SOURCE_IDS_JSON,
                 SCORE_JSON,
-                NOW,
+                intended_slot,
                 thread_tweets_json,
                 NOW,
                 NOW,
