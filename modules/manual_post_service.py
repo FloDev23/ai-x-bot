@@ -26,6 +26,7 @@ class ManualPostService:
         expected_state_value: str,
         session_token: str,
         operator: str,
+        thread_tweets: list[str] | None = None,
     ) -> tuple[dict | None, str]:
         try:
             state = json.loads(expected_state_value)
@@ -62,4 +63,5 @@ class ManualPostService:
             session_token=session_token,
             operator=operator,
             now=current,
+            thread_tweets=thread_tweets,
         )

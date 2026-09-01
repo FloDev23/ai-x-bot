@@ -596,6 +596,7 @@ class DraftPipeline:
         expected_state_value,
         session_token,
         operator="telegram_operator",
+        thread_tweets=None,
     ):
         """Compatibility delegate for direct manual-operator authority."""
         return ManualPostService(
@@ -610,6 +611,7 @@ class DraftPipeline:
             expected_state_value=expected_state_value,
             session_token=session_token,
             operator=operator,
+            thread_tweets=thread_tweets,
         )
 
     def approve_queue(self, draft_id, approved_by) -> bool:

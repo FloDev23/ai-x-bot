@@ -52,6 +52,7 @@ _SESSION_KINDS = {
         "source_child_news_url", "source_child_news_date",
         "source_child_news_source",
     },
+    "manual_thread": {"tweet", "category", "media"},
 }
 _SOURCE_TYPES = {
     "founder_note": "Founder note",
@@ -126,6 +127,7 @@ class TelegramController:
             "/stats": self._stats,
             "/ideas": self._ideas,
             "/newpost": self._newpost,
+            "/newthread": self._newthread,
             "/media": self._media,
             "/pause": self._pause,
             "/resume": self._resume,
@@ -1144,6 +1146,92 @@ class TelegramController:
         )
         return "manual_text_input"
 
+    def _newthread(self, chat_id: str):
+        self._set_session(chat_id, "manual_thread", "tweet", {"tweets": []})
+        self._send(
+            chat_id,
+            "Invia il testo del primo tweet (massimo 280 caratteri).",
+            reply_markup=self._callback_markup([[
+                self._callback_button("Annulla", "thread:cancel"),
+            ]]),
+        )
+        return "thread_tweet_input"
+
+    def _thread_tweet_action_markup(self, tweet_count: int):
+        rows = []
+        if tweet_count >= 2:
+            rows.append([self._callback_button(
+                f"Crea thread ({tweet_count} tweet)", "thread:done",
+            )])
+        rows.append([self._callback_button("Aggiungi risposta", "thread:add")])
+        rows.append([self._callback_button("Annulla", "thread:cancel")])
+        return self._callback_markup(rows)
+
+    def _thread_category_markup(self):
+        rows = [
+            [self._callback_button(
+                _MANUAL_CATEGORY_LABELS[category],
+                f"thread:category:{category}",
+            )]
+            for category in PORTFOLIO
+        ]
+        rows.append([self._callback_button("Annulla", "thread:cancel")])
+        return self._callback_markup(rows)
+
+    def _thread_media_markup(self):
+        return self._callback_markup([
+            [self._callback_button("Sfoglia media", "thread:media:browse")],
+            [self._callback_button("Nessun media", "thread:media:none")],
+            [self._callback_button("Annulla", "thread:cancel")],
+        ])
+
+    def _finish_manual_thread(self, chat_id: str, raw: str, session: dict):
+        if self.draft_pipeline is None:
+            self._send(chat_id, "Pipeline bozze non disponibile.")
+            return "draft_unavailable"
+        payload = session["payload"]
+        tweets = payload["tweets"]
+        media_id = payload.get("media_id")
+        try:
+            draft, outcome = (
+                self.draft_pipeline.create_manual_from_telegram_session(
+                    text=tweets[0],
+                    category=payload["category"],
+                    source_ids=[],
+                    media_id=media_id,
+                    translation_it=None,
+                    thread_tweets=tweets,
+                    state_key=self._session_key(chat_id),
+                    expected_state_value=raw,
+                    session_token=session["token"],
+                )
+            )
+        except Exception:
+            self._send(
+                chat_id,
+                "Creazione non riuscita. La sessione è ancora disponibile.",
+            )
+            return "manual_create_failed"
+        if outcome == "session_conflict":
+            self._send(chat_id, "Operazione già gestita.")
+            return "session_conflict"
+        if outcome not in {"created", "already_applied"} or not isinstance(draft, dict):
+            messages = {
+                "media_unavailable": "Il media selezionato non è più disponibile.",
+            }
+            self._send(
+                chat_id,
+                messages.get(outcome, "Thread respinto dai controlli editoriali. Correggi e riprova."),
+            )
+            return "manual_rejected"
+        queued = self.db.get_queue_draft(draft.get("id")) or draft
+        self._send(
+            chat_id,
+            "Thread approvato e aggiunto alla coda approvata.",
+        )
+        self._send_draft_card(chat_id, queued)
+        return "thread_created"
+
     def _media(self, chat_id: str):
         """Open the persisted, verified media browser (never filename buttons)."""
         try:
@@ -1457,6 +1545,7 @@ class TelegramController:
             "/stats — riepilogo performance",
             "/ideas — aggiungi una fonte",
             "/newpost — aggiungi un post manuale alla coda",
+            "/newthread — crea un thread manuale (2–10 tweet)",
             "/pause — ferma le pubblicazioni",
             "/resume — riattiva le pubblicazioni",
             "/errors — ultimi errori sicuri",
@@ -1611,6 +1700,36 @@ class TelegramController:
             ):
                 return False
             return False
+        if kind == "manual_thread":
+            tweets = payload.get("tweets")
+            if (
+                not isinstance(tweets, list)
+                or len(tweets) > 10
+                or any(
+                    type(t) is not str or not t.strip() or len(t) > 280
+                    for t in tweets
+                )
+            ):
+                return False
+            if step == "tweet":
+                return set(payload) == {"tweets"}
+            if len(tweets) < 2:
+                return False
+            if step == "category":
+                return set(payload) == {"tweets"}
+            category = payload.get("category")
+            if type(category) is not str or category not in PORTFOLIO:
+                return False
+            if step == "media":
+                if set(payload) == {"tweets", "category"}:
+                    return True
+                media_id = payload.get("media_id")
+                if media_id is not None and (
+                    type(media_id) is not int
+                    or not 0 < media_id <= _SQLITE_INTEGER_MAX
+                ):
+                    return False
+                return set(payload) == {"tweets", "category", "media_id"}
         return False
 
     def _decode_session(self, raw: Any):
@@ -1856,6 +1975,32 @@ class TelegramController:
                     chat_id, raw, session, source_type="verified_news",
                     text=child["text"], url=child["url"], metadata=metadata,
                 )
+        if kind == "manual_thread":
+            if step == "tweet":
+                if (
+                    not text.strip()
+                    or len(text) > 280
+                    or not self._manual_text_urls_are_safe(text)
+                ):
+                    self._send(
+                        chat_id,
+                        "Testo non valido: massimo 280 caratteri e solo URL HTTPS sicuri.",
+                    )
+                    return "invalid_thread_tweet"
+                updated_tweets = payload["tweets"] + [text]
+                if not self._replace_session(
+                    chat_id, raw, "manual_thread", "tweet", {"tweets": updated_tweets},
+                ):
+                    self._send(chat_id, "Operazione già gestita.")
+                    return "session_conflict"
+                preview = f"[{len(updated_tweets)}] {text}"
+                self._send(
+                    chat_id,
+                    preview,
+                    reply_markup=self._thread_tweet_action_markup(len(updated_tweets)),
+                )
+                return "thread_tweet_added"
+
         if kind == "source_intake":
             if step == "text":
                 if not clean or len(clean) > 2000:
@@ -2074,6 +2219,8 @@ class TelegramController:
             return self._input_callback(chat_id, parts)
         if parts[0] == "manual":
             return self._manual_callback(chat_id, parts)
+        if parts[0] == "thread":
+            return self._thread_callback(chat_id, parts)
         if parts[0] == "msugg":
             return self._msugg_callback(chat_id, parts)
         self._send(chat_id, "Azione non valida.")
@@ -2222,6 +2369,10 @@ class TelegramController:
                 payload = dict(session["payload"])
                 payload["media_id"] = media_id
                 return self._finish_manual_post(chat_id, raw, {**session, "payload": payload})
+            if not invalid and session is not None and session.get("kind") == "manual_thread" and session.get("step") == "media":
+                payload = dict(session["payload"])
+                payload["media_id"] = media_id
+                return self._finish_manual_thread(chat_id, raw, {**session, "payload": payload})
             self._send(chat_id, f"Media #{media_id} selezionato.")
             return "media_selected"
         if len(parts) == 5 and parts[1] in {"a", "r", "d"}:
@@ -2293,6 +2444,10 @@ class TelegramController:
                     payload = dict(session["payload"])
                     payload["media_id"] = None
                     return self._finish_manual_post(chat_id, raw, {**session, "payload": payload})
+                if not invalid and session is not None and session.get("kind") == "manual_thread" and session.get("step") == "media":
+                    payload = dict(session["payload"])
+                    payload["media_id"] = None
+                    return self._finish_manual_thread(chat_id, raw, {**session, "payload": payload})
             self._send(chat_id, "Selezione media annullata.")
             return "media_cancelled"
         if len(parts) == 3 and parts[1] == "q":
@@ -2728,6 +2883,114 @@ class TelegramController:
             )
 
         self._send(chat_id, "Azione manuale non valida.")
+        return "invalid_callback"
+
+    def _thread_callback(self, chat_id: str, parts) -> str:
+        if parts == ["thread", "cancel"]:
+            raw = self.db.get_state(self._session_key(chat_id))
+            if raw is not None:
+                self.db.compare_and_clear_state(self._session_key(chat_id), raw)
+            self._send(chat_id, "Creazione del thread annullata.")
+            return "thread_cancelled"
+
+        raw, session, invalid = self._load_session(chat_id)
+        if invalid or session is None:
+            self._send(chat_id, "Sessione non valida o scaduta. Riprova.")
+            return "invalid_session"
+        if session["kind"] != "manual_thread":
+            self._send(chat_id, "Questa sessione non riguarda un thread manuale.")
+            return "invalid_session"
+
+        step = session["step"]
+        payload = session["payload"]
+
+        if parts == ["thread", "add"]:
+            if step != "tweet":
+                self._send(chat_id, "Questa sessione non attende tweet.")
+                return "invalid_session"
+            self._send(
+                chat_id,
+                "Invia il testo del prossimo tweet (massimo 280 caratteri).",
+                reply_markup=self._callback_markup([[
+                    self._callback_button("Annulla", "thread:cancel"),
+                ]]),
+            )
+            return "thread_add_tweet"
+
+        if parts == ["thread", "done"]:
+            if step != "tweet" or len(payload["tweets"]) < 2:
+                self._send(chat_id, "Servono almeno 2 tweet per creare un thread.")
+                return "invalid_callback"
+            if not self._replace_session(
+                chat_id, raw, "manual_thread", "category", {"tweets": payload["tweets"]},
+            ):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            self._send(
+                chat_id,
+                "Scegli la categoria editoriale.",
+                reply_markup=self._thread_category_markup(),
+            )
+            return "thread_category"
+
+        if len(parts) == 3 and parts[1] == "category":
+            category = parts[2]
+            if step != "category" or category not in PORTFOLIO:
+                self._send(chat_id, "Categoria non valida.")
+                return "invalid_callback"
+            next_payload = {"tweets": payload["tweets"], "category": category}
+            if not self._replace_session(
+                chat_id, raw, "manual_thread", "media", next_payload,
+            ):
+                self._send(chat_id, "Operazione già gestita.")
+                return "session_conflict"
+            self._send(
+                chat_id,
+                "Scegli un media disponibile oppure continua senza media.",
+                reply_markup=self._thread_media_markup(),
+            )
+            return "thread_media"
+
+        if parts == ["thread", "media", "browse"]:
+            if step != "media":
+                self._send(chat_id, "Questa sessione non attende un media.")
+                return "invalid_session"
+            try:
+                self.media_browser.show(chat_id=chat_id, media_id=None, context="manual")
+            except Exception:
+                self._send(chat_id, "Media non disponibile.")
+                return "media_unavailable"
+            return "thread_media_browser"
+
+        if len(parts) == 3 and parts[1] == "media":
+            if step != "media":
+                self._send(chat_id, "Questa sessione non attende un media.")
+                return "invalid_session"
+            media_id = None if parts[2] == "none" else self._positive_id(parts[2])
+            if parts[2] != "none" and media_id is None:
+                self._send(chat_id, "Media non valido.")
+                return "invalid_callback"
+            if media_id is not None:
+                try:
+                    media = self.db.get_media_by_id(media_id)
+                except Exception:
+                    media = None
+                if (
+                    not isinstance(media, dict)
+                    or media.get("id") != media_id
+                    or media.get("lifecycle_state") != "available"
+                    or media.get("file_deleted") != 0
+                ):
+                    self._send(chat_id, "Media non più disponibile.")
+                    return "thread_media_rejected"
+            next_payload = {**payload, "media_id": media_id}
+            return self._finish_manual_thread(
+                chat_id,
+                raw,
+                {**session, "payload": next_payload},
+            )
+
+        self._send(chat_id, "Azione thread non valida.")
         return "invalid_callback"
 
     def _ingest_media(self, chat_id: str, message: Dict[str, Any]):

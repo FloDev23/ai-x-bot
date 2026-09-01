@@ -2189,6 +2189,7 @@ class Database:
         session_token: str,
         operator: str,
         now: datetime,
+        thread_tweets: Optional[List[str]] = None,
     ) -> Tuple[Optional[Dict], str]:
         """Atomically persist exact operator copy as directly approved."""
         current = self._strict_aware_datetime(now)
@@ -2208,7 +2209,24 @@ class Database:
                 sort_keys=True,
                 separators=(",", ":"),
             )
+            thread_tweets_json = None
+            if thread_tweets is not None:
+                thread_tweets_json = json.dumps(
+                    thread_tweets, allow_nan=False, ensure_ascii=False,
+                    separators=(",", ":"),
+                )
         except (AttributeError, TypeError, ValueError, UnicodeError):
+            return None, "rejected"
+        if thread_tweets is not None and (
+            not isinstance(thread_tweets, list)
+            or len(thread_tweets) < 2
+            or len(thread_tweets) > 10
+            or any(
+                type(t) is not str or not t.strip() or len(t) > 280
+                for t in thread_tweets
+            )
+            or thread_tweets[0] != text
+        ):
             return None, "rejected"
         if (
             type(text) is not str
@@ -2305,6 +2323,7 @@ class Database:
                         and existing["source_ids_json"] == final_source_json
                         and existing["score_json"] == score_json
                         and existing["media_id"] == media_id
+                        and existing["thread_tweets_json"] == thread_tweets_json
                         and existing["status"] == "approved"
                         and existing["origin"] == "manual_operator"
                         and existing["approved_by"] == operator
@@ -2349,9 +2368,10 @@ class Database:
                     INSERT INTO post_drafts (
                         publication_key, text, category, source_ids_json,
                         score_json, intended_slot, status, media_id,
-                        approved_at, approved_by, created_at, updated_at, origin
+                        approved_at, approved_by, created_at, updated_at, origin,
+                        thread_tweets_json
                     ) VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, ?,
-                              'manual_operator')
+                              'manual_operator', ?)
                 """, (
                     publication_key,
                     text,
@@ -2364,6 +2384,7 @@ class Database:
                     operator,
                     now_iso,
                     now_iso,
+                    thread_tweets_json,
                 ))
                 draft_id = cursor.lastrowid
                 if media is not None:
