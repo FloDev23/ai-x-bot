@@ -1113,6 +1113,24 @@ class Database:
                 count += 1
         return count
 
+    def count_text_since_last_media(self, limit: int = 30) -> int:
+        """Return count of consecutive text-only published posts since last media post."""
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT d.media_id
+                FROM publication_plans p
+                JOIN post_drafts d ON d.id = p.draft_id
+                WHERE p.status = 'published'
+                ORDER BY p.scheduled_for DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        count = 0
+        for row in rows:
+            if row["media_id"] is not None:
+                break
+            count += 1
+        return count
+
     def last_post_had_link(self) -> bool:
         with self._conn() as conn:
             row = conn.execute("""

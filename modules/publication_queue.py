@@ -443,6 +443,7 @@ class PublicationPlanner:
         current: datetime,
         selected_categories: set[str],
         selected_formats: set[str],
+        text_since_last_media: int = 0,
     ):
         if type(draft) is not dict:
             return None
@@ -494,6 +495,7 @@ class PublicationPlanner:
         category_diversity = int(category not in selected_categories)
         format_diversity = int(media_format not in selected_formats)
         approval_age = min(31_536_000, max(0, int((current - approval).total_seconds())))
+        media_due = int(media_format == "media" and text_since_last_media >= 3)
         reason = {
             "source_urgency": min(1_000_000, max(0, seconds_to_expiry // 3600))
             if has_expiry else 0,
@@ -507,6 +509,7 @@ class PublicationPlanner:
             -seconds_to_expiry,
             score_data["total"],
             category_diversity,
+            media_due,
             format_diversity,
             approval_age,
             -draft_id,
@@ -523,6 +526,10 @@ class PublicationPlanner:
         selected_categories = set()
         selected_formats = set()
         simulated_ids = self.db.get_simulated_draft_ids() if self.dry_run else set()
+        try:
+            text_since_last_media = self.db.count_text_since_last_media()
+        except Exception:
+            text_since_last_media = 0
         final = []
         for initial_plan in sorted(plans, key=lambda item: item.get("position", 99)):
             if initial_plan.get("status") == "planned":
@@ -577,6 +584,7 @@ class PublicationPlanner:
                         current,
                         selected_categories,
                         selected_formats,
+                        text_since_last_media,
                     )
                     if ranked_value is not None:
                         ranked.append((ranked_value[0], candidate, *ranked_value[1:]))
