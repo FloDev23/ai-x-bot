@@ -2826,6 +2826,7 @@ class Database:
         ):
             return [], None, None
         cursor_rank = cursor_updated = cursor_id = None
+        cursor_updated_sql = None  # plain format for SQL comparison against DB values
         if cursor is not None:
             if not isinstance(cursor, dict):
                 return [], None, None
@@ -2838,6 +2839,12 @@ class Database:
                 or not self._exact_positive_identifier(cursor_id)
             ):
                 return [], None, None
+            # DB stores updated_at without TZ suffix; strip for string comparison.
+            cursor_updated_sql = (
+                cursor_updated[:-6]
+                if isinstance(cursor_updated, str) and cursor_updated.endswith("+00:00")
+                else cursor_updated
+            )
         # The fixed rank is intentionally duplicated in SELECT/WHERE: changing
         # a draft after a page was opened cannot turn this into offset paging.
         rank = """CASE
@@ -2859,7 +2866,7 @@ class Database:
                 "(d.updated_at = ? AND d.id < ?))))"
             )
             values.extend([
-                cursor_rank, cursor_rank, cursor_updated, cursor_updated,
+                cursor_rank, cursor_rank, cursor_updated_sql, cursor_updated_sql,
                 cursor_id,
             ])
         with self._conn() as conn:
@@ -2883,8 +2890,15 @@ class Database:
         next_cursor = None
         if len(rows) > limit and page:
             last = page[-1]
+            raw_updated_at = last["updated_at"]
+            # Ensure timezone-aware for _validate_telegram_view_state.
+            if (
+                isinstance(raw_updated_at, str) and raw_updated_at
+                and "+" not in raw_updated_at and raw_updated_at[-1:] != "Z"
+            ):
+                raw_updated_at = raw_updated_at + "+00:00"
             next_cursor = {
-                "rank": last["index_rank"], "updated_at": last["updated_at"],
+                "rank": last["index_rank"], "updated_at": raw_updated_at,
                 "id": last["id"],
             }
         return page, next_cursor, dict(cursor) if cursor is not None else None
