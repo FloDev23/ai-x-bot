@@ -353,38 +353,19 @@ class TelegramController:
                 generation_used = usage
         except Exception:
             approved_count = pending_count = generation_used = 0
+        dry_run_label = "ON" if self.dry_run else "OFF"
+        pausa_label = "SI" if paused else "NO"
         lines = [
-            "Stato",
-            f"dry-run: {'attivo' if self.dry_run else 'disattivo'}",
-            f"pausa: {'attiva' if paused else 'disattiva'}",
-            f"coda approvata target: {APPROVED_QUEUE_TARGET}",
-            f"coda approvata: {approved_count}/{APPROVED_QUEUE_TARGET}",
-            f"in revisione: {pending_count}/{PENDING_REVIEW_LIMIT}",
-            f"generazione oggi: {generation_used}/{DRAFT_GENERATION_DAILY_CAP}",
-            f"pubblicazioni target oggi: {target_today}",
-            f"pubblico: Stati Uniti ({AUDIENCE_TIMEZONE})",
+            "Stato bot",
+            f"dry-run: {dry_run_label}  |  pausa: {pausa_label}",
+            "",
+            "Coda",
+            f"  approvata:     {approved_count}/{APPROVED_QUEUE_TARGET}",
+            f"  revisione:     {pending_count}/{PENDING_REVIEW_LIMIT}",
+            f"  generati oggi: {generation_used}/{DRAFT_GENERATION_DAILY_CAP}",
         ]
-        if cadence_reason is not None:
-            lines.append(f"cadenza: {cadence_reason}")
-        jobs = []
-        if callable(self.scheduler_status):
-            try:
-                reported = self.scheduler_status()
-                if isinstance(reported, (list, tuple)):
-                    jobs = list(reported)[:10]
-            except Exception:
-                jobs = []
-        if jobs:
-            lines.append("prossimi job:")
-            for job in jobs:
-                if not isinstance(job, dict):
-                    continue
-                name = self._clean_text(job.get("name"), 80) or "job"
-                when = self._clean_text(job.get("next_run"), 80) or "non disponibile"
-                lines.append(f"- {name}: {when}")
-        else:
-            lines.append("prossimi job: non disponibili")
-        for plan in publication_positions[:3]:
+        slots = []
+        for plan in publication_positions[:target_today]:
             scheduled = self._clean_text(plan.get("scheduled_for"), 80)
             try:
                 parsed = datetime.fromisoformat(scheduled.replace("Z", "+00:00"))
@@ -392,13 +373,19 @@ class TelegramController:
                 continue
             if parsed.tzinfo is None:
                 continue
-            et = parsed.astimezone(ZoneInfo(AUDIENCE_TIMEZONE))
             rome = parsed.astimezone(ZoneInfo("Europe/Rome"))
-            lines.append(
-                f"pubblicazione {plan.get('position')}: "
-                f"{et.strftime('%Y-%m-%d %H:%M %Z')} / "
-                f"{rome.strftime('%Y-%m-%d %H:%M %Z')}"
+            et = parsed.astimezone(ZoneInfo(AUDIENCE_TIMEZONE))
+            pos = plan.get("position", len(slots) + 1)
+            slots.append(
+                f"  {pos}  {rome.strftime('%H:%M')} IT"
+                f"  ({et.strftime('%H:%M')} ET)"
             )
+        lines.append("")
+        lines.append(f"Oggi — {target_today} pubblicazioni")
+        if slots:
+            lines.extend(slots)
+        else:
+            lines.append("  nessuno slot pianificato")
         self._send(chat_id, "\n".join(lines))
         return "status"
 
@@ -1026,72 +1013,75 @@ class TelegramController:
         period = period if isinstance(period, dict) else {}
         start_date = cls._clean_text(period.get("start_date"), 20) or "n/d"
         end_date = cls._clean_text(period.get("end_date"), 20) or "n/d"
-        lines = [
-            "Riepilogo settimanale",
-            f"periodo: {start_date} — {end_date}",
-            f"follower totali (followers_total: {integer('followers_total')})",
-            (
-                "nuovi follower: "
-                f"{integer('new_followers')} "
-                f"(pertinenti: {integer('new_relevant_followers')}, "
-                f"tasso: {decimal('relevant_follower_rate') * 100:.1f}%)"
-            ),
-            f"candidati valutati nel report: {integer('candidate_count')}",
-        ]
+
+        followers_total = integer("followers_total")
+        new_followers = integer("new_followers")
+        new_relevant = integer("new_relevant_followers")
+        relevant_rate = decimal("relevant_follower_rate") * 100
+        post_count = integer("post_count")
+        median_imp = decimal("median_impressions")
+        candidate_count = integer("candidate_count")
 
         decision_counts = report.get("decision_counts")
-        decision_counts = (
-            decision_counts if isinstance(decision_counts, dict) else {}
-        )
-        lines.append(
-            "decisioni: "
-            f"salvati {decision_counts.get('saved', 0) if type(decision_counts.get('saved')) is int else 0}, "
-            f"seguiti manualmente {decision_counts.get('followed_manually', 0) if type(decision_counts.get('followed_manually')) is int else 0}, "
-            f"scartati {decision_counts.get('discarded', 0) if type(decision_counts.get('discarded')) is int else 0}, "
-            f"rifiutati {decision_counts.get('rejected', 0) if type(decision_counts.get('rejected')) is int else 0}"
-        )
+        decision_counts = decision_counts if isinstance(decision_counts, dict) else {}
+
+        def dc(key):
+            v = decision_counts.get(key)
+            return v if type(v) is int and v >= 0 else 0
+
+        categories = report.get("content_by_category")
+        categories = categories if isinstance(categories, dict) else {}
+        cat_parts = []
+        for cat in sorted(categories, key=lambda v: -categories.get(v, 0))[:8]:
+            count = categories[cat]
+            if type(cat) is not str or type(count) is not int or count < 0:
+                continue
+            safe = cls._clean_text(cat, 40)
+            if safe:
+                cat_parts.append(f"{safe}: {count}")
 
         rates = report.get("follow_back_rate_by_source")
         rates = rates if isinstance(rates, dict) else {}
         rate_parts = []
-        for source in sorted(rates, key=lambda value: str(value))[:12]:
+        skip_sources = {"topic_search"}
+        for source in sorted(rates, key=lambda v: -rates.get(v, 0))[:8]:
             rate = rates[source]
-            if type(source) is not str or isinstance(rate, bool) or not isinstance(
-                rate, (int, float),
+            if (
+                type(source) is not str
+                or source in skip_sources
+                or isinstance(rate, bool)
+                or not isinstance(rate, (int, float))
             ):
                 continue
-            safe_source = cls._clean_text(source, 80)
-            if safe_source:
-                rate_parts.append(f"{safe_source} {max(float(rate), 0.0) * 100:.1f}%")
-        lines.append(
-            "follow-back per fonte: " + (", ".join(rate_parts) or "nessun dato")
-        )
-        lines.extend([
-            (
-                f"post: {integer('post_count')}; "
-                f"impression mediane: {decimal('median_impressions'):g}"
-            ),
-            (
-                f"budget query usato: {integer('query_budget_used')}; "
-                f"profili valutati: {integer('profiles_evaluated')}"
-            ),
-        ])
-        categories = report.get("content_by_category")
-        categories = categories if isinstance(categories, dict) else {}
-        category_parts = []
-        for category in sorted(categories, key=lambda value: str(value))[:12]:
-            count = categories[category]
-            if type(category) is not str or type(count) is not int or count < 0:
-                continue
-            safe_category = cls._clean_text(category, 80)
-            if safe_category:
-                category_parts.append(f"{safe_category} {count}")
-        lines.append(
-            "contenuti per categoria: "
-            + (", ".join(category_parts) or "nessun dato")
-        )
-        attribution = cls._clean_text(report.get("attribution_label"), 40)
-        lines.append(f"attribuzione post/follower: {attribution or 'correlation'}")
+            safe = cls._clean_text(source, 40)
+            if safe:
+                rate_parts.append(f"{safe}: {max(float(rate), 0.0) * 100:.0f}%")
+
+        lines = [
+            f"Statistiche settimanali  {start_date} — {end_date}",
+            "",
+            "Follower",
+            f"  totali: {followers_total}  |  nuovi: +{new_followers}",
+            f"  pertinenti: {new_relevant}  |  tasso: {relevant_rate:.1f}%",
+            "",
+            f"Post  ({post_count} pubblicati, mediana {median_imp:g} imp.)",
+        ]
+        if cat_parts:
+            for part in cat_parts:
+                lines.append(f"  {part}")
+        else:
+            lines.append("  nessun dato")
+        lines += [
+            "",
+            f"Crescita  (candidati valutati: {candidate_count})",
+            f"  salvati: {dc('saved')}  |  seguiti: {dc('followed_manually')}"
+            f"  |  scartati: {dc('discarded')}  |  rifiutati: {dc('rejected')}",
+        ]
+        if rate_parts:
+            lines.append("")
+            lines.append("Follow-back per fonte")
+            for part in rate_parts:
+                lines.append(f"  {part}")
         return "\n".join(lines)
 
     def _stats(self, chat_id: str):

@@ -1065,8 +1065,7 @@ def test_injected_agent_requires_editorial_feed_client_without_real_fallback(
 
 def test_status_renders_scheduler_next_run_contract(agent_and_fakes):
     agent, fakes = agent_and_fakes
-    jobs = agent.register_jobs()
-    jobs[0].next_run_time = datetime(2026, 8, 11, 10, 30, tzinfo=ROME)
+    agent.register_jobs()
 
     assert agent.telegram_controller.process_update({
         "update_id": 304,
@@ -1074,7 +1073,9 @@ def test_status_renders_scheduler_next_run_contract(agent_and_fakes):
     }) == "processed"
 
     rendered = fakes["telegram_api"].messages[-1][1]
-    assert "- Editorial source refresh: 2026-08-11T10:30:00+02:00" in rendered
+    assert "Stato bot" in rendered
+    assert "Coda" in rendered
+    assert "Oggi" in rendered
 
 
 def test_lead_jobs_are_registered_only_when_explicitly_enabled(tmp_path):

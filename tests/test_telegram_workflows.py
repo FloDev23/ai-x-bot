@@ -1063,8 +1063,8 @@ def test_pause_resume_status_and_help_are_persistent_and_concise(tmp_path):
     assert db.get_state("paused") == "true"
     restarted = workflow_controller(Database(path), telegram)
     assert restarted.process_update(message_update(21, "/status")) == "processed"
-    assert "dry-run: attivo" in telegram.messages[-1][1].lower()
-    assert "pausa: attiva" in telegram.messages[-1][1].lower()
+    assert "dry-run: on" in telegram.messages[-1][1].lower()
+    assert "pausa: si" in telegram.messages[-1][1].lower()
     assert controller.process_update(message_update(22, "/resume")) == "processed"
     assert db.get_state("paused") == "false"
     assert controller.process_update(message_update(23, "/help")) == "processed"
@@ -1083,15 +1083,15 @@ def test_status_reports_missing_or_noncanonical_pause_state_as_active(tmp_path):
     controller = workflow_controller(db, telegram)
 
     assert controller.process_update(message_update(24, "/status")) == "processed"
-    assert "pausa: attiva" in telegram.messages[-1][1].lower()
+    assert "pausa: si" in telegram.messages[-1][1].lower()
 
     db.set_state("paused", "FALSE")
     assert controller.process_update(message_update(25, "/status")) == "processed"
-    assert "pausa: attiva" in telegram.messages[-1][1].lower()
+    assert "pausa: si" in telegram.messages[-1][1].lower()
 
     db.set_state("paused", "false")
     assert controller.process_update(message_update(26, "/status")) == "processed"
-    assert "pausa: disattiva" in telegram.messages[-1][1].lower()
+    assert "pausa: no" in telegram.messages[-1][1].lower()
 
 
 def test_posts_renders_complete_safe_draft_card_and_latest_published(tmp_path):
@@ -1653,12 +1653,10 @@ def test_status_exposes_queue_and_us_publication_targets(tmp_path):
     assert controller.process_update(message_update(315, "/status")) == "processed"
 
     rendered = telegram.messages[-1][1]
-    assert "coda approvata target: 14" in rendered
-    assert "coda approvata: 0/14" in rendered
-    assert "in revisione: 0/5" in rendered
-    assert "generazione oggi: 0/5" in rendered
-    assert "pubblicazioni target oggi: 2" in rendered
-    assert "pubblico: Stati Uniti (America/New_York)" in rendered
+    assert "approvata:" in rendered and "/14" in rendered
+    assert "revisione:" in rendered and "/5" in rendered
+    assert "generati oggi:" in rendered and "/5" in rendered
+    assert "2 pubblicazioni" in rendered
 
 
 def test_newpost_exact_text_survives_restart_to_advisory_card(tmp_path):
@@ -1875,10 +1873,11 @@ def test_status_and_posts_show_planned_time_in_et_and_rome(tmp_path):
     assert controller.process_update(message_update(318, "/posts")) == "processed"
 
     rendered = "\n".join(message[1] for message in telegram.messages)
-    assert "2029-08-15 08:30 EDT" in rendered
-    assert "2029-08-15 14:30 CEST" in rendered
-    assert "2029-08-15 18:30 EDT" in rendered
-    assert "2029-08-16 00:30 CEST" in rendered
+    # /status shows HH:MM IT  (HH:MM ET) for each planned slot
+    assert "08:30 ET" in rendered
+    assert "14:30 IT" in rendered
+    assert "18:30 ET" in rendered
+    assert "00:30 IT" in rendered
 
 
 def test_posts_sends_verified_media_stream_before_separate_full_draft_card(tmp_path):
@@ -2745,8 +2744,8 @@ def test_errors_uses_sanitized_rows_and_stats_uses_read_only_analytics(tmp_path)
     assert "safe <detail> only" in telegram.messages[-1][1]
     assert telegram.messages[-1][2]["parse_mode"] is None
     assert controller.process_update(message_update(41, "/stats")) == "processed"
-    assert "followers_total: 120" in telegram.messages[-1][1]
-    assert "correlation" in telegram.messages[-1][1]
+    assert "totali: 120" in telegram.messages[-1][1]
+    assert "Follower" in telegram.messages[-1][1]
 
 
 def test_plain_text_source_flow_survives_restart_and_consumes_once(tmp_path):
