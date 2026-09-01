@@ -816,7 +816,8 @@ class FlexDropinGrowthAgent:
             return
         commands = [
             {"command": "posts",   "description": "Bozze in coda e pianificate"},
-            {"command": "newpost", "description": "Crea nuovo post manuale"},
+            {"command": "newpost",   "description": "Crea nuovo post manuale"},
+            {"command": "newthread", "description": "Crea thread manuale (2–10 tweet)"},
             {"command": "media",   "description": "Libreria media"},
             {"command": "status",  "description": "Stato bot e conteggi coda"},
             {"command": "growth",  "description": "Digest crescita giornaliero"},
