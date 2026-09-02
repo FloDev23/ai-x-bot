@@ -27,14 +27,19 @@ from modules.growth_candidate_schema import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOPIC_QUERIES = (
-    '("gym owner" OR "studio owner" OR "fitness studio" OR "box owner") '
-    '("drop-in" OR booking OR scheduling OR "class management" OR "no-show") '
+    '("gym owner" OR "studio owner" OR "box owner" OR "fitness center" OR '
+    '"CrossFit box" OR "boxing gym" OR "martial arts school" OR "pilates studio" OR '
+    '"yoga studio" OR "fitness studio") '
+    '(booking OR schedule OR "class management" OR "drop-in" OR "day pass" OR '
+    '"no-show" OR waitlist OR software OR app OR capacity) '
     'lang:en -is:retweet',
-    '(pilates OR yoga OR crossfit OR "martial arts" OR BJJ OR fitness) '
-    '(studio OR gym) (owner OR founder OR manager OR operator) '
-    '(booking OR "drop-in" OR capacity OR software OR app) lang:en -is:retweet',
+    '(pilates OR yoga OR crossfit OR boxing OR BJJ OR "muay thai" OR "martial arts" '
+    'OR "functional training" OR HIIT OR "personal training") '
+    '(studio OR gym OR box OR "training center" OR "fitness center") '
+    '(owner OR founder OR manager OR operator OR "head coach") '
+    'lang:en -is:retweet',
 )
-_PRIMARY_ROLE_TERMS = ("owner", "founder", "manager")
+_PRIMARY_ROLE_TERMS = ("owner", "founder", "manager", "operator")
 _AMPLIFIER_ROLE_TERMS = (
     "coach",
     "trainer",
@@ -50,8 +55,12 @@ _END_USER_TERMS = (
     "pilates",
     "yoga",
     "fitness",
-    "athlete",
-    "member",
+    "crossfit",
+    "boxing",
+    "martial arts",
+    "bjj",
+    "muay thai",
+    "functional",
 )
 _OPERATING_TOPIC_TERMS = (
     "class",
@@ -62,8 +71,11 @@ _OPERATING_TOPIC_TERMS = (
     "occupancy",
     "booking",
     "drop-in",
+    "day pass",
+    "waitlist",
+    "revenue",
 )
-_AFFINITY_TERMS = ("drop-in", "drop in", "class booking", "flexdropin")
+_AFFINITY_TERMS = ("drop-in", "drop in", "class booking", "day pass", "flexdropin")
 
 
 def _utc(value: datetime) -> datetime:

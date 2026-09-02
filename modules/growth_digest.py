@@ -17,17 +17,19 @@ ROME = ZoneInfo("Europe/Rome")
 GROWTH_POST_QUERY_BUDGET = 2
 POST_QUERY_PORTFOLIO: Tuple[Tuple[str, str], ...] = (
     (
-        "dropin_booking_operators",
-        '("drop-in" OR "day pass" OR "class pass" OR "class booking" OR '
-        '"studio booking" OR "gym booking" OR "drop in class") '
-        '(gym OR studio OR fitness OR pilates OR yoga OR crossfit OR martial) '
+        "gym_operator_booking",
+        '("gym owner" OR "studio owner" OR "box owner" OR "fitness studio" OR '
+        '"CrossFit box" OR "boxing gym" OR "martial arts school") '
+        '(booking OR schedule OR "class management" OR "drop-in" OR "day pass" OR '
+        '"no-show" OR waitlist OR software OR app) '
         'lang:en -is:retweet -is:reply',
     ),
     (
-        "fitness_capacity_management",
-        '("gym owner" OR "studio owner" OR "fitness business" OR '
-        '"gym management" OR "class capacity" OR "no-show" OR "member retention") '
-        '(booking OR schedule OR capacity OR software OR app OR management) '
+        "fitness_venue_dropin",
+        '("drop-in class" OR "drop-in session" OR "day pass" OR "class pass" OR '
+        '"pay per class" OR "class booking") '
+        '(gym OR studio OR pilates OR yoga OR crossfit OR boxing OR BJJ OR '
+        '"martial arts" OR functional OR "fitness center") '
         'lang:en -is:retweet -is:reply',
     ),
 )
