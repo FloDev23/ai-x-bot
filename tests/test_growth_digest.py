@@ -983,7 +983,7 @@ def test_service_builds_closed_ranked_daily_digest_with_fixed_read_budget(tmp_pa
     assert digest["outcome"] == "created"
     assert [row["object_id"] for row in digest["accounts"]] == ["101"]
     assert [row["object_id"] for row in digest["posts"]] == ["9001", "9002"]
-    assert digest["posts"][0]["score"] == 89
+    assert digest["posts"][0]["score"] == 84
     assert len(x_client.queries) == 2
     assert all(limit == 25 for _query, limit in x_client.queries)
     assert discovery.calls == 1

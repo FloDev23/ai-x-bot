@@ -17,19 +17,22 @@ ROME = ZoneInfo("Europe/Rome")
 GROWTH_POST_QUERY_BUDGET = 2
 POST_QUERY_PORTFOLIO: Tuple[Tuple[str, str], ...] = (
     (
-        "gym_operator_booking",
-        '("gym owner" OR "studio owner" OR "box owner" OR "fitness studio" OR '
-        '"CrossFit box" OR "boxing gym" OR "martial arts school") '
-        '(booking OR schedule OR "class management" OR "drop-in" OR "day pass" OR '
-        '"no-show" OR waitlist OR software OR app) '
-        'lang:en -is:retweet -is:reply',
+        "fitness_intent_model",
+        '("drop-in" OR "day pass" OR "gym without membership" OR "pay per class" OR '
+        '"pay per visit" OR "no contract gym" OR "trial class" OR "first class" OR '
+        '"want to try" OR "looking for a gym" OR "gym recommendations") '
+        '(gym OR studio OR CrossFit OR Pilates OR yoga OR boxing OR BJJ OR '
+        '"martial arts" OR fitness OR "training center") '
+        'lang:en -is:retweet -is:reply '
+        '-"home gym" -"garage gym" -airdrop -dropshipping -crypto',
     ),
     (
-        "fitness_venue_dropin",
-        '("drop-in class" OR "drop-in session" OR "day pass" OR "class pass" OR '
-        '"pay per class" OR "class booking") '
-        '(gym OR studio OR pilates OR yoga OR crossfit OR boxing OR BJJ OR '
-        '"martial arts" OR functional OR "fitness center") '
+        "gym_operator_pain",
+        '("gym owner" OR "studio owner" OR "box owner" OR "fitness studio" OR '
+        '"CrossFit box" OR "boxing gym" OR "pilates studio" OR "yoga studio") '
+        '("empty spots" OR "no-shows" OR "no show" OR "last-minute cancellation" OR '
+        '"WhatsApp booking" OR "manual booking" OR "day pass" OR "drop-in" OR '
+        'bookings OR revenue OR waitlist OR capacity) '
         'lang:en -is:retweet -is:reply',
     ),
 )
@@ -78,6 +81,23 @@ def _contains(text: str, pattern: str) -> bool:
     return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
 
+_NOISE_PATTERN = re.compile(
+    r"\b(?:home gym|garage gym|home workout equipment|gym equipment|"
+    r"treadmill|dumbbells?|kettlebells?|protein powder|creatine|supplement|"
+    r"airdrop|dropshipping|crypto drop|album drop|sneaker drop|price drop|"
+    r"job offer|job opening|we.re hiring|giveaway|contest|sweepstakes|"
+    r"personal trainer certification|trainer certification|pt certification|"
+    r"workout (?:plan|program|routine) (?:pdf|free)|online personal trainer)\b",
+    re.IGNORECASE,
+)
+_VENUE_PATTERN = re.compile(
+    r"\b(?:gym|studio|class|fitness|crossfit|pilates|yoga|martial arts?|"
+    r"bjj|jiu[ -]?jitsu|dojo|mma|boxing|muay thai|hyrox|"
+    r"training center|fitness center)\b",
+    re.IGNORECASE,
+)
+
+
 def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
     """Validate and score one closed normalized post with integer components."""
     if type(post) is not dict or type(now) is not datetime:
@@ -107,39 +127,78 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
     if age < timedelta(0) or age > timedelta(days=30):
         return None
     lowered = text.lower()
-    if not _contains(
-        lowered,
-        r"\b(?:gym|studio|class|fitness|crossfit|pilates|martial arts?|"
-        r"bjj|jiu[ -]?jitsu|dojo|mma)\b",
-    ):
+    # Hard noise exclusion before any scoring
+    if _NOISE_PATTERN.search(lowered):
         return None
-    weighted_reasons = []
+    # Must contain a fitness venue or discipline term
+    if not _VENUE_PATTERN.search(lowered):
+        return None
+    weighted_reasons: List[Tuple[str, int]] = []
+    # Operator identity signals
     if _contains(lowered, r"\b(?:gym|studio|box) owners?\b"):
         weighted_reasons.append(("gym_owner", 15))
     if _contains(
         lowered,
         r"\b(?:empty (?:class |studio )?(?:spot|spots|capacity)|"
-        r"class capacity|unused capacity|fill (?:an? )?(?:class|spot))\b",
+        r"class capacity|unused capacity|fill (?:an? )?(?:class|spots?))\b",
     ):
         weighted_reasons.append(("empty_capacity", 12))
-    if _contains(lowered, r"\bdrop[ -]?ins?\b"):
-        weighted_reasons.append(("drop_in", 12))
-    if _contains(lowered, r"\bfunctional fitness\b"):
-        weighted_reasons.append(("functional_fitness", 8))
-    if _contains(lowered, r"\bcrossfit\b"):
-        weighted_reasons.append(("crossfit", 8))
-    if _contains(lowered, r"\bpilates\b"):
-        weighted_reasons.append(("pilates", 8))
-    if _contains(lowered, r"\b(?:martial arts?|bjj|jiu[ -]?jitsu|dojo|mma)\b"):
-        weighted_reasons.append(("martial_arts", 8))
+    if _contains(
+        lowered,
+        r"\b(?:whatsapp (?:booking|bookings|reservation)|instagram (?:dm|booking)|"
+        r"manual (?:booking|bookings|reservation)|cash payment|booking via (?:whatsapp|instagram|dm))\b",
+    ):
+        weighted_reasons.append(("booking_problem", 12))
     if _contains(
         lowered,
         r"\b(?:fitness business|gym business|studio operations|"
-        r"member retention|class schedule|no[ -]?show|revenue)\b",
+        r"member retention|class schedule|no[ -]?show|revenue|waitlist)\b",
     ):
         weighted_reasons.append(("fitness_operations", 12))
-    relevance = min(sum(points for _reason, points in weighted_reasons), 50)
-    if relevance < 12:
+    # Drop-in / no-membership model signals
+    if _contains(lowered, r"\bdrop[ -]?ins?\b"):
+        weighted_reasons.append(("drop_in", 10))
+    if _contains(
+        lowered,
+        r"\b(?:day pass|pay per class|pay per visit|pay as you go|"
+        r"no contract gym|without (?:a )?membership|gym without membership)\b",
+    ):
+        weighted_reasons.append(("day_pass_model", 10))
+    # Explicit intent / request signals
+    if _contains(
+        lowered,
+        r"\b(?:looking for (?:a |an )?gym|gym recommendations?|"
+        r"recommend (?:a |an )?gym|anyone know (?:a |an )?gym|"
+        r"want to try|trying (?:crossfit|pilates|yoga|bjj|boxing|muay thai)|"
+        r"first class|trial class|where (?:can i|to) (?:find|go) (?:a |an )?gym)\b",
+    ):
+        weighted_reasons.append(("explicit_intent", 10))
+    # Travel context
+    if _contains(
+        lowered,
+        r"\b(?:visiting|traveling|travelling|business trip|"
+        r"digital nomad|expat|gym near (?:my )?hotel|workout while travel)\b",
+    ):
+        weighted_reasons.append(("travel_context", 8))
+    # Urgency / availability
+    if _contains(
+        lowered,
+        r"\b(?:class today|gym today|workout today|class tonight|"
+        r"last[ -]?minute (?:class|spot|cancellation)|"
+        r"available (?:spot|spots|class|session)|spots? available)\b",
+    ):
+        weighted_reasons.append(("urgency", 8))
+    # Discipline signals (lower weight — context enrichers)
+    if _contains(lowered, r"\bcrossfit\b"):
+        weighted_reasons.append(("crossfit", 6))
+    if _contains(lowered, r"\bpilates\b"):
+        weighted_reasons.append(("pilates", 6))
+    if _contains(lowered, r"\b(?:martial arts?|bjj|jiu[ -]?jitsu|dojo|mma|muay thai|boxing|hyrox)\b"):
+        weighted_reasons.append(("combat_sports", 6))
+    if _contains(lowered, r"\b(?:functional (?:fitness|training)|calisthenics|hiit)\b"):
+        weighted_reasons.append(("functional_fitness", 6))
+    relevance = min(sum(points for _reason, points in weighted_reasons), 55)
+    if relevance < 10:
         return None
     if age <= timedelta(days=1):
         recency = 20
@@ -161,7 +220,7 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
         author_quality = 5
     else:
         author_quality = 0
-    specificity = min(len(weighted_reasons) * 5, 15)
+    specificity = min(len(weighted_reasons) * 4, 15)
     reasons = [reason for reason, _points in weighted_reasons]
     if recency >= 10:
         reasons.append("recent")
