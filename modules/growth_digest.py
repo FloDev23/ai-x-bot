@@ -91,9 +91,45 @@ _NOISE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _VENUE_PATTERN = re.compile(
-    r"\b(?:gym|studio|class|fitness|crossfit|pilates|yoga|martial arts?|"
-    r"bjj|jiu[ -]?jitsu|dojo|mma|boxing|muay thai|hyrox|"
-    r"training center|fitness center)\b",
+    r"\b(?:gym|studio|class|fitness center|training center|"
+    # Functional / strength
+    r"crossfit|hyrox|athx|functional (?:training|fitness)|calisthenics|"
+    r"weightlifting|bodybuilding|circuit training|bootcamp|hiit|trx|fitcamp|"
+    # Cardio
+    r"spinning|indoor cycling|rowing|cardio fitness|"
+    # Mind / body
+    r"yoga|pilates|barre|meditation|stretching|postural gymnastics|"
+    # Dance
+    r"zumba|dance fitness|aqua zumba|"
+    # Combat
+    r"boxing|mma|muay thai|karate|bjj|jiu[ -]?jitsu|dojo|"
+    # Water
+    r"swimming|aqua fitness|hydrospinning|"
+    # Outdoor / alternative
+    r"climbing|bouldering|pole dance|parkour|"
+    # Generic venue
+    r"fitness|studio)\b",
+    re.IGNORECASE,
+)
+_DISCIPLINE_PATTERN = re.compile(
+    r"\b(?:"
+    # Functional / strength
+    r"crossfit|hyrox|athx|functional (?:training|fitness)|calisthenics|"
+    r"weightlifting|bodybuilding|circuit training|bootcamp|hiit|trx|fitcamp|"
+    # Cardio
+    r"spinning|indoor cycling|rowing|cardio fitness|outdoor running|outdoor fitness|"
+    # Mind / body
+    r"yoga|pilates|barre|meditation|stretching|postural gymnastics|"
+    # Dance / rhythm
+    r"zumba|dance fitness|aqua zumba|"
+    # Combat
+    r"boxing|mma|muay thai|karate|bjj|jiu[ -]?jitsu|dojo|"
+    # Water
+    r"swimming|aqua fitness|hydrospinning|"
+    # Outdoor / alternative
+    r"climbing|bouldering|pole dance|parkour|skateboard|"
+    # Personal
+    r"personal training)\b",
     re.IGNORECASE,
 )
 
@@ -188,15 +224,9 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
         r"available (?:spot|spots|class|session)|spots? available)\b",
     ):
         weighted_reasons.append(("urgency", 8))
-    # Discipline signals (lower weight — context enrichers)
-    if _contains(lowered, r"\bcrossfit\b"):
-        weighted_reasons.append(("crossfit", 6))
-    if _contains(lowered, r"\bpilates\b"):
-        weighted_reasons.append(("pilates", 6))
-    if _contains(lowered, r"\b(?:martial arts?|bjj|jiu[ -]?jitsu|dojo|mma|muay thai|boxing|hyrox)\b"):
-        weighted_reasons.append(("combat_sports", 6))
-    if _contains(lowered, r"\b(?:functional (?:fitness|training)|calisthenics|hiit)\b"):
-        weighted_reasons.append(("functional_fitness", 6))
+    # Discipline signals (context enrichers — any FlexDropin discipline)
+    if _DISCIPLINE_PATTERN.search(lowered):
+        weighted_reasons.append(("discipline_match", 6))
     relevance = min(sum(points for _reason, points in weighted_reasons), 55)
     if relevance < 10:
         return None

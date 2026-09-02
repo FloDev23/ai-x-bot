@@ -29,13 +29,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOPIC_QUERIES = (
     '("gym owner" OR "studio owner" OR "box owner" OR "fitness center" OR '
     '"CrossFit box" OR "boxing gym" OR "martial arts school" OR "pilates studio" OR '
-    '"yoga studio" OR "fitness studio") '
+    '"yoga studio" OR "fitness studio" OR "spinning studio" OR "barre studio" OR '
+    '"climbing gym" OR "dojo") '
     '(booking OR schedule OR "class management" OR "drop-in" OR "day pass" OR '
     '"no-show" OR waitlist OR software OR app OR capacity) '
     'lang:en -is:retweet',
-    '(pilates OR yoga OR crossfit OR boxing OR BJJ OR "muay thai" OR "martial arts" '
-    'OR "functional training" OR HIIT OR "personal training") '
-    '(studio OR gym OR box OR "training center" OR "fitness center") '
+    '(CrossFit OR HYROX OR ATHX OR Pilates OR Yoga OR Boxing OR BJJ OR '
+    '"Muay Thai" OR Karate OR MMA OR Spinning OR Barre OR Calisthenics OR '
+    '"Functional Training" OR HIIT OR Bootcamp OR Climbing OR Swimming OR '
+    '"Pole Dance" OR "Personal Training" OR Weightlifting) '
+    '(studio OR gym OR box OR "training center" OR "fitness center" OR dojo) '
     '(owner OR founder OR manager OR operator OR "head coach") '
     'lang:en -is:retweet',
 )
@@ -52,15 +55,43 @@ _END_USER_TERMS = (
     "studio",
     "gym",
     "box",
+    "dojo",
+    # Functional / strength
+    "crossfit",
+    "hyrox",
+    "athx",
+    "functional training",
+    "functional fitness",
+    "calisthenics",
+    "weightlifting",
+    "powerlifting",
+    "bootcamp",
+    "hiit",
+    "circuit training",
+    # Cardio
+    "spinning",
+    "indoor cycling",
+    "rowing",
+    # Mind / body
     "pilates",
     "yoga",
-    "fitness",
-    "crossfit",
+    "barre",
+    "meditation",
+    # Combat
     "boxing",
-    "martial arts",
-    "bjj",
+    "mma",
     "muay thai",
-    "functional",
+    "karate",
+    "bjj",
+    "jiu-jitsu",
+    "martial arts",
+    # Water / outdoor / alternative
+    "swimming",
+    "climbing",
+    "pole dance",
+    "parkour",
+    # Generic
+    "fitness",
 )
 _OPERATING_TOPIC_TERMS = (
     "class",

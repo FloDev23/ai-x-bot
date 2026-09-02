@@ -134,8 +134,11 @@ _GROWTH_ACCOUNT_REASONS = frozenset({
     "no_follow_back_after_14_days",
 })
 _GROWTH_POST_REASONS = frozenset({
-    "gym_owner", "empty_capacity", "drop_in", "functional_fitness",
-    "crossfit", "pilates", "martial_arts", "fitness_operations",
+    "gym_owner", "empty_capacity", "booking_problem", "fitness_operations",
+    "drop_in", "day_pass_model", "explicit_intent",
+    "travel_context", "urgency", "discipline_match",
+    # legacy codes kept for existing rows
+    "functional_fitness", "crossfit", "pilates", "martial_arts",
     "recent", "credible_author",
 })
 _GROWTH_PUBLIC_METRIC_KEYS = frozenset({
