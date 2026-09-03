@@ -42,7 +42,7 @@ automaticamente l'ora legale statunitense. Il processo registra soltanto:
 - controllo dei piani dovuti ogni 5 minuti;
 - digest growth read-only alle 09:00 `Europe/Rome`;
 - snapshot follower alle 23:15;
-- metriche dei post propri alle 23:30;
+- metriche dei post propri e ricalcolo dei pesi editoriali alle 23:30;
 - report growth Telegram il lunedì alle 09:00.
 
 La discovery lead è secondaria e viene aggiunta solo con `ENABLE_LEAD_DISCOVERY=true`. Non esistono job di engagement automatico, human-mode o build-in-public.
@@ -68,6 +68,11 @@ Telegram long polling gira in un thread daemon nominato. Scheduler e polling con
 8. Con `DRY_RUN=true` il piano diventa `simulated`, la bozza resta approvata e
    non viene eseguita alcuna chiamata di scrittura X.
 
+Dopo almeno 30 giorni dal primo post, il ciclo metriche calcola i pesi per
+categoria. Il planner li combina con il portafoglio editoriale base e
+normalizza il risultato; dati mancanti, non finiti o fuori dai limiti 0.3–3.0
+mantengono invariato il portafoglio statico.
+
 I comandi Telegram includono `/status`, `/posts`, `/media`, `/growth`, `/stats`,
 `/ideas`, `/newpost`, `/pause`, `/resume`, `/errors` e `/help`.
 
@@ -84,6 +89,11 @@ Telegram e tutti i gate editoriali.
 richiesta con il testo inglese completo e la traduzione. La rimozione di un post
 approvato è recuperabile; la sua eliminazione definitiva non esiste.
 
+Durante la pubblicazione di un thread, ogni ID confermato da X viene salvato
+insieme all'indice e all'ID padre. Se una parte successiva ha esito ambiguo, la
+bozza resta `publication_unknown`, non viene ritentata e gli ID già registrati
+restano disponibili per la riconciliazione manuale.
+
 `/media` apre il browser media verificato: archivia, ripristina, o elimina
 definitivamente (doppia conferma, solo per media mai usato). Nessun percorso
 raw raggiunge mai Telegram.
@@ -94,6 +104,20 @@ X; il bot marca solo la decisione locale in SQLite.
 
 Il refresh riuscito o senza novità è silenzioso; `/errors` mostra solo codici di
 errore sistemici sanitizzati.
+
+## Budget e telemetria X API
+
+Ogni richiesta X prenota una stima prima della chiamata e la riconcilia con le
+risorse realmente restituite. Una lettura fallita libera la prenotazione; una
+scrittura con esito di trasporto ambiguo conserva il costo massimo stimato e
+resta `unknown`. `/status` mostra la stima del mese UTC.
+
+`X_API_MONTHLY_BUDGET_USD=0` è il default retrocompatibile e registra soltanto
+la telemetria. Un valore positivo blocca prima della rete le richieste che
+supererebbero il tetto mensile. Le tariffe unitarie sono configurabili tramite
+le variabili `X_API_*_UNIT_COST_USD` presenti in `.env.example`: devono essere
+allineate ai prezzi correnti della X Developer Console, che rimane la fonte
+autorevole per la fatturazione effettiva.
 
 ## Fonti automatiche
 
@@ -131,6 +155,7 @@ una fase separata: richiede due giornate USA simulate, una riserva di 14 post,
 - `modules/publisher.py`: unico confine di scrittura X.
 - `modules/growth_discovery.py`: discovery follower read-only.
 - `modules/analytics.py`: snapshot, metriche proprie e report settimanale.
+- `modules/x_api_usage.py`: prenotazioni atomiche, tetto e stima dei costi X API.
 - `modules/database.py`: persistenza SQLite concorrente e restart-safe.
 - `modules/editorial_feed.py`: client fixed-host e validazione del feed ufficiale.
 - `modules/source_refresh.py`: isolamento del refresh blog/NewsAPI.
