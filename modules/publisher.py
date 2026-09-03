@@ -244,6 +244,7 @@ class Publisher:
                         media_file,
                         media.get("media_type") or "image",
                         media.get("filename"),
+                        publication_claim=claim,
                     )
         except (OSError, PermissionError, RuntimeError, ValueError) as error:
             media_exit_error = error
@@ -275,7 +276,7 @@ class Publisher:
         media_id = draft.get("media_id")
         if media_id is None:
             outcome = self._transport_to_x(
-                draft, None, "image", None,
+                draft, None, "image", None, publication_claim=draft_claim,
             )
             return self._persist_plan_transport_outcome(
                 draft_claim,
@@ -327,6 +328,7 @@ class Publisher:
                         media_file,
                         media.get("media_type") or "image",
                         media.get("filename"),
+                        publication_claim=draft_claim,
                     )
         except (OSError, PermissionError, RuntimeError, ValueError) as error:
             exit_failure = error
@@ -455,6 +457,7 @@ class Publisher:
             media_file,
             media_type,
             media_filename,
+            publication_claim=claim,
         )
         return self._persist_transport_outcome(
             claim,
@@ -468,6 +471,7 @@ class Publisher:
         media_file,
         media_type,
         media_filename,
+        publication_claim=None,
     ):
         if self._publication_is_paused():
             return _XTransportOutcome("paused")
@@ -475,7 +479,9 @@ class Publisher:
         thread_tweets = draft.get("thread_tweets")
         if isinstance(thread_tweets, list) and len(thread_tweets) >= 2:
             try:
-                tweet_ids = self._call_post_thread(thread_tweets)
+                tweet_ids = self._call_post_thread(
+                    thread_tweets, publication_claim,
+                )
             except XPublicationPaused:
                 return _XTransportOutcome("paused")
             except XPublicationRejected as error:
@@ -547,7 +553,7 @@ class Publisher:
             )
         return PublishResult("published", outcome.tweet_id)
 
-    def _call_post_thread(self, tweets):
+    def _call_post_thread(self, tweets, publication_claim=None):
         method = self.x_client.post_thread
         try:
             parameters = inspect.signature(method).parameters.values()
@@ -561,7 +567,31 @@ class Publisher:
         kwargs = {}
         if accepts_keywords or "before_write" in names:
             kwargs["before_write"] = self._publication_gate_open
-        return method(tweets, **kwargs)
+        recorder = getattr(self.db, "record_thread_publication_part", None)
+
+        def checkpoint(index, tweet_id, parent_id):
+            if (
+                publication_claim is None
+                or not callable(recorder)
+                or recorder(
+                    publication_claim, index, tweet_id, parent_id,
+                ) is not True
+            ):
+                raise RuntimeError("thread_checkpoint_persistence_failed")
+
+        callback_supported = (
+            callable(recorder)
+            and publication_claim is not None
+            and (accepts_keywords or "on_tweet_posted" in names)
+        )
+        if callback_supported:
+            kwargs["on_tweet_posted"] = checkpoint
+        tweet_ids = method(tweets, **kwargs)
+        if callable(recorder) and publication_claim is not None:
+            for index, tweet_id in enumerate(tweet_ids or []):
+                parent_id = tweet_ids[index - 1] if index else None
+                checkpoint(index, tweet_id, parent_id)
+        return tweet_ids
 
     def _call_post_tweet(
         self, text, media_file, media_type, media_filename

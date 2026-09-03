@@ -238,6 +238,9 @@ class TwitterClient:
         tweets: List[str],
         *,
         before_write: Optional[Callable[[], bool]] = None,
+        on_tweet_posted: Optional[
+            Callable[[int, str, Optional[str]], None]
+        ] = None,
     ) -> List[str]:
         """Post a sequence of tweets as a thread; returns their IDs in order.
 
@@ -247,6 +250,8 @@ class TwitterClient:
         """
         if not isinstance(tweets, list) or len(tweets) < 2:
             raise XPublicationRejected("thread_requires_at_least_two_tweets")
+        if on_tweet_posted is not None and not callable(on_tweet_posted):
+            raise XPublicationRejected("invalid_thread_checkpoint_callback")
         if before_write is not None:
             try:
                 allowed = before_write()
@@ -273,8 +278,21 @@ class TwitterClient:
             tweet_id = data.get("id") if isinstance(data, dict) else None
             if not is_valid_x_tweet_id(tweet_id):
                 raise XPublicationUnknown("x_thread_response_missing_id")
+            parent_id = reply_to_id
             tweet_ids.append(tweet_id)
             reply_to_id = tweet_id
+            if on_tweet_posted is not None:
+                try:
+                    on_tweet_posted(index, tweet_id, parent_id)
+                except Exception as error:
+                    logger.error(
+                        "x_thread_checkpoint_failed tweet_index=%d error_type=%s",
+                        index,
+                        type(error).__name__,
+                    )
+                    raise XPublicationUnknown(
+                        "x_thread_checkpoint_persistence_unknown"
+                    ) from error
             logger.info("x_thread_tweet_published tweet_id=%s index=%d", tweet_id, index)
         return tweet_ids
 

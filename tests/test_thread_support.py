@@ -125,6 +125,26 @@ def test_post_thread_posts_all_tweets_and_returns_ids():
     assert stub.calls[2]["text"] == THREAD_TWEETS[2]
 
 
+def test_post_thread_reports_each_confirmed_id_with_its_parent():
+    stub = StubTweepyClient(base_id=110)
+    client = _make_twitter_client_with_stub(stub)
+    checkpoints = []
+
+    ids = client.post_thread(
+        THREAD_TWEETS,
+        on_tweet_posted=lambda index, tweet_id, parent_id: checkpoints.append(
+            (index, tweet_id, parent_id)
+        ),
+    )
+
+    assert ids == ["110", "111", "112"]
+    assert checkpoints == [
+        (0, "110", None),
+        (1, "111", "110"),
+        (2, "112", "111"),
+    ]
+
+
 def test_post_thread_links_replies_via_in_reply_to_tweet_id():
     stub = StubTweepyClient(base_id=200)
     client = _make_twitter_client_with_stub(stub)
@@ -228,6 +248,40 @@ def test_get_post_draft_thread_tweets_is_none_for_single_post(tmp_path):
     assert draft["thread_tweets"] is None
 
 
+def test_thread_publication_checkpoints_are_sequential_idempotent_and_persistent(
+    tmp_path,
+):
+    path = str(tmp_path / "thread-checkpoints.db")
+    db = Database(path)
+    draft_id = _approved_thread_draft(
+        db, slot=SLOT, key="thread-checkpoints", tweets=THREAD_TWEETS,
+    )
+    draft = db.get_post_draft(draft_id)
+    claimed = db.claim_post_draft_for_publication(draft_id, draft["revision"])
+    assert claimed is not None
+    _claimed_draft, claim = claimed
+
+    assert db.record_thread_publication_part(claim, 0, "7101", None) is True
+    assert db.record_thread_publication_part(claim, 0, "7101", None) is True
+    assert db.record_thread_publication_part(claim, 2, "7103", "7102") is False
+    assert db.record_thread_publication_part(claim, 1, "7102", "wrong") is False
+    assert db.record_thread_publication_part(claim, 1, "7102", "7101") is True
+
+    reopened = Database(path)
+    assert reopened.get_thread_publication_parts(draft_id) == [
+        {
+            "part_index": 0,
+            "tweet_id": "7101",
+            "reply_to_tweet_id": None,
+        },
+        {
+            "part_index": 1,
+            "tweet_id": "7102",
+            "reply_to_tweet_id": "7101",
+        },
+    ]
+
+
 # ─── Publisher integration tests ────────────────────────────────────────────
 
 
@@ -254,6 +308,39 @@ def test_thread_draft_stores_root_tweet_id(tmp_path):
     stored = db.get_post_draft(draft_id)
     assert stored["status"] == "published"
     assert stored["published_tweet_id"] == "4001"
+
+
+def test_partial_thread_failure_keeps_confirmed_part_ids_for_reconciliation(tmp_path):
+    class PartialThreadXClient(ThreadRecordingXClient):
+        def post_thread(self, tweets, **kwargs):
+            checkpoint = kwargs["on_tweet_posted"]
+            checkpoint(0, "7201", None)
+            checkpoint(1, "7202", "7201")
+            raise XPublicationUnknown("third_part_outcome_unknown")
+
+    db = Database(str(tmp_path / "partial-thread.db"))
+    draft_id = _approved_thread_draft(
+        db, slot=SLOT, key="thread-partial", tweets=THREAD_TWEETS,
+    )
+
+    result = Publisher(db, PartialThreadXClient(), dry_run=False).publish(
+        draft_id, SLOT,
+    )
+
+    assert result.status == "publication_unknown"
+    assert db.get_post_draft(draft_id)["status"] == "publication_unknown"
+    assert db.get_thread_publication_parts(draft_id) == [
+        {
+            "part_index": 0,
+            "tweet_id": "7201",
+            "reply_to_tweet_id": None,
+        },
+        {
+            "part_index": 1,
+            "tweet_id": "7202",
+            "reply_to_tweet_id": "7201",
+        },
+    ]
 
 
 def test_thread_draft_paused_gate_restores_draft(tmp_path):

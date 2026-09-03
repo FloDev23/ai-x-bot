@@ -560,6 +560,19 @@ class Database:
                     "ALTER TABLE post_drafts "
                     "ADD COLUMN thread_tweets_json TEXT"
                 )
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS thread_publication_parts (
+                    draft_id INTEGER NOT NULL,
+                    part_index INTEGER NOT NULL CHECK (
+                        part_index >= 0 AND part_index < 10
+                    ),
+                    tweet_id TEXT NOT NULL UNIQUE,
+                    reply_to_tweet_id TEXT,
+                    recorded_at TEXT NOT NULL,
+                    PRIMARY KEY (draft_id, part_index),
+                    FOREIGN KEY (draft_id) REFERENCES post_drafts(id)
+                )
+            """)
             for draft in c.execute(
                 "SELECT id, intended_slot FROM post_drafts"
             ).fetchall():
@@ -5434,6 +5447,89 @@ class Database:
             ).fetchone()
             claim = self._publication_claim_from_row(row)
             return self._decode_post_draft(row), claim
+
+    def record_thread_publication_part(
+        self,
+        claim: PostDraftPublicationClaim,
+        part_index: int,
+        tweet_id: str,
+        reply_to_tweet_id: Optional[str],
+    ) -> bool:
+        """Persist one confirmed thread part while the exact claim is active."""
+        if (
+            not isinstance(claim, PostDraftPublicationClaim)
+            or type(part_index) is not int
+            or not 0 <= part_index < 10
+            or not self._canonical_x_tweet_id(tweet_id)
+            or (
+                reply_to_tweet_id is not None
+                and not self._canonical_x_tweet_id(reply_to_tweet_id)
+            )
+            or (part_index == 0) != (reply_to_tweet_id is None)
+        ):
+            return False
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            draft = conn.execute(
+                "SELECT * FROM post_drafts WHERE id = ?", (claim.draft_id,)
+            ).fetchone()
+            if not self._post_draft_matches_publication_claim(draft, claim):
+                return False
+            try:
+                thread_tweets = json.loads(draft["thread_tweets_json"] or "null")
+            except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+                return False
+            if not isinstance(thread_tweets, list) or part_index >= len(thread_tweets):
+                return False
+            existing = conn.execute("""
+                SELECT part_index, tweet_id, reply_to_tweet_id
+                FROM thread_publication_parts
+                WHERE draft_id = ? ORDER BY part_index
+            """, (claim.draft_id,)).fetchall()
+            if part_index < len(existing):
+                row = existing[part_index]
+                return (
+                    row["part_index"] == part_index
+                    and row["tweet_id"] == tweet_id
+                    and row["reply_to_tweet_id"] == reply_to_tweet_id
+                )
+            if (
+                part_index != len(existing)
+                or any(row["part_index"] != index for index, row in enumerate(existing))
+                or (
+                    part_index > 0
+                    and existing[-1]["tweet_id"] != reply_to_tweet_id
+                )
+            ):
+                return False
+            try:
+                conn.execute("""
+                    INSERT INTO thread_publication_parts (
+                        draft_id, part_index, tweet_id, reply_to_tweet_id,
+                        recorded_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, (
+                    claim.draft_id,
+                    part_index,
+                    tweet_id,
+                    reply_to_tweet_id,
+                    self._now_iso(),
+                ))
+            except sqlite3.IntegrityError:
+                return False
+            return True
+
+    def get_thread_publication_parts(self, draft_id: int) -> List[Dict]:
+        """Return confirmed thread IDs in reply order for reconciliation."""
+        if type(draft_id) is not int or draft_id <= 0:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT part_index, tweet_id, reply_to_tweet_id
+                FROM thread_publication_parts
+                WHERE draft_id = ? ORDER BY part_index
+            """, (draft_id,)).fetchall()
+        return [dict(row) for row in rows]
 
     def validate_post_draft_publication_media(
         self,
