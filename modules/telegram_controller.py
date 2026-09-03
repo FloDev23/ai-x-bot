@@ -19,6 +19,7 @@ from config import (
     NEWS_TRUSTED_DOMAINS,
     PENDING_REVIEW_LIMIT,
     POSTS_PER_DAY,
+    X_API_MONTHLY_BUDGET_MICROUSD,
 )
 from modules.media_store import open_verified_media
 from modules.telegram_media_browser import MediaBrowser
@@ -364,6 +365,26 @@ class TelegramController:
             f"  revisione:     {pending_count}/{PENDING_REVIEW_LIMIT}",
             f"  generati oggi: {generation_used}/{DRAFT_GENERATION_DAILY_CAP}",
         ]
+        period_key = current.astimezone(timezone.utc).strftime("%Y-%m")
+        try:
+            api_usage = self.db.get_x_api_usage_summary(period_key)
+        except Exception:
+            api_usage = {}
+        estimated_cost = api_usage.get("estimated_cost_microusd")
+        if type(estimated_cost) is int and estimated_cost >= 0:
+            cost_label = (
+                f"${estimated_cost // 1_000_000}."
+                f"{estimated_cost % 1_000_000:06d}"
+            )
+            if X_API_MONTHLY_BUDGET_MICROUSD:
+                budget_label = (
+                    f"${X_API_MONTHLY_BUDGET_MICROUSD // 1_000_000}."
+                    f"{X_API_MONTHLY_BUDGET_MICROUSD % 1_000_000:06d}"
+                )
+                cost_label = f"{cost_label} / {budget_label}"
+            else:
+                cost_label = f"{cost_label} (solo telemetria)"
+            lines.extend(["", f"API X — {period_key} UTC", f"  stima: {cost_label}"])
         slots = []
         for plan in publication_positions[:target_today]:
             scheduled = self._clean_text(plan.get("scheduled_for"), 80)

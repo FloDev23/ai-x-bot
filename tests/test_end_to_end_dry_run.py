@@ -1076,6 +1076,8 @@ def test_status_renders_scheduler_next_run_contract(agent_and_fakes):
     assert "Stato bot" in rendered
     assert "Coda" in rendered
     assert "Oggi" in rendered
+    assert "API X — 2026-08 UTC" in rendered
+    assert "$0.000000 (solo telemetria)" in rendered
 
 
 def test_lead_jobs_are_registered_only_when_explicitly_enabled(tmp_path):

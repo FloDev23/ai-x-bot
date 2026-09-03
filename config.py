@@ -100,6 +100,26 @@ def _bounded_positive_int_env(name, default, maximum):
     return value
 
 
+_USD_AMOUNT_FORMAT = re.compile(
+    r"(?P<whole>0|[1-9][0-9]{0,6})(?:\.(?P<fraction>[0-9]{1,6}))?"
+)
+
+
+def _strict_nonnegative_usd_micros_env(name, default):
+    """Parse a canonical USD amount into exact integer micro-USD."""
+    raw_value = os.getenv(name, default)
+    match = (
+        _USD_AMOUNT_FORMAT.fullmatch(raw_value)
+        if isinstance(raw_value, str)
+        else None
+    )
+    if match is None:
+        raise ValueError(f"{name} must be a non-negative USD amount")
+    whole = int(match["whole"])
+    fraction = (match["fraction"] or "").ljust(6, "0")
+    return whole * 1_000_000 + int(fraction or "0")
+
+
 def _strict_clock_time_env(name, default):
     raw_value = os.getenv(name, default)
     if (
@@ -252,8 +272,38 @@ def _growth_digest_configuration():
     }
 
 
+def _x_api_usage_configuration():
+    costs = {
+        "post_read": _strict_nonnegative_usd_micros_env(
+            "X_API_POST_READ_UNIT_COST_USD", "0.005",
+        ),
+        "user_read": _strict_nonnegative_usd_micros_env(
+            "X_API_USER_READ_UNIT_COST_USD", "0.010",
+        ),
+        "owned_read": _strict_nonnegative_usd_micros_env(
+            "X_API_OWNED_READ_UNIT_COST_USD", "0.001",
+        ),
+        "content_create": _strict_nonnegative_usd_micros_env(
+            "X_API_CONTENT_CREATE_UNIT_COST_USD", "0.015",
+        ),
+        "content_create_with_url": _strict_nonnegative_usd_micros_env(
+            "X_API_CONTENT_CREATE_WITH_URL_UNIT_COST_USD", "0.200",
+        ),
+        "media_upload": _strict_nonnegative_usd_micros_env(
+            "X_API_MEDIA_UPLOAD_UNIT_COST_USD", "0",
+        ),
+    }
+    return {
+        "monthly_budget_microusd": _strict_nonnegative_usd_micros_env(
+            "X_API_MONTHLY_BUDGET_USD", "0",
+        ),
+        "unit_costs_microusd": costs,
+    }
+
+
 _ADAPTIVE_CONFIGURATION = _adaptive_configuration()
 _GROWTH_DIGEST_CONFIGURATION = _growth_digest_configuration()
+_X_API_USAGE_CONFIGURATION = _x_api_usage_configuration()
 POSTS_PER_DAY = _ADAPTIVE_CONFIGURATION["POSTS_PER_DAY"]
 THIRD_POST_DAYS_PER_WEEK = _ADAPTIVE_CONFIGURATION["THIRD_POST_DAYS_PER_WEEK"]
 APPROVED_QUEUE_TARGET = _ADAPTIVE_CONFIGURATION["APPROVED_QUEUE_TARGET"]
@@ -288,6 +338,12 @@ GROWTH_SUGGESTION_COOLDOWN_DAYS = _GROWTH_DIGEST_CONFIGURATION[
 GROWTH_UNFOLLOW_REVIEW_DAYS = _GROWTH_DIGEST_CONFIGURATION[
     "GROWTH_UNFOLLOW_REVIEW_DAYS"
 ]
+X_API_MONTHLY_BUDGET_MICROUSD = _X_API_USAGE_CONFIGURATION[
+    "monthly_budget_microusd"
+]
+X_API_UNIT_COSTS_MICROUSD = dict(
+    _X_API_USAGE_CONFIGURATION["unit_costs_microusd"]
+)
 
 
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Rome")
@@ -356,9 +412,8 @@ LIKE_ENGAGEMENT_THRESHOLD = int(os.getenv('LIKE_ENGAGEMENT_THRESHOLD', '50'))
 MAX_COMMENTS_PER_SESSION = int(os.getenv('MAX_COMMENTS_PER_SESSION', '3'))
 
 # ========== Growth Agent v3: scheduling e frequenze cicli ==========
-# NOTA COSTI (X API 2026, pay-per-use): letture ~$0.005, post ~$0.015,
-# post con link ~$0.20. Gli intervalli qui sotto sono pensati per contenere
-# il costo mensile, non per massimizzare la frequenza di pubblicazione.
+# I costi X sono stimati attraverso la configurazione X_API_* e devono
+# rispecchiare le tariffe correnti mostrate nella Developer Console.
 OPPORTUNITY_CYCLE_TIMES = os.getenv('OPPORTUNITY_CYCLE_TIMES', '10:00,16:00').split(',')  # 2 ricerche lead/giorno
 PERFORMANCE_CYCLE_TIME = os.getenv('PERFORMANCE_CYCLE_TIME', '23:00')  # 1 volta/giorno, owned reads economici
 
@@ -463,5 +518,8 @@ def validate_config():
 
     if _growth_digest_configuration() != _GROWTH_DIGEST_CONFIGURATION:
         raise ValueError("Growth digest configuration changed after import")
+
+    if _x_api_usage_configuration() != _X_API_USAGE_CONFIGURATION:
+        raise ValueError("X API usage configuration changed after import")
 
     print("✅ Configurazione validata con successo!")

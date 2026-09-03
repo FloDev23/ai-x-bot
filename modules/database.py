@@ -573,6 +573,30 @@ class Database:
                     FOREIGN KEY (draft_id) REFERENCES post_drafts(id)
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS x_api_usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_token TEXT NOT NULL UNIQUE,
+                    period_key TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    reserved_units INTEGER NOT NULL CHECK (reserved_units > 0),
+                    actual_units INTEGER CHECK (
+                        actual_units IS NULL OR actual_units >= 0
+                    ),
+                    unit_cost_microusd INTEGER NOT NULL CHECK (
+                        unit_cost_microusd >= 0
+                    ),
+                    state TEXT NOT NULL CHECK (
+                        state IN ('reserved','completed','failed','unknown')
+                    ),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_x_api_usage_period
+                ON x_api_usage_events(period_key, state)
+            """)
             for draft in c.execute(
                 "SELECT id, intended_slot FROM post_drafts"
             ).fetchall():
@@ -5530,6 +5554,167 @@ class Database:
                 WHERE draft_id = ? ORDER BY part_index
             """, (draft_id,)).fetchall()
         return [dict(row) for row in rows]
+
+    def reserve_x_api_usage(
+        self,
+        *,
+        request_token: str,
+        operation: str,
+        max_units: int,
+        unit_cost_microusd: int,
+        monthly_budget_microusd: int,
+        occurred_at: datetime,
+    ) -> bool:
+        """Atomically reserve the maximum estimated cost of one X request."""
+        current = self._strict_aware_datetime(occurred_at)
+        if (
+            type(request_token) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", request_token) is None
+            or type(operation) is not str
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", operation) is None
+            or type(max_units) is not int
+            or not 1 <= max_units <= 1_000_000_000
+            or type(unit_cost_microusd) is not int
+            or not 0 <= unit_cost_microusd <= 1_000_000_000
+            or type(monthly_budget_microusd) is not int
+            or not 0 <= monthly_budget_microusd <= 1_000_000_000_000_000
+            or current is None
+        ):
+            return False
+        period_key = current.astimezone(timezone.utc).strftime("%Y-%m")
+        reserved_cost = max_units * unit_cost_microusd
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("""
+                SELECT state, reserved_units, actual_units, unit_cost_microusd
+                FROM x_api_usage_events WHERE period_key = ?
+            """, (period_key,)).fetchall()
+            used = 0
+            for row in rows:
+                if row["state"] == "failed":
+                    continue
+                units = (
+                    row["actual_units"]
+                    if row["state"] == "completed"
+                    else row["reserved_units"]
+                )
+                if type(units) is not int or units < 0:
+                    return False
+                used += units * row["unit_cost_microusd"]
+            if monthly_budget_microusd and (
+                used + reserved_cost > monthly_budget_microusd
+            ):
+                return False
+            timestamp = current.astimezone(timezone.utc).isoformat()
+            try:
+                conn.execute("""
+                    INSERT INTO x_api_usage_events (
+                        request_token, period_key, operation, reserved_units,
+                        actual_units, unit_cost_microusd, state, created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, NULL, ?, 'reserved', ?, ?)
+                """, (
+                    request_token,
+                    period_key,
+                    operation,
+                    max_units,
+                    unit_cost_microusd,
+                    timestamp,
+                    timestamp,
+                ))
+            except sqlite3.IntegrityError:
+                return False
+            return True
+
+    def settle_x_api_usage(
+        self,
+        request_token: str,
+        state: str,
+        *,
+        actual_units: Optional[int] = None,
+    ) -> bool:
+        """Settle an exact usage reservation without changing its estimate rate."""
+        if (
+            type(request_token) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", request_token) is None
+            or state not in {"completed", "failed", "unknown"}
+            or (
+                state == "completed"
+                and (type(actual_units) is not int or actual_units < 0)
+            )
+            or (state != "completed" and actual_units is not None)
+        ):
+            return False
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("""
+                SELECT state, reserved_units, actual_units
+                FROM x_api_usage_events WHERE request_token = ?
+            """, (request_token,)).fetchone()
+            if row is None:
+                return False
+            if row["state"] == state:
+                return (
+                    state != "completed"
+                    or row["actual_units"] == actual_units
+                )
+            if row["state"] != "reserved":
+                return False
+            if state == "completed" and actual_units > row["reserved_units"]:
+                return False
+            cursor = conn.execute("""
+                UPDATE x_api_usage_events
+                SET state = ?, actual_units = ?, updated_at = ?
+                WHERE request_token = ? AND state = 'reserved'
+            """, (
+                state,
+                actual_units if state == "completed" else None,
+                self._now_iso(),
+                request_token,
+            ))
+            return cursor.rowcount == 1
+
+    def get_x_api_usage_summary(self, period_key: str) -> Dict:
+        """Return deterministic estimated usage for one UTC calendar month."""
+        if (
+            type(period_key) is not str
+            or re.fullmatch(r"[0-9]{4}-(?:0[1-9]|1[0-2])", period_key) is None
+        ):
+            return {}
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT operation, state, reserved_units, actual_units,
+                       unit_cost_microusd
+                FROM x_api_usage_events
+                WHERE period_key = ? ORDER BY id
+            """, (period_key,)).fetchall()
+        states = {name: 0 for name in ("reserved", "completed", "failed", "unknown")}
+        operations: Dict[str, Dict[str, int]] = {}
+        total_cost = 0
+        for row in rows:
+            state = row["state"]
+            states[state] += 1
+            units = 0
+            if state == "completed":
+                units = row["actual_units"]
+            elif state in {"reserved", "unknown"}:
+                units = row["reserved_units"]
+            cost = units * row["unit_cost_microusd"]
+            total_cost += cost
+            bucket = operations.setdefault(row["operation"], {
+                "requests": 0,
+                "billable_units": 0,
+                "estimated_cost_microusd": 0,
+            })
+            bucket["requests"] += 1
+            bucket["billable_units"] += units
+            bucket["estimated_cost_microusd"] += cost
+        return {
+            "period_key": period_key,
+            "estimated_cost_microusd": total_cost,
+            "states": states,
+            "operations": operations,
+        }
 
     def validate_post_draft_publication_media(
         self,

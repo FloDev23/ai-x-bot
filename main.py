@@ -48,6 +48,8 @@ from config import (
     SEMANTIC_DUPLICATE_THRESHOLD,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
+    X_API_MONTHLY_BUDGET_MICROUSD,
+    X_API_UNIT_COSTS_MICROUSD,
     EVENING_WINDOW,
     validate_config,
 )
@@ -84,6 +86,7 @@ from modules.source_refresh import (
 from modules.telegram_api import TELEGRAM_POLL_TIMEOUT, TelegramApi
 from modules.telegram_controller import TelegramController
 from modules.twitter_client import TwitterClient
+from modules.x_api_usage import XApiUsageMeter
 
 
 logging.basicConfig(
@@ -138,6 +141,7 @@ class FlexDropinGrowthAgent:
         "telegram_poll_timeout",
         "timezone_name",
         "x_client",
+        "x_api_usage_meter",
     })
     _REQUIRED_INJECTED_BOUNDARIES = frozenset({
         "db",
@@ -208,6 +212,15 @@ class FlexDropinGrowthAgent:
         )
 
         self.db = resolve("db", Database)
+        self.x_api_usage_meter = resolve(
+            "x_api_usage_meter",
+            lambda: XApiUsageMeter(
+                self.db,
+                monthly_budget_microusd=X_API_MONTHLY_BUDGET_MICROUSD,
+                unit_costs_microusd=X_API_UNIT_COSTS_MICROUSD,
+                clock=self.clock,
+            ),
+        )
         telegram_token = supplied.get("telegram_bot_token", TELEGRAM_BOT_TOKEN)
         self.telegram_api = resolve(
             "telegram_api",
@@ -249,7 +262,10 @@ class FlexDropinGrowthAgent:
                 weekday_min_posts=ADAPTIVE_WEEKDAY_MIN_POSTS,
             ),
         )
-        self.twitter_client = resolve("x_client", TwitterClient)
+        self.twitter_client = resolve(
+            "x_client",
+            lambda: TwitterClient(usage_meter=self.x_api_usage_meter),
+        )
         self.scorer = resolve(
             "scorer",
             lambda: TweetScorer(

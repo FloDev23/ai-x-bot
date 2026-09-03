@@ -17,6 +17,8 @@ from config import (
 from typing import BinaryIO, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
+from modules.x_api_usage import XApiBudgetExceeded
+
 logger = logging.getLogger(__name__)
 
 
@@ -134,7 +136,7 @@ def _raise_publication_error(error: BaseException) -> None:
 class TwitterClient:
     """Gestisce l'interazione con X (Twitter) API"""
     
-    def __init__(self):
+    def __init__(self, usage_meter=None):
         # Autenticazione con OAuth 2.0
         self._client = tweepy.Client(
             bearer_token=TWITTER_BEARER_TOKEN,
@@ -149,6 +151,62 @@ class TwitterClient:
         auth = tweepy.OAuthHandler(TWITTER_API_KEY, TWITTER_API_SECRET)
         auth.set_access_token(TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET)
         self._api = tweepy.API(auth, wait_on_rate_limit=True)
+        self._usage_meter = usage_meter
+
+    def _reserve_usage(self, operation: str, max_units: int):
+        meter = getattr(self, "_usage_meter", None)
+        if meter is None:
+            return None
+        claim = meter.reserve(operation, max_units)
+        if claim is None:
+            raise XApiBudgetExceeded("x_api_monthly_budget_exceeded")
+        return claim
+
+    def _complete_usage(self, claim, actual_units: int) -> None:
+        meter = getattr(self, "_usage_meter", None)
+        if claim is None or meter is None:
+            return
+        try:
+            settled = meter.complete(claim, actual_units)
+        except Exception as error:
+            logger.error(
+                "x_api_usage_completion_failed error_type=%s",
+                type(error).__name__,
+            )
+            return
+        if settled is not True:
+            logger.error("x_api_usage_completion_conflict")
+
+    def _fail_usage(self, claim, *, unknown: bool = False) -> None:
+        meter = getattr(self, "_usage_meter", None)
+        if claim is None or meter is None:
+            return
+        try:
+            settled = meter.unknown(claim) if unknown else meter.fail(claim)
+        except Exception as error:
+            logger.error(
+                "x_api_usage_failure_settlement_failed error_type=%s",
+                type(error).__name__,
+            )
+            return
+        if settled is not True:
+            logger.error("x_api_usage_failure_settlement_conflict")
+
+    def _metered_read(self, operation: str, max_units: int, request):
+        claim = self._reserve_usage(operation, max_units)
+        try:
+            response = request()
+        except Exception:
+            self._fail_usage(claim)
+            raise
+        data = getattr(response, "data", None)
+        actual_units = (
+            len(data)
+            if isinstance(data, (list, tuple))
+            else int(data is not None)
+        )
+        self._complete_usage(claim, actual_units)
+        return response
     
     def _upload_media(
         self,
@@ -169,6 +227,10 @@ class TwitterClient:
         ):
             raise XPublicationRejected("invalid_media_filename")
         try:
+            usage_claim = self._reserve_usage("media_upload", 1)
+        except XApiBudgetExceeded as error:
+            raise XPublicationRejected("x_api_budget_exceeded") from error
+        try:
             if media_type == "video":
                 media = self._api.media_upload(
                     safe_filename,
@@ -179,13 +241,19 @@ class TwitterClient:
             else:
                 media = self._api.media_upload(safe_filename, file=media_file)
         except Exception as error:
+            self._fail_usage(
+                usage_claim,
+                unknown=_publication_outcome_is_unknown(error),
+            )
             logger.error(
                 "x_media_upload_failed error_type=%s", type(error).__name__
             )
             _raise_publication_error(error)
         media_id = getattr(media, "media_id_string", None)
         if not media_id:
+            self._fail_usage(usage_claim, unknown=True)
             raise XPublicationRejected("x_media_upload_rejected")
+        self._complete_usage(usage_claim, 1)
         return str(media_id)
 
     def post_tweet(
@@ -207,29 +275,51 @@ class TwitterClient:
         if media_path is not None:
             if not callable(getattr(media_path, "read", None)):
                 raise XPublicationRejected("verified_media_stream_required")
-            media_id = self._upload_media(
-                media_path, media_type, filename=media_filename
-            )
+        operation = (
+            "content_create_with_url"
+            if type(text) is str and re.search(r"https?://", text)
+            else "content_create"
+        )
+        try:
+            usage_claim = self._reserve_usage(operation, 1)
+        except XApiBudgetExceeded as error:
+            raise XPublicationRejected("x_api_budget_exceeded") from error
+        if media_path is not None:
+            try:
+                media_id = self._upload_media(
+                    media_path, media_type, filename=media_filename
+                )
+            except Exception:
+                self._fail_usage(usage_claim)
+                raise
             params["media_ids"] = [media_id]
 
         if before_write is not None:
             try:
                 allowed = before_write()
             except Exception as error:
+                self._fail_usage(usage_claim)
                 raise XPublicationPaused("publication_gate_unavailable") from error
             if allowed is not True:
+                self._fail_usage(usage_claim)
                 raise XPublicationPaused("publication_paused")
 
         try:
             response = self._client.create_tweet(**params)
         except Exception as error:
+            self._fail_usage(
+                usage_claim,
+                unknown=_publication_outcome_is_unknown(error),
+            )
             logger.error("x_tweet_write_failed error_type=%s", type(error).__name__)
             _raise_publication_error(error)
 
         data = getattr(response, "data", response)
         tweet_id = data.get("id") if isinstance(data, dict) else None
         if not is_valid_x_tweet_id(tweet_id):
+            self._fail_usage(usage_claim, unknown=True)
             raise XPublicationUnknown("x_publication_response_missing_id")
+        self._complete_usage(usage_claim, 1)
         logger.info("x_tweet_published tweet_id=%s", tweet_id)
         return response
 
@@ -259,6 +349,15 @@ class TwitterClient:
                 raise XPublicationPaused("publication_gate_unavailable") from error
             if allowed is not True:
                 raise XPublicationPaused("publication_paused")
+        operation = (
+            "content_create_with_url"
+            if any(type(text) is str and re.search(r"https?://", text) for text in tweets)
+            else "content_create"
+        )
+        try:
+            usage_claim = self._reserve_usage(operation, len(tweets))
+        except XApiBudgetExceeded as error:
+            raise XPublicationRejected("x_api_budget_exceeded") from error
         tweet_ids: List[str] = []
         reply_to_id: Optional[str] = None
         for index, text in enumerate(tweets):
@@ -268,6 +367,13 @@ class TwitterClient:
             try:
                 response = self._client.create_tweet(**params)
             except Exception as error:
+                self._fail_usage(
+                    usage_claim,
+                    unknown=(
+                        bool(tweet_ids)
+                        or _publication_outcome_is_unknown(error)
+                    ),
+                )
                 logger.error(
                     "x_thread_tweet_write_failed tweet_index=%d error_type=%s",
                     index,
@@ -277,6 +383,7 @@ class TwitterClient:
             data = getattr(response, "data", response)
             tweet_id = data.get("id") if isinstance(data, dict) else None
             if not is_valid_x_tweet_id(tweet_id):
+                self._fail_usage(usage_claim, unknown=True)
                 raise XPublicationUnknown("x_thread_response_missing_id")
             parent_id = reply_to_id
             tweet_ids.append(tweet_id)
@@ -285,6 +392,7 @@ class TwitterClient:
                 try:
                     on_tweet_posted(index, tweet_id, parent_id)
                 except Exception as error:
+                    self._fail_usage(usage_claim, unknown=True)
                     logger.error(
                         "x_thread_checkpoint_failed tweet_index=%d error_type=%s",
                         index,
@@ -294,6 +402,7 @@ class TwitterClient:
                         "x_thread_checkpoint_persistence_unknown"
                     ) from error
             logger.info("x_thread_tweet_published tweet_id=%s index=%d", tweet_id, index)
+        self._complete_usage(usage_claim, len(tweet_ids))
         return tweet_ids
 
     def search_tweets(self, query: str, limit: int = 10) -> List[Dict]:
@@ -312,12 +421,17 @@ class TwitterClient:
             Lista di tweet
         """
         try:
-            tweets = self._client.search_recent_tweets(
-                query=query,
-                max_results=max(10, min(limit, 100)),
-                tweet_fields=['public_metrics', 'author_id', 'created_at'],
-                expansions=['author_id'],
-                user_fields=['username']
+            max_results = max(10, min(limit, 100))
+            tweets = self._metered_read(
+                "post_read",
+                max_results,
+                lambda: self._client.search_recent_tweets(
+                    query=query,
+                    max_results=max_results,
+                    tweet_fields=['public_metrics', 'author_id', 'created_at'],
+                    expansions=['author_id'],
+                    user_fields=['username']
+                ),
             )
 
             if tweets.data:
@@ -570,7 +684,11 @@ class TwitterClient:
             if next_token is not None:
                 params["next_token"] = next_token
             try:
-                response = self._client.search_recent_tweets(**params)
+                response = self._metered_read(
+                    "post_read",
+                    params["max_results"],
+                    lambda: self._client.search_recent_tweets(**params),
+                )
             except Exception as error:
                 logger.warning(
                     "x_relevant_posts_read_failed error_type=%s",
@@ -752,7 +870,11 @@ class TwitterClient:
             if pagination_token is not None:
                 params["pagination_token"] = pagination_token
             try:
-                response = self._client.get_users_followers(**params)
+                response = self._metered_read(
+                    "owned_read",
+                    params["max_results"],
+                    lambda: self._client.get_users_followers(**params),
+                )
             except Exception as error:
                 logger.warning(
                     "x_growth_followers_read_failed error_type=%s",
@@ -805,13 +927,18 @@ class TwitterClient:
         return list(self.read_followers_profiles().profiles)
 
     def _search_recent_profiles(self, query: str, limit: int) -> List[Dict]:
+        max_results = max(10, min(limit, 100))
         try:
-            response = self._client.search_recent_tweets(
-                query=query,
-                max_results=max(10, min(limit, 100)),
-                tweet_fields=["author_id", "created_at", "lang"],
-                expansions=["author_id"],
-                user_fields=self._growth_user_fields(),
+            response = self._metered_read(
+                "post_read",
+                max_results,
+                lambda: self._client.search_recent_tweets(
+                    query=query,
+                    max_results=max_results,
+                    tweet_fields=["author_id", "created_at", "lang"],
+                    expansions=["author_id"],
+                    user_fields=self._growth_user_fields(),
+                ),
             )
         except Exception as error:
             logger.warning(
@@ -868,11 +995,15 @@ class TwitterClient:
         if type(user_id) is not str or not user_id:
             return None
         try:
-            response = self._client.get_users_tweets(
-                id=user_id,
-                max_results=5,
-                exclude=["retweets", "replies"],
-                tweet_fields=["created_at", "lang", "public_metrics"],
+            response = self._metered_read(
+                "post_read",
+                5,
+                lambda: self._client.get_users_tweets(
+                    id=user_id,
+                    max_results=5,
+                    exclude=["retweets", "replies"],
+                    tweet_fields=["created_at", "lang", "public_metrics"],
+                ),
             )
         except Exception as error:
             logger.warning(
@@ -921,9 +1052,13 @@ class TwitterClient:
         anche questa è una lettura a pagamento.
         """
         try:
-            user = self._client.get_user(
-                username=username.lstrip('@'),
-                user_fields=['public_metrics', 'verified']
+            user = self._metered_read(
+                "user_read",
+                1,
+                lambda: self._client.get_user(
+                    username=username.lstrip('@'),
+                    user_fields=['public_metrics', 'verified']
+                ),
             )
             if not user.data:
                 return None
@@ -945,8 +1080,13 @@ class TwitterClient:
             info = self.get_user_info(username)
             if not info:
                 return None
-            tweets = self._client.get_users_tweets(
-                id=info['id'], max_results=5, tweet_fields=['public_metrics']
+            tweets = self._metered_read(
+                "post_read",
+                5,
+                lambda: self._client.get_users_tweets(
+                    id=info['id'], max_results=5,
+                    tweet_fields=['public_metrics'],
+                ),
             )
             if not tweets.data:
                 return None
@@ -964,9 +1104,13 @@ class TwitterClient:
         """
         result = {}
         try:
-            tweets = self._client.get_tweets(
-                ids=tweet_ids,
-                tweet_fields=['public_metrics', 'non_public_metrics']
+            tweets = self._metered_read(
+                "owned_read",
+                max(1, len(tweet_ids)),
+                lambda: self._client.get_tweets(
+                    ids=tweet_ids,
+                    tweet_fields=['public_metrics', 'non_public_metrics']
+                ),
             )
             if not tweets.data:
                 return result
@@ -990,7 +1134,9 @@ class TwitterClient:
             ID dell'utente
         """
         try:
-            user = self._client.get_me()
+            user = self._metered_read(
+                "owned_read", 1, self._client.get_me,
+            )
             return user.data.id
         except Exception as e:
             logger.error(f"❌ Errore nell'ottenere l'ID utente: {e}")
