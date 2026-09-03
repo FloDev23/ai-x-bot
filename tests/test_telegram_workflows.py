@@ -1094,7 +1094,7 @@ def test_status_reports_missing_or_noncanonical_pause_state_as_active(tmp_path):
     assert "pausa: no" in telegram.messages[-1][1].lower()
 
 
-def test_posts_renders_complete_safe_draft_card_and_latest_published(tmp_path):
+def test_posts_renders_complete_safe_draft_card_and_hides_published(tmp_path):
     db = Database(str(tmp_path / "posts.db"))
     source_id, draft_id = add_pending_draft(
         db,
@@ -1118,13 +1118,11 @@ def test_posts_renders_complete_safe_draft_card_and_latest_published(tmp_path):
     assert controller.process_update(message_update(30, "/posts")) == "processed"
     index_message = telegram.messages[-1]
     pending_callback = post_detail_callback(index_message, "Complete")
-    published_callback = post_detail_callback(index_message, "Already published")
     assert controller.process_update(callback_update(3000, pending_callback)) == "processed"
-    assert controller.process_update(callback_update(3001, published_callback)) == "processed"
 
     rendered = "\n".join(item[1] for item in telegram.messages)
     assert "Complete <draft> & copy" in rendered
-    assert "Already published" in rendered
+    assert "Already published" not in rendered
     assert "founder_story" in rendered
     assert "non ancora pianificato" in rendered
     assert "total: 88" in rendered
@@ -1988,6 +1986,10 @@ def test_published_preview_requires_exact_tweet_media_binding(tmp_path):
         text="Published post with mismatched used media",
     )
     record = attach_verified_preview(db, tmp_path, draft_id)
+    telegram = WorkflowTelegramApi(tmp_path)
+    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
+    assert controller.process_update(message_update(309, "/posts")) == "processed"
+    detail_callback = post_detail_callback(telegram.messages[-1])
     with db._conn() as conn:
         conn.execute(
             "UPDATE post_drafts SET status = 'published', "
@@ -2000,11 +2002,10 @@ def test_published_preview_requires_exact_tweet_media_binding(tmp_path):
             "WHERE id = ?",
             (record["id"],),
         )
-    telegram = WorkflowTelegramApi(tmp_path)
-    controller = workflow_controller(db, telegram, pipeline=StubPipeline(db))
 
-    assert controller.process_update(message_update(309, "/posts")) == "processed"
-    open_first_post_detail(controller, telegram, 3309)
+    assert controller.process_update(
+        callback_update(3309, detail_callback)
+    ) == "processed"
 
     assert telegram.media_messages == []
     assert any(

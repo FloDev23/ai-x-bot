@@ -7741,6 +7741,12 @@ class Database:
             return "invalid", None
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                DELETE FROM growth_read_claims
+                WHERE observed_on = ? AND query_key != ?
+                  AND substr(query_key, 1, 2) != '__'
+                  AND state = 'claimed' AND expires_at <= ?
+            """, (observed_on, query_key, claimed.isoformat()))
             existing = conn.execute("""
                 SELECT state, claim_token, expires_at FROM growth_read_claims
                 WHERE observed_on = ? AND query_key = ?
