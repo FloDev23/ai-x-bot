@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 venv/
 media_library/
+.worktrees/
