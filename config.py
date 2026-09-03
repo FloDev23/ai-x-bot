@@ -272,6 +272,26 @@ def _growth_digest_configuration():
     }
 
 
+def _reply_copilot_configuration():
+    enabled, enabled_valid = _strict_boolean_env(
+        "ENABLE_REPLY_COPILOT", False,
+    )
+    if not enabled_valid:
+        raise ValueError("ENABLE_REPLY_COPILOT must be exactly true or false")
+    return {
+        "enabled": enabled,
+        "daily_limit": _bounded_positive_int_env(
+            "REPLY_COPILOT_DAILY_LIMIT", 5, 5,
+        ),
+        "max_age_hours": _bounded_positive_int_env(
+            "REPLY_COPILOT_MAX_AGE_HOURS", 48, 48,
+        ),
+        "max_regenerations": _bounded_positive_int_env(
+            "REPLY_COPILOT_MAX_REGENERATIONS", 2, 2,
+        ),
+    }
+
+
 def _x_api_usage_configuration():
     costs = {
         "post_read": _strict_nonnegative_usd_micros_env(
@@ -303,6 +323,7 @@ def _x_api_usage_configuration():
 
 _ADAPTIVE_CONFIGURATION = _adaptive_configuration()
 _GROWTH_DIGEST_CONFIGURATION = _growth_digest_configuration()
+_REPLY_COPILOT_CONFIGURATION = _reply_copilot_configuration()
 _X_API_USAGE_CONFIGURATION = _x_api_usage_configuration()
 POSTS_PER_DAY = _ADAPTIVE_CONFIGURATION["POSTS_PER_DAY"]
 THIRD_POST_DAYS_PER_WEEK = _ADAPTIVE_CONFIGURATION["THIRD_POST_DAYS_PER_WEEK"]
@@ -337,6 +358,12 @@ GROWTH_SUGGESTION_COOLDOWN_DAYS = _GROWTH_DIGEST_CONFIGURATION[
 ]
 GROWTH_UNFOLLOW_REVIEW_DAYS = _GROWTH_DIGEST_CONFIGURATION[
     "GROWTH_UNFOLLOW_REVIEW_DAYS"
+]
+ENABLE_REPLY_COPILOT = _REPLY_COPILOT_CONFIGURATION["enabled"]
+REPLY_COPILOT_DAILY_LIMIT = _REPLY_COPILOT_CONFIGURATION["daily_limit"]
+REPLY_COPILOT_MAX_AGE_HOURS = _REPLY_COPILOT_CONFIGURATION["max_age_hours"]
+REPLY_COPILOT_MAX_REGENERATIONS = _REPLY_COPILOT_CONFIGURATION[
+    "max_regenerations"
 ]
 X_API_MONTHLY_BUDGET_MICROUSD = _X_API_USAGE_CONFIGURATION[
     "monthly_budget_microusd"
@@ -518,6 +545,9 @@ def validate_config():
 
     if _growth_digest_configuration() != _GROWTH_DIGEST_CONFIGURATION:
         raise ValueError("Growth digest configuration changed after import")
+
+    if _reply_copilot_configuration() != _REPLY_COPILOT_CONFIGURATION:
+        raise ValueError("Reply Copilot configuration changed after import")
 
     if _x_api_usage_configuration() != _X_API_USAGE_CONFIGURATION:
         raise ValueError("X API usage configuration changed after import")

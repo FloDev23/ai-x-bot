@@ -68,6 +68,55 @@ def test_growth_digest_configuration_has_bounded_release_defaults():
     assert result.stdout.strip() == "09:00 5 10 2 30 14"
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("ENABLE_REPLY_COPILOT", "True"),
+        ("ENABLE_REPLY_COPILOT", "1"),
+        ("REPLY_COPILOT_DAILY_LIMIT", "0"),
+        ("REPLY_COPILOT_DAILY_LIMIT", "6"),
+        ("REPLY_COPILOT_MAX_AGE_HOURS", "49"),
+        ("REPLY_COPILOT_MAX_REGENERATIONS", "3"),
+    ),
+)
+def test_reply_copilot_configuration_fails_closed(name, value):
+    script = (
+        "import os; "
+        f"os.environ[{name!r}] = {value!r}; "
+        "import config"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert name in result.stderr
+
+
+def test_reply_copilot_configuration_has_safe_defaults():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import config; print(config.ENABLE_REPLY_COPILOT, "
+                "config.REPLY_COPILOT_DAILY_LIMIT, "
+                "config.REPLY_COPILOT_MAX_AGE_HOURS, "
+                "config.REPLY_COPILOT_MAX_REGENERATIONS)"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False 5 48 2"
+
+
 def test_x_api_budget_configuration_has_backward_compatible_defaults():
     result = subprocess.run(
         [
