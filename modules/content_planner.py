@@ -1,4 +1,6 @@
 """Deterministic, source-backed editorial planning."""
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional
@@ -40,14 +42,47 @@ class ContentPlan:
     include_link: bool
 
 
-def _portfolio_deficit(category: str, counts: Dict[str, int]) -> float:
+def effective_portfolio(weights=None) -> Dict[str, float]:
+    """Return normalized learned targets or the unchanged static portfolio."""
+    base = dict(PORTFOLIO)
+    if not isinstance(weights, Mapping) or not weights:
+        return base
+    known = {category: weights[category] for category in PORTFOLIO if category in weights}
+    if not known:
+        return base
+    if any(
+        type(weight) not in {int, float}
+        or not math.isfinite(weight)
+        or not 0.3 <= weight <= 3.0
+        for weight in known.values()
+    ):
+        return base
+    adjusted = {
+        category: share * known.get(category, 1.0)
+        for category, share in PORTFOLIO.items()
+    }
+    total = sum(adjusted.values())
+    if not math.isfinite(total) or total <= 0:
+        return base
+    return {category: value / total for category, value in adjusted.items()}
+
+
+def _portfolio_deficit(
+    category: str,
+    counts: Dict[str, int],
+    portfolio: Mapping[str, float] = PORTFOLIO,
+) -> float:
     next_total = sum(counts.values()) + 1
-    return PORTFOLIO[category] * next_total - counts.get(category, 0)
+    return portfolio[category] * next_total - counts.get(category, 0)
 
 
-def choose_portfolio_category(counts: Dict[str, int]) -> str:
+def choose_portfolio_category(counts: Dict[str, int], weights=None) -> str:
     """Return the category with the largest 30-day portfolio deficit."""
-    return max(PORTFOLIO, key=lambda category: _portfolio_deficit(category, counts))
+    portfolio = effective_portfolio(weights)
+    return max(
+        portfolio,
+        key=lambda category: _portfolio_deficit(category, counts, portfolio),
+    )
 
 
 class ContentPlanner:
@@ -86,6 +121,12 @@ class ContentPlanner:
             return None
 
         counts = self.database.get_content_mix_counts(days=30)
+        read_weights = getattr(self.database, "get_all_category_weights", None)
+        try:
+            weights = read_weights() if callable(read_weights) else None
+        except Exception:
+            weights = None
+        portfolio = effective_portfolio(weights)
         sources = self.database.get_eligible_sources()
         if (
             not isinstance(sources, list)
@@ -115,14 +156,16 @@ class ContentPlanner:
             now=local_slot,
         )
         eligible_categories = [
-            category for category in PORTFOLIO if sources_by_category[category]
+            category for category in portfolio if sources_by_category[category]
         ]
         if not eligible_categories:
             return None
 
         category = max(
             eligible_categories,
-            key=lambda candidate: _portfolio_deficit(candidate, counts),
+            key=lambda candidate: _portfolio_deficit(
+                candidate, counts, portfolio,
+            ),
         )
         selected_source = sources_by_category[category][0]
         include_link = False

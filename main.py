@@ -659,9 +659,13 @@ class FlexDropinGrowthAgent:
             self._notify_error("cycle", error)
             return {}
 
-    def performance_metrics_cycle(self):
+    def performance_metrics_cycle(self, now=None):
         try:
-            return self.analytics.refresh_own_tweet_metrics()
+            result = self.analytics.refresh_own_tweet_metrics()
+            self.analytics.recompute_category_weights(
+                now=self._now() if now is None else now,
+            )
+            return result
         except Exception as error:
             self._notify_error("cycle", error)
             return None

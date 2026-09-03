@@ -1080,6 +1080,25 @@ def test_status_renders_scheduler_next_run_contract(agent_and_fakes):
     assert "$0.000000 (solo telemetria)" in rendered
 
 
+def test_performance_cycle_refreshes_metrics_before_reweighting(agent_and_fakes):
+    agent, _fakes = agent_and_fakes
+    calls = []
+
+    class RecordingAnalytics:
+        def refresh_own_tweet_metrics(self):
+            calls.append(("refresh", None))
+            return "refreshed"
+
+        def recompute_category_weights(self, *, now):
+            calls.append(("reweight", now))
+            return {"gym_strategy": 1.0}
+
+    agent.analytics = RecordingAnalytics()
+
+    assert agent.performance_metrics_cycle(now=NOW) == "refreshed"
+    assert calls == [("refresh", None), ("reweight", NOW)]
+
+
 def test_lead_jobs_are_registered_only_when_explicitly_enabled(tmp_path):
     disabled = FlexDropinGrowthAgent(dependency_bundle(tmp_path / "off"))
     assert not any(job.id.startswith("lead_discovery_") for job in disabled.register_jobs())

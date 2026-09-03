@@ -258,8 +258,8 @@ class PerformanceAnalyzer:
         Calcola il CTR (engagement/impression) per categoria e ne deriva un peso.
         Le categorie che performano meglio della media ottengono un peso > 1,
         quelle sotto media un peso < 1. Questo peso viene poi usato da
-        content_scheduler.pick_category() per aumentare automaticamente
-        i contenuti che funzionano (auto-ottimizzazione, come richiesto).
+        ContentPlanner per adattare il mix futuro senza superare i limiti
+        minimi e massimi definiti qui.
         """
         current_time = self._aware_datetime(
             now or datetime.now(timezone.utc), "now",

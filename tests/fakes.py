@@ -8,6 +8,7 @@ class FakeDatabase:
 
     def __init__(self):
         self.content_counts = {}
+        self.category_weights = {}
         self.sources = []
         self.drafts_today = 0
         self.links_last_days = 0
@@ -23,6 +24,9 @@ class FakeDatabase:
     def get_content_mix_counts(self, days=30):
         assert days == 30
         return dict(self.content_counts)
+
+    def get_all_category_weights(self):
+        return dict(self.category_weights)
 
     def count_links_last_days(self, days=7, now=None):
         assert days == 7

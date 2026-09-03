@@ -1,7 +1,12 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from modules.content_planner import ContentPlanner, choose_portfolio_category
+from modules.content_planner import (
+    PORTFOLIO,
+    ContentPlanner,
+    choose_portfolio_category,
+    effective_portfolio,
+)
 
 
 ROME = ZoneInfo("Europe/Rome")
@@ -16,6 +21,36 @@ def test_largest_rolling_deficit_wins():
         "founder_journey": 2,
     }
     assert choose_portfolio_category(counts) == "gym_strategy"
+
+
+def test_learned_weights_change_category_target_and_remain_normalized():
+    weights = {"fitness_business_insight": 3.0}
+
+    targets = effective_portfolio(weights)
+
+    assert set(targets) == set(PORTFOLIO)
+    assert round(sum(targets.values()), 12) == 1.0
+    assert choose_portfolio_category({}, weights) == "fitness_business_insight"
+
+
+def test_missing_or_malformed_weights_preserve_static_portfolio():
+    assert effective_portfolio() == PORTFOLIO
+    assert effective_portfolio({}) == PORTFOLIO
+    assert effective_portfolio({"gym_strategy": float("nan")}) == PORTFOLIO
+    assert effective_portfolio({"gym_strategy": 0.29}) == PORTFOLIO
+    assert effective_portfolio({"gym_strategy": 3.01}) == PORTFOLIO
+    assert effective_portfolio({"gym_strategy": True}) == PORTFOLIO
+
+
+def test_planner_uses_database_category_weights_for_eligible_deficits(fake_db):
+    fake_db.category_weights = {"fitness_business_insight": 3.0}
+    fake_db.sources = [{"id": 7, "source_type": "verified_news"}]
+
+    plan = ContentPlanner(fake_db).plan(
+        datetime(2026, 8, 11, 14, 0, tzinfo=ROME),
+    )
+
+    assert plan.category == "fitness_business_insight"
 
 
 def test_planner_skips_when_no_category_has_an_eligible_source(fake_db):
