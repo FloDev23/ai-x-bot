@@ -83,6 +83,10 @@ DRAFT_SCORE_THRESHOLD=70
 SEMANTIC_DUPLICATE_THRESHOLD=0.72
 MAX_LINKS_PER_WEEK=1
 ENABLE_LEAD_DISCOVERY=false
+ENABLE_REPLY_COPILOT=false
+REPLY_COPILOT_DAILY_LIMIT=5
+REPLY_COPILOT_MAX_AGE_HOURS=48
+REPLY_COPILOT_MAX_REGENERATIONS=2
 MEDIA_MATCH_THRESHOLD=80
 TELEGRAM_POLL_TIMEOUT=25
 TELEGRAM_MAX_IMAGE_BYTES=10485760
@@ -101,7 +105,7 @@ GROWTH_SEED_ACCOUNTS=
 NEWS_TRUSTED_DOMAINS=
 ```
 
-`validate_config()` rifiuta token/chat Telegram mancanti e `APPROVAL_REQUIRED=false`. Richiede `NEWSAPI_KEY` solo quando è configurato almeno un dominio fidato. Il query budget growth è comunque limitato a tre.
+`validate_config()` rifiuta token/chat Telegram mancanti, `APPROVAL_REQUIRED=false` e valori Reply Copilot non canonici o superiori ai tetti 5/48/2. Richiede `NEWSAPI_KEY` solo quando è configurato almeno un dominio fidato. Il query budget growth è comunque limitato a tre.
 
 ## 5. Test locale senza rete
 
@@ -122,6 +126,24 @@ Alle 10:30 `Europe/Rome` il job `source_refresh` aggiorna separatamente:
 - le news esterne, solo dai domini in `NEWS_TRUSTED_DOMAINS`.
 
 Un guasto di un canale non annulla l'altro. Successo e assenza di novità non generano messaggi Telegram; gli errori sistemici vengono sanitizzati e sono consultabili con `/errors`. Un articolo blog non viene trattato come product fact. I suoi link rispettano `MAX_LINKS_PER_WEEK=1` e un cooldown di 30 giorni sullo stesso articolo.
+
+### Reply Copilot opzionale
+
+Con `ENABLE_REPLY_COPILOT=true`, il job Growth Digest genera anche fino a cinque
+bozze di risposta dai soli post già persistiti. Non viene aggiunto un job di
+discovery, non viene eseguita un'altra lettura X e il bot non pubblica mai la
+risposta. `/replies` mostra testo, conteggio caratteri e controlli manuali:
+
+- `Copia risposta` copia soltanto il testo validato;
+- `Rispondi su X` apre il composer standard X tramite Web Intent;
+- `Rigenera` consuma uno dei due tentativi manuali disponibili;
+- `Ignora` e `Segna come pubblicata` aggiornano soltanto SQLite.
+
+Le risposte sono inglesi, pertinenti e non promozionali: nessun riferimento a
+FlexDropin, sito, app, link o invito commerciale. Il limite di età è 48 ore e
+la ripartizione dei batch pieni alterna 4/1 e 3/2 tra operatori ed end user.
+Per tornare allo stato precedente impostare `ENABLE_REPLY_COPILOT=false`; non è
+necessaria né consentita una migrazione distruttiva del database.
 
 ## 7. Dry-run sul VPS
 
@@ -151,6 +173,10 @@ Completare e annotare tutta la checklist:
 - [ ] digest growth alle 09:00 Rome: al massimo 5 account, 10 post, 5 da rivalutare; ogni azione (follow, like) resta manuale su X;
 - [ ] `Segnala come seguito` aggiorna solo SQLite; zero chiamate di engagement X;
 - [ ] pulsanti post/account del digest aprono URL X per azione manuale; nessun callback di follow/like sui post;
+- [ ] con Reply Copilot attivo, `/replies` mostra al massimo cinque candidati già presenti nel digest, senza nuove letture X;
+- [ ] ogni risposta è pertinente, inglese e non promozionale; `Copia risposta` e `Rispondi su X` non cambiano lo stato;
+- [ ] dopo la pubblicazione manuale su X, solo `Segna come pubblicata` aggiorna SQLite; rigenerazione e scarto restano revision-bound;
+- [ ] il ledger X non cambia durante build, apertura, copia, Web Intent, rigenerazione, scarto e marcatura manuale;
 - [ ] `/pause` impedisce la pubblicazione e `/resume` la riabilita;
 - [ ] reinvio dello stesso callback senza doppia mutazione;
 - [ ] snapshot follower e report `/stats` coerenti;

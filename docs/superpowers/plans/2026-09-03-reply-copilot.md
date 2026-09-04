@@ -39,7 +39,7 @@
 - Produces constants: `ENABLE_REPLY_COPILOT`, `REPLY_COPILOT_DAILY_LIMIT`, `REPLY_COPILOT_MAX_AGE_HOURS`, `REPLY_COPILOT_MAX_REGENERATIONS`.
 - Extends: `validate_config()` with an import-time snapshot comparison.
 
-- [ ] **Step 1: Write failing subprocess configuration tests**
+- [x] **Step 1: Write failing subprocess configuration tests**
 
 Add cases beside the Growth Digest configuration tests:
 
@@ -69,7 +69,7 @@ def test_reply_copilot_configuration_has_safe_defaults():
 
 Reuse the test file's existing subprocess helpers and sanitized environment rather than importing and reloading `config` in-process.
 
-- [ ] **Step 2: Run the focused tests and confirm the missing configuration is red**
+- [x] **Step 2: Run the focused tests and confirm the missing configuration is red**
 
 Run:
 
@@ -79,7 +79,7 @@ venv/bin/python -m pytest -q tests/test_main_startup.py -k reply_copilot
 
 Expected: FAIL because the constants and strict parser block do not exist.
 
-- [ ] **Step 3: Implement the cached strict configuration block**
+- [x] **Step 3: Implement the cached strict configuration block**
 
 Add:
 
@@ -106,11 +106,11 @@ def _reply_copilot_configuration():
 
 Cache it as `_REPLY_COPILOT_CONFIGURATION`, expose the four constants, and compare a fresh parse to the cached value in `validate_config()` so post-import environment changes fail closed.
 
-- [ ] **Step 4: Document the four environment variables**
+- [x] **Step 4: Document the four environment variables**
 
 Add the exact disabled defaults to `.env.example` next to the Growth Digest controls. State that the limits may only be reduced and that enabling the feature creates AI drafts but never sends replies through X.
 
-- [ ] **Step 5: Verify configuration behavior**
+- [x] **Step 5: Verify configuration behavior**
 
 Run:
 
@@ -120,7 +120,7 @@ venv/bin/python -m pytest -q tests/test_main_startup.py
 
 Expected: all tests pass.
 
-- [ ] **Step 6: Commit locally**
+- [x] **Step 6: Commit locally**
 
 ```bash
 git add config.py .env.example tests/test_main_startup.py
@@ -145,7 +145,7 @@ Do not push the commit.
 - Produces: `build_reply_web_intent(tweet_id: object, reply_text: object) -> str | None`.
 - Produces: `AIGenerator.generate_value_reply(tweet_text: str) -> str | None`.
 
-- [ ] **Step 1: Write failing pure-function guard tests**
+- [x] **Step 1: Write failing pure-function guard tests**
 
 Cover all of these exact behaviors in `tests/test_reply_copilot.py`:
 
@@ -172,7 +172,7 @@ assert parse_qs(parsed.query) == {
 }
 ```
 
-- [ ] **Step 2: Run the pure-function tests and confirm the module is absent**
+- [x] **Step 2: Run the pure-function tests and confirm the module is absent**
 
 Run:
 
@@ -182,11 +182,11 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py -k "segment or guard or
 
 Expected: collection/import failure for `modules.reply_copilot`.
 
-- [ ] **Step 3: Implement pure classification, guard, and Web Intent helpers**
+- [x] **Step 3: Implement pure classification, guard, and Web Intent helpers**
 
 In `modules/reply_copilot.py`:
 
-- normalize with Unicode NFC and collapsed ordinary whitespace;
+- normalize with Unicode NFKC and collapsed ordinary whitespace;
 - reject control/surrogate code points before persistence;
 - use compiled, case-insensitive bounded regexes for URL, email, hashtag, mention, brand, promotion, prompt-injection, and high-risk terms;
 - validate a canonical positive decimal X post ID;
@@ -195,11 +195,11 @@ In `modules/reply_copilot.py`:
 
 Define the segment code sets as immutable module constants and do not accept legacy generic reason codes as sufficient evidence of a segment.
 
-- [ ] **Step 4: Verify the pure functions**
+- [x] **Step 4: Verify the pure functions**
 
 Run the command from Step 2. Expected: PASS.
 
-- [ ] **Step 5: Write failing tests for the dedicated AI method**
+- [x] **Step 5: Write failing tests for the dedicated AI method**
 
 Use the existing fake Groq completion pattern in `tests/test_ai_generator.py` and assert:
 
@@ -210,7 +210,7 @@ Use the existing fake Groq completion pattern in `tests/test_ai_generator.py` an
 - empty/provider-failed output returns `None`;
 - this method never calls `generate_flexdropin_comment` or the lead-DM path.
 
-- [ ] **Step 6: Run the focused generator tests and confirm they are red**
+- [x] **Step 6: Run the focused generator tests and confirm they are red**
 
 Run:
 
@@ -220,7 +220,7 @@ venv/bin/python -m pytest -q tests/test_ai_generator.py -k value_reply
 
 Expected: FAIL because `generate_value_reply` is missing.
 
-- [ ] **Step 7: Implement `AIGenerator.generate_value_reply`**
+- [x] **Step 7: Implement `AIGenerator.generate_value_reply`**
 
 Add a dedicated method that calls `_complete` directly:
 
@@ -242,7 +242,7 @@ def generate_value_reply(self, tweet_text: str) -> Optional[str]:
 
 Keep final policy enforcement in `normalize_and_validate_reply`; this AI method is only the narrow provider boundary. Do not log the prompt or source.
 
-- [ ] **Step 8: Verify reply generation and the existing AI suite**
+- [x] **Step 8: Verify reply generation and the existing AI suite**
 
 Run:
 
@@ -252,7 +252,7 @@ venv/bin/python -m pytest -q tests/test_ai_generator.py tests/test_reply_copilot
 
 Expected: all selected tests pass.
 
-- [ ] **Step 9: Commit locally**
+- [x] **Step 9: Commit locally**
 
 ```bash
 git add modules/reply_copilot.py modules/ai_generator.py tests/test_reply_copilot.py tests/test_ai_generator.py
@@ -280,7 +280,7 @@ Do not push the commit.
 - Produces: `Database.transition_reply_suggestion(reply_id, expected_revision, target_status, decided_at) -> str`.
 - Produces: `Database.get_reply_copilot_counts(observed_on) -> dict[str, int]`.
 
-- [ ] **Step 1: Write failing additive-migration and row-validation tests**
+- [x] **Step 1: Write failing additive-migration and row-validation tests**
 
 Create a database with existing growth suggestions, drafts, publication plans, metrics, and X usage events, reopen it with the new `Database`, and assert every pre-existing count is unchanged. Assert `reply_suggestions` exists with:
 
@@ -312,7 +312,7 @@ FOREIGN KEY(growth_suggestion_id) REFERENCES growth_suggestions(id)
 
 Add indexes for `(observed_on, status, relevance_score)` and expired generation claims. Invalid enum/counter rows must fail at SQLite constraint level.
 
-- [ ] **Step 2: Run the migration test and confirm it is red**
+- [x] **Step 2: Run the migration test and confirm it is red**
 
 Run:
 
@@ -322,15 +322,15 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py -k "migration or schema
 
 Expected: FAIL because the table is absent.
 
-- [ ] **Step 3: Add the schema and immutable claim dataclass**
+- [x] **Step 3: Add the schema and immutable claim dataclass**
 
 Create `ReplyGenerationClaim` next to the existing publication claim dataclasses. Add only `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` statements inside `_init_schema`; do not alter, drop, or reinterpret any existing table.
 
-- [ ] **Step 4: Verify additive migration**
+- [x] **Step 4: Verify additive migration**
 
 Run the command from Step 2. Expected: PASS.
 
-- [ ] **Step 5: Write failing atomic reservation tests**
+- [x] **Step 5: Write failing atomic reservation tests**
 
 Prove that `reserve_reply_suggestions`:
 
@@ -344,7 +344,7 @@ Prove that `reserve_reply_suggestions`:
 
 Use `threading.Barrier` for the two-instance race and assert the final SQL count, not just each caller's return value.
 
-- [ ] **Step 6: Run reservation tests and confirm the API is red**
+- [x] **Step 6: Run reservation tests and confirm the API is red**
 
 Run:
 
@@ -354,15 +354,15 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py -k reservation
 
 Expected: FAIL because the reservation method is missing.
 
-- [ ] **Step 7: Implement reservation and read models**
+- [x] **Step 7: Implement reservation and read models**
 
 Use `BEGIN IMMEDIATE` around capacity calculation and inserts. Bound all stored strings, parse JSON only through existing Growth Digest readers, and return plain dictionaries with parsed aware datetimes. `get_reply_suggestion` must honor `expected_revision` when supplied; `list_reply_suggestions` must reject unknown statuses instead of interpolating them into SQL.
 
-- [ ] **Step 8: Verify reservation tests**
+- [x] **Step 8: Verify reservation tests**
 
 Run the command from Step 6. Expected: PASS.
 
-- [ ] **Step 9: Write failing generation-lease tests**
+- [x] **Step 9: Write failing generation-lease tests**
 
 Cover:
 
@@ -377,7 +377,7 @@ Cover:
 - failure sets `generation_failed`, stores only a bounded failure code, clears copy/lease, and increments revision;
 - all state survives `Database` restart.
 
-- [ ] **Step 10: Run lease tests and confirm they are red**
+- [x] **Step 10: Run lease tests and confirm they are red**
 
 Run:
 
@@ -387,11 +387,11 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py -k "claim or lease or g
 
 Expected: FAIL because the claim methods are absent.
 
-- [ ] **Step 11: Implement claim, completion, and failure transitions**
+- [x] **Step 11: Implement claim, completion, and failure transitions**
 
 Use exact token equality and `BEGIN IMMEDIATE`. A claim changes the row to `reserved`, clears obsolete output/failure fields, increments `generation_count` and `revision`, and returns that new revision in `ReplyGenerationClaim`. Completion or failure increments revision again. Never persist an exception message; accept only stable internal failure codes such as `provider_unavailable`, `invalid_output`, and `claim_lost`.
 
-- [ ] **Step 12: Write and implement manual-decision/count tests**
+- [x] **Step 12: Write and implement manual-decision/count tests**
 
 First add red tests, then implement:
 
@@ -408,7 +408,7 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py -k "transition or count
 
 Expected after implementation: PASS.
 
-- [ ] **Step 13: Verify the complete persistence slice**
+- [x] **Step 13: Verify the complete persistence slice**
 
 Run:
 
@@ -418,7 +418,7 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py
 
 Expected: all persistence and pure-function tests pass.
 
-- [ ] **Step 14: Commit locally**
+- [x] **Step 14: Commit locally**
 
 ```bash
 git add modules/database.py tests/test_reply_copilot.py
@@ -444,7 +444,7 @@ Do not push the commit.
 - Produces: `ReplyCopilotService.mark_published(reply_id, expected_revision, now=None) -> tuple[dict | None, str]`.
 - Produces: `ReplyCopilotService.counts(observed_on) -> dict[str, int]`.
 
-- [ ] **Step 1: Write failing deterministic selection tests**
+- [x] **Step 1: Write failing deterministic selection tests**
 
 Seed real `growth_suggestions` through existing Growth Digest persistence helpers. Assert:
 
@@ -459,7 +459,7 @@ Seed real `growth_suggestions` through existing Growth Digest persistence helper
 
 Add a sentinel object whose every attribute access raises and prove it is never needed by the constructor or `build`; this is the structural no-X-dependency test.
 
-- [ ] **Step 2: Run selection tests and confirm the service is red**
+- [x] **Step 2: Run selection tests and confirm the service is red**
 
 Run:
 
@@ -469,7 +469,7 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py -k "service_selection o
 
 Expected: FAIL because `ReplyCopilotService` is missing.
 
-- [ ] **Step 3: Implement validation, ranking, and alternating allocation**
+- [x] **Step 3: Implement validation, ranking, and alternating allocation**
 
 The service must reload the persisted digest even when the caller already has a digest dictionary. Parse `payload.created_at` as an aware UTC time, calculate age from the passed aware `now`, and build only normalized candidate snapshots for `Database.reserve_reply_suggestions`.
 
@@ -485,11 +485,11 @@ operator_quota, end_user_quota = (
 
 Select within each segment by the shared stable rank, then fill unused capacity from all remaining candidates by that same rank. Do not inspect live X state.
 
-- [ ] **Step 4: Verify selection behavior**
+- [x] **Step 4: Verify selection behavior**
 
 Run the command from Step 2. Expected: PASS.
 
-- [ ] **Step 5: Write failing generation-orchestration tests**
+- [x] **Step 5: Write failing generation-orchestration tests**
 
 Using a fake generator with queued responses, prove:
 
@@ -503,7 +503,7 @@ Using a fake generator with queued responses, prove:
 - `dismiss` and `mark_published` use only exact current rows/revisions;
 - summaries have exactly `observed_on`, `outcome`, `reserved`, `ready`, `failed`, and `suggestions`, where `suggestions` contains current safe rows only.
 
-- [ ] **Step 6: Run orchestration tests and confirm they are red**
+- [x] **Step 6: Run orchestration tests and confirm they are red**
 
 Run:
 
@@ -513,7 +513,7 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py -k "generation_orchestr
 
 Expected: FAIL until service generation methods exist.
 
-- [ ] **Step 7: Implement bounded orchestration and failure isolation**
+- [x] **Step 7: Implement bounded orchestration and failure isolation**
 
 For each row eligible for generation:
 
@@ -526,7 +526,7 @@ For each row eligible for generation:
 
 `build` may generate newly reserved/expired-claim rows, but must never automatically retry a completed `generation_failed` row. `regenerate` is the only ordinary retry path.
 
-- [ ] **Step 8: Verify the complete service**
+- [x] **Step 8: Verify the complete service**
 
 Run:
 
@@ -536,7 +536,7 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py
 
 Expected: all tests pass.
 
-- [ ] **Step 9: Commit locally**
+- [x] **Step 9: Commit locally**
 
 ```bash
 git add modules/reply_copilot.py tests/test_reply_copilot.py
@@ -562,7 +562,7 @@ Do not push the commit.
 - Adds callback prefixes: `rp` for detail/navigation and `rpa` for mutations.
 - Extends Telegram reply markup with validated `copy_text` buttons.
 
-- [ ] **Step 1: Write failing `/replies` and card-rendering tests**
+- [x] **Step 1: Write failing `/replies` and card-rendering tests**
 
 In `tests/test_reply_copilot_telegram.py`, build the real controller with a real temporary database and a fake Reply Copilot service. Assert:
 
@@ -574,7 +574,7 @@ In `tests/test_reply_copilot_telegram.py`, build the real controller with a real
 - `Rispondi su X` contains the exact parsed `in_reply_to` and reply text;
 - copy and URL buttons contain no callback data and cause no database transition.
 
-- [ ] **Step 2: Run the new Telegram tests and confirm they are red**
+- [x] **Step 2: Run the new Telegram tests and confirm they are red**
 
 Run:
 
@@ -584,7 +584,7 @@ venv/bin/python -m pytest -q tests/test_reply_copilot_telegram.py -k "command or
 
 Expected: FAIL because Reply Copilot is not wired into the controller.
 
-- [ ] **Step 3: Implement the command, summary, opaque view, and card**
+- [x] **Step 3: Implement the command, summary, opaque view, and card**
 
 Add `reply_copilot` as an optional keyword-only constructor dependency and register `/replies`. Use `view_kind="reply_copilot"` and persist the current row IDs with `Database.create_telegram_view`.
 
@@ -599,13 +599,13 @@ rpa:p:<view_token>:<reply_id>:<revision>
 
 Before rendering, reload the opaque view for the authorized chat, confirm membership of `reply_id`, and reload the exact revision. Build `copy_text` and Web Intent from the persisted validated reply only.
 
-- [ ] **Step 4: Extend reply-markup validation for `copy_text`**
+- [x] **Step 4: Extend reply-markup validation for `copy_text`**
 
 In `_validate_reply_markup`, require each inline button to contain exactly one supported action among `callback_data`, `url`, and `copy_text`. For `copy_text`, require exactly `{"text": <str>}` and a 1-256-character value. Preserve all existing valid callback and HTTPS URL buttons.
 
 Add focused transport tests in `tests/test_telegram_workflows.py` for a valid copy button, empty/257-character copy, malformed object, and a button with multiple action kinds.
 
-- [ ] **Step 5: Verify command/card/transport tests**
+- [x] **Step 5: Verify command/card/transport tests**
 
 Run:
 
@@ -615,7 +615,7 @@ venv/bin/python -m pytest -q tests/test_reply_copilot_telegram.py tests/test_tel
 
 Expected: all selected tests pass.
 
-- [ ] **Step 6: Write failing callback, navigation, and replay tests**
+- [x] **Step 6: Write failing callback, navigation, and replay tests**
 
 Cover:
 
@@ -627,7 +627,7 @@ Cover:
 - a Telegram delivery failure leaves the persisted row unchanged and recoverable by a later `/replies`;
 - no callback ever accepts reply text from its data payload.
 
-- [ ] **Step 7: Run callback tests and confirm they are red**
+- [x] **Step 7: Run callback tests and confirm they are red**
 
 Run:
 
@@ -637,13 +637,13 @@ venv/bin/python -m pytest -q tests/test_reply_copilot_telegram.py -k "callback o
 
 Expected: FAIL until the callback branches are implemented.
 
-- [ ] **Step 8: Implement revision-bound callbacks and failure messages**
+- [x] **Step 8: Implement revision-bound callbacks and failure messages**
 
 Route `rp` and `rpa` in `_handle_callback`. Validate part count and canonical numeric fields with `_positive_id`/`_nonnegative_id`, reload `view_kind="reply_copilot"`, verify membership, then call the service. Treat `updated` and the exact same terminal state as safe outcomes; reject stale or conflicting callbacks without mutation.
 
 Do not mark a reply as published when the copy or URL button is rendered or used. Only `rpa:p` records `published_manually`.
 
-- [ ] **Step 9: Write failing `/status`, `/help`, and push-summary tests**
+- [x] **Step 9: Write failing `/status`, `/help`, and push-summary tests**
 
 Assert:
 
@@ -653,7 +653,7 @@ Assert:
 - explicit `/replies` reports empty/failure states instead of staying silent;
 - the summary text never claims that X was posted automatically.
 
-- [ ] **Step 10: Implement status/help/summary behavior and verify Telegram**
+- [x] **Step 10: Implement status/help/summary behavior and verify Telegram**
 
 Run:
 
@@ -663,7 +663,7 @@ venv/bin/python -m pytest -q tests/test_reply_copilot_telegram.py tests/test_tel
 
 Expected: all tests pass.
 
-- [ ] **Step 11: Commit locally**
+- [x] **Step 11: Commit locally**
 
 ```bash
 git add modules/telegram_controller.py modules/telegram_api.py tests/test_reply_copilot_telegram.py tests/test_telegram_workflows.py
@@ -688,7 +688,7 @@ Do not push the commit.
 - Extends: `FlexDropinGrowthAgent.growth_digest_cycle(now=None)` without adding a scheduler job.
 - Extends: `_register_telegram_commands()` with `/replies` only while enabled.
 
-- [ ] **Step 1: Write failing dependency and scheduler tests**
+- [x] **Step 1: Write failing dependency and scheduler tests**
 
 Assert:
 
@@ -698,7 +698,7 @@ Assert:
 - registered jobs still contain exactly one existing `growth_digest` job and no Reply Copilot-specific job;
 - the Telegram command menu contains `/replies` only when the feature is enabled.
 
-- [ ] **Step 2: Run focused wiring tests and confirm they are red**
+- [x] **Step 2: Run focused wiring tests and confirm they are red**
 
 Run:
 
@@ -708,7 +708,7 @@ venv/bin/python -m pytest -q tests/test_main_startup.py tests/test_end_to_end_dr
 
 Expected: FAIL because the dependency keys and wiring are absent.
 
-- [ ] **Step 3: Implement construction and command registration**
+- [x] **Step 3: Implement construction and command registration**
 
 Import the four config constants and `ReplyCopilotService`. Add `reply_copilot` and `reply_copilot_enabled` to `_DEPENDENCY_KEYS`, validate the injected flag with `type(value) is bool`, and create the service only when enabled:
 
@@ -732,11 +732,11 @@ self.reply_copilot = (
 
 Pass only this service into `TelegramController`. Do not pass the X client through it. Append the `/replies` menu entry only when enabled.
 
-- [ ] **Step 4: Verify dependency and scheduler tests**
+- [x] **Step 4: Verify dependency and scheduler tests**
 
 Run the command from Step 2. Expected: PASS.
 
-- [ ] **Step 5: Write failing cycle-isolation tests**
+- [x] **Step 5: Write failing cycle-isolation tests**
 
 Extend the current clock-once Growth Digest test to prove:
 
@@ -747,7 +747,7 @@ Extend the current clock-once Growth Digest test to prove:
 - a Growth Digest failure preserves the current `growth_digest_failed` result;
 - the clock is still read once per cycle.
 
-- [ ] **Step 6: Run cycle tests and confirm they are red**
+- [x] **Step 6: Run cycle tests and confirm they are red**
 
 Run:
 
@@ -757,11 +757,11 @@ venv/bin/python -m pytest -q tests/test_end_to_end_dry_run.py -k "growth_digest_
 
 Expected: FAIL because `growth_digest_cycle` does not invoke Reply Copilot.
 
-- [ ] **Step 7: Implement isolated piggyback orchestration**
+- [x] **Step 7: Implement isolated piggyback orchestration**
 
 Keep the existing Growth Digest `try` boundary. Capture its current presentation result, then run Reply Copilot in a nested `try` only when enabled and `observed_on` is a canonical date string. On nested failure call `_notify_error("reply_copilot_cycle", error)` and still return the original Growth Digest result.
 
-- [ ] **Step 8: Write the end-to-end zero-X-cost safety test**
+- [x] **Step 8: Write the end-to-end zero-X-cost safety test**
 
 In `tests/test_end_to_end_dry_run.py`, use the real database, Growth Digest, Reply Copilot service, Telegram controller, and a recording fake X client. Run:
 
@@ -785,7 +785,7 @@ assert db.get_x_api_usage_summary(period_key) == usage_after_growth_digest
 
 Also assert the existing owned-post publication path can still publish independently through its established approval flow; do not route it through Reply Copilot.
 
-- [ ] **Step 9: Run the wiring and end-to-end safety slice**
+- [x] **Step 9: Run the wiring and end-to-end safety slice**
 
 Run:
 
@@ -795,7 +795,7 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py tests/test_reply_copilo
 
 Expected: all tests pass, with zero Reply Copilot X calls.
 
-- [ ] **Step 10: Commit locally**
+- [x] **Step 10: Commit locally**
 
 ```bash
 git add main.py tests/fakes.py tests/test_end_to_end_dry_run.py tests/test_main_startup.py
@@ -810,7 +810,7 @@ Do not push the commit.
 
 **Files:**
 - Modify: `README.md`
-- Modify: `SETUP_GUIDE.md`
+- Modify: `SETUP.md`
 - Modify: `docs/superpowers/plans/2026-09-03-reply-copilot.md`
 - Test: full repository suite
 
@@ -819,7 +819,7 @@ Do not push the commit.
 - Documents safety/cost boundary: no extra X reads, no X writes, bounded Groq generations.
 - Documents local feature toggle and rollback without performing either VPS action.
 
-- [ ] **Step 1: Update operator documentation**
+- [x] **Step 1: Update operator documentation**
 
 Document:
 
@@ -834,7 +834,7 @@ Document:
 
 Do not claim deployment or VPS activation has occurred.
 
-- [ ] **Step 2: Run focused Reply Copilot tests**
+- [x] **Step 2: Run focused Reply Copilot tests**
 
 ```bash
 venv/bin/python -m pytest -q tests/test_reply_copilot.py tests/test_reply_copilot_telegram.py
@@ -842,7 +842,7 @@ venv/bin/python -m pytest -q tests/test_reply_copilot.py tests/test_reply_copilo
 
 Expected: all tests pass.
 
-- [ ] **Step 3: Run the full regression suite**
+- [x] **Step 3: Run the full regression suite**
 
 ```bash
 venv/bin/python -m pytest -q
@@ -850,7 +850,7 @@ venv/bin/python -m pytest -q
 
 Expected: all tests pass.
 
-- [ ] **Step 4: Compile production modules**
+- [x] **Step 4: Compile production modules**
 
 ```bash
 venv/bin/python -m compileall -q config.py main.py modules
@@ -858,13 +858,13 @@ venv/bin/python -m compileall -q config.py main.py modules
 
 Expected: exit code 0.
 
-- [ ] **Step 5: Test migration on a disposable local database copy**
+- [x] **Step 5: Test migration on a disposable local database copy**
 
 Create a temporary directory with `mktemp -d`, copy the local SQLite fixture/database into that exact directory, open the copy with `Database`, then compare pre/post counts for every pre-existing table and verify `reply_suggestions` starts empty. Do not open or copy any VPS database.
 
 Expected: all pre-existing counts are identical; only the additive table/indexes appear.
 
-- [ ] **Step 6: Run static safety searches**
+- [x] **Step 6: Run static safety searches**
 
 ```bash
 rg -n "TwitterClient|Publisher|post_tweet|post_thread|reply_to_tweet|search_relevant_posts|read_relevant_posts" modules/reply_copilot.py
@@ -873,7 +873,7 @@ rg -n "reply_text|source_excerpt|intent/tweet" modules/reply_copilot.py main.py 
 
 Expected: the first command finds no matches. Review the second command manually and confirm none of those values are passed to logging calls.
 
-- [ ] **Step 7: Inspect repository integrity**
+- [x] **Step 7: Inspect repository integrity**
 
 ```bash
 git diff --check
@@ -883,13 +883,26 @@ git diff --stat main..HEAD
 
 Expected: no whitespace errors; only planned files are changed/committed; the two pre-existing untracked user files remain untouched.
 
-- [ ] **Step 8: Mark this plan complete and commit documentation locally**
+- [x] **Step 8: Mark this plan complete and commit documentation locally**
 
 Change completed checkboxes to `[x]`, record exact local test counts in a short `## Verification Evidence` section, then run:
 
 ```bash
-git add README.md SETUP_GUIDE.md docs/superpowers/plans/2026-09-03-reply-copilot.md
+git add README.md SETUP.md docs/superpowers/plans/2026-09-03-reply-copilot.md
 git commit -m "docs: document reply copilot operations"
 ```
 
 Do not push the commit and do not deploy it. Stop with a local-only handoff containing the branch name, commit range, tests, migration result, and an explicit statement that the VPS was not contacted or changed.
+
+## Verification Evidence
+
+Local verification completed on 2026-09-04:
+
+- focused Reply Copilot, AI, Telegram, startup, and end-to-end slice: 244 passed;
+- full repository regression suite: 1392 passed, with one pre-existing Tweepy `imghdr` deprecation warning;
+- production-module compilation: exit code 0;
+- disposable copy of local `bot_data.db`: 34 pre-existing table counts unchanged, `reply_suggestions` empty after migration, and `PRAGMA integrity_check=ok`;
+- Reply Copilot X-capable boundary search: zero matches;
+- whitespace/integrity check: clean.
+
+No push, deployment, production preflight, SSH/SCP command, or VPS change was performed. The pre-existing untracked `VPS_ROLLOUT.md` and `bot_data.db.bak-20260827-173658` files were left untouched.
