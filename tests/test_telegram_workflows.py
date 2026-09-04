@@ -2959,6 +2959,33 @@ def test_telegram_api_enforces_message_callback_and_caption_limits(tmp_path):
     assert requests.posts == []
 
 
+def test_telegram_api_rejects_malformed_copy_text_buttons_before_network(tmp_path):
+    requests = NoRequests()
+    api = TelegramApi("123456:secret", tmp_path, requests_client=requests)
+    invalid_markups = [
+        {"inline_keyboard": [[{
+            "text": "Copy", "copy_text": {"text": ""},
+        }]]},
+        {"inline_keyboard": [[{
+            "text": "Copy", "copy_text": {"text": "x" * 257},
+        }]]},
+        {"inline_keyboard": [[{
+            "text": "Copy", "copy_text": "not-an-object",
+        }]]},
+        {"inline_keyboard": [[{
+            "text": "Ambiguous",
+            "copy_text": {"text": "safe"},
+            "callback_data": "also-a-callback",
+        }]]},
+    ]
+
+    for reply_markup in invalid_markups:
+        with pytest.raises(ValueError):
+            api.send_message("42", "ok", reply_markup=reply_markup)
+
+    assert requests.posts == []
+
+
 def test_oversized_inbound_text_does_not_reach_draft_pipeline(tmp_path):
     db = Database(str(tmp_path / "oversized-text.db"))
     _source_id, draft_id = add_pending_draft(db)

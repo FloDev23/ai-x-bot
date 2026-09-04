@@ -7,7 +7,7 @@ import re
 import threading
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Dict, Optional, Sequence
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -389,17 +389,46 @@ def _validate_reply_markup(reply_markup: Optional[Dict[str, Any]]) -> None:
         for button in row:
             if not isinstance(button, dict) or not isinstance(button.get("text"), str):
                 raise ValueError("Invalid Telegram inline button")
-            callback_data = button.get("callback_data")
-            if callback_data is None:
-                continue
-            if not isinstance(callback_data, str):
-                raise ValueError("Invalid Telegram callback data")
-            try:
-                size = len(callback_data.encode("utf-8"))
-            except UnicodeError:
-                raise ValueError("Invalid Telegram callback data") from None
-            if not 1 <= size <= TELEGRAM_CALLBACK_DATA_MAX_BYTES:
-                raise ValueError("Invalid Telegram callback data")
+            actions = [
+                name for name in ("callback_data", "url", "copy_text")
+                if name in button
+            ]
+            if len(actions) != 1 or set(button) != {"text", actions[0]}:
+                raise ValueError("Invalid Telegram inline button")
+            action = actions[0]
+            if action == "callback_data":
+                callback_data = button["callback_data"]
+                if not isinstance(callback_data, str):
+                    raise ValueError("Invalid Telegram callback data")
+                try:
+                    size = len(callback_data.encode("utf-8"))
+                except UnicodeError:
+                    raise ValueError("Invalid Telegram callback data") from None
+                if not 1 <= size <= TELEGRAM_CALLBACK_DATA_MAX_BYTES:
+                    raise ValueError("Invalid Telegram callback data")
+            elif action == "url":
+                url = button["url"]
+                try:
+                    parsed = urlparse(url)
+                except (TypeError, ValueError):
+                    parsed = None
+                if (
+                    not isinstance(url, str)
+                    or not 1 <= len(url) <= 2048
+                    or parsed is None
+                    or parsed.scheme != "https"
+                    or not parsed.netloc
+                ):
+                    raise ValueError("Invalid Telegram URL button")
+            else:
+                copy_text = button["copy_text"]
+                if (
+                    not isinstance(copy_text, dict)
+                    or set(copy_text) != {"text"}
+                    or not isinstance(copy_text["text"], str)
+                    or not 1 <= len(copy_text["text"]) <= 256
+                ):
+                    raise ValueError("Invalid Telegram copy text button")
 
 
 class _ConnectionPoolLogFilter(logging.Filter):
