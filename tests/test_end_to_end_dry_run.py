@@ -1,6 +1,7 @@
 import json
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -896,6 +897,203 @@ def test_growth_digest_cycle_reads_clock_once_and_reuses_controller_formatter(
     assert clock.calls == 1
     assert digest.calls == [NOW]
     assert controller.calls == [(empty, False)]
+
+
+def test_reply_copilot_wiring_is_disabled_by_default_and_requires_boolean_flag(
+    tmp_path,
+):
+    disabled = FlexDropinGrowthAgent(dependency_bundle(tmp_path / "disabled"))
+    assert disabled.reply_copilot_enabled is False
+    assert disabled.reply_copilot is None
+    assert disabled.telegram_controller.reply_copilot is None
+
+    enabled = FlexDropinGrowthAgent(dependency_bundle(
+        tmp_path / "enabled", reply_copilot_enabled=True,
+    ))
+    assert enabled.reply_copilot_enabled is True
+    assert enabled.reply_copilot is enabled.telegram_controller.reply_copilot
+    assert enabled.reply_copilot.db is enabled.db
+    assert enabled.reply_copilot.generator is enabled.ai_generator
+    assert not hasattr(enabled.reply_copilot, "twitter_client")
+
+    with pytest.raises(ValueError, match="reply_copilot_enabled"):
+        FlexDropinGrowthAgent(dependency_bundle(
+            tmp_path / "invalid", reply_copilot_enabled="true",
+        ))
+
+
+def test_reply_copilot_adds_a_command_but_no_scheduler_job(tmp_path):
+    disabled_dependencies = dependency_bundle(tmp_path / "disabled-menu")
+    disabled = FlexDropinGrowthAgent(disabled_dependencies)
+    disabled._register_telegram_commands()
+    assert "replies" not in {
+        item["command"] for item in disabled_dependencies["telegram_api"].commands
+    }
+
+    enabled_dependencies = dependency_bundle(
+        tmp_path / "enabled-menu", reply_copilot_enabled=True,
+    )
+    enabled = FlexDropinGrowthAgent(enabled_dependencies)
+    enabled._register_telegram_commands()
+    assert "replies" in {
+        item["command"] for item in enabled_dependencies["telegram_api"].commands
+    }
+    assert {job.id for job in enabled.register_jobs()} == {
+        "source_refresh",
+        "queue_replenishment",
+        "translation_retry",
+        "publication_planning",
+        "adaptive_publish",
+        "growth_digest",
+        "follower_snapshot",
+        "performance_metrics",
+        "weekly_growth_report",
+    }
+
+
+def test_reply_copilot_failure_does_not_change_growth_digest_result(tmp_path):
+    class CountingClock:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            return NOW
+
+    class Digest:
+        def build(self, current):
+            assert current == NOW
+            return {
+                "observed_on": "2026-08-11",
+                "accounts": [],
+                "posts": [],
+                "reevaluate": [],
+                "outcome": "created",
+            }
+
+    class FailingReplyCopilot:
+        def build(self, observed_on, now):
+            assert observed_on == "2026-08-11"
+            assert now == NOW
+            raise RuntimeError("private provider detail")
+
+    class Controller:
+        def __init__(self):
+            self.growth_calls = []
+
+        def push_growth_digest(self, digest, *, explicit):
+            self.growth_calls.append((digest, explicit))
+            return "growth_digest_silent"
+
+    clock = CountingClock()
+    notifier = RecordingNotifier()
+    controller = Controller()
+    agent = FlexDropinGrowthAgent(dependency_bundle(
+        tmp_path,
+        clock=clock,
+        growth_digest=Digest(),
+        reply_copilot_enabled=True,
+        reply_copilot=FailingReplyCopilot(),
+        telegram_controller=controller,
+        notifier=notifier,
+    ))
+
+    assert agent.growth_digest_cycle() == "growth_digest_silent"
+    assert clock.calls == 1
+    assert len(controller.growth_calls) == 1
+    assert notifier.errors == [("reply_copilot_cycle", "private provider detail")]
+
+
+def test_reply_copilot_full_manual_flow_adds_no_x_calls_or_usage(tmp_path):
+    from tests.test_reply_copilot import _seed_custom_growth_posts
+
+    reply_now = datetime(2026, 9, 3, 10, 0, tzinfo=ROME)
+    dependencies = dependency_bundle(
+        tmp_path,
+        clock=lambda: reply_now,
+        reply_copilot_enabled=True,
+    )
+    _seed_custom_growth_posts(
+        dependencies["db"],
+        [
+            {"tweet_id": "8800", "reasons": ["gym_owner"], "score": 95},
+            {"tweet_id": "8801", "reasons": ["travel_context"], "score": 94},
+        ],
+        completed_at=reply_now.astimezone(timezone.utc),
+    )
+    agent = FlexDropinGrowthAgent(dependencies)
+    x_client = dependencies["x_client"]
+    period_key = reply_now.astimezone(timezone.utc).strftime("%Y-%m")
+    reads_after_digest = list(x_client.read_calls)
+    writes_after_digest = list(x_client.write_calls)
+    usage_after_digest = agent.db.get_x_api_usage_summary(period_key)
+
+    assert agent.growth_digest_cycle(now=reply_now) == "growth_digest_silent"
+    assert len(agent.db.list_reply_suggestions("2026-09-03")) == 2
+
+    api = dependencies["telegram_api"]
+    assert agent.telegram_controller.process_update({
+        "update_id": 900,
+        "message": {"chat": {"id": 42}, "text": "/replies"},
+    }) == "processed"
+    buttons = [
+        button
+        for row in api.messages[-1][2]["reply_markup"]["inline_keyboard"]
+        for button in row
+    ]
+    assert next(button for button in buttons if button["text"] == "Copia risposta")[
+        "copy_text"
+    ]["text"]
+    assert urlparse(
+        next(button for button in buttons if button["text"] == "Rispondi su X")[
+            "url"
+        ]
+    ).netloc == "x.com"
+    regenerate = next(
+        button["callback_data"] for button in buttons
+        if button["text"] == "Rigenera"
+    )
+    assert agent.telegram_controller.process_update(
+        callback_update(901, regenerate)
+    ) == "processed"
+    publish = next(
+        button["callback_data"]
+        for row in api.messages[-1][2]["reply_markup"]["inline_keyboard"]
+        for button in row
+        if button["text"] == "Segna come pubblicata"
+    )
+    assert agent.telegram_controller.process_update(
+        callback_update(902, publish)
+    ) == "processed"
+
+    assert agent.telegram_controller.process_update({
+        "update_id": 903,
+        "message": {"chat": {"id": 42}, "text": "/replies"},
+    }) == "processed"
+    dismiss = next(
+        button["callback_data"]
+        for row in api.messages[-1][2]["reply_markup"]["inline_keyboard"]
+        for button in row
+        if button["text"] == "Ignora"
+    )
+    assert agent.telegram_controller.process_update(
+        callback_update(904, dismiss)
+    ) == "processed"
+
+    restart_dependencies = dict(dependencies)
+    restart_dependencies["db"] = Database(dependencies["db"].db_path)
+    restart_dependencies["telegram_api"] = FakeTelegramApi(
+        tmp_path / "restart-reply-media"
+    )
+    restarted = FlexDropinGrowthAgent(restart_dependencies)
+    assert restarted.telegram_controller.process_update({
+        "update_id": 905,
+        "message": {"chat": {"id": 42}, "text": "/replies"},
+    }) == "processed"
+
+    assert x_client.read_calls == reads_after_digest
+    assert x_client.write_calls == writes_after_digest == []
+    assert agent.db.get_x_api_usage_summary(period_key) == usage_after_digest
 
 
 def test_adaptive_cycles_use_one_clock_read_and_stop_event(tmp_path):

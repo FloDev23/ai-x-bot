@@ -6,7 +6,7 @@ import secrets
 import sys
 import threading
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -25,6 +25,7 @@ from config import (
     DRAFT_SCORE_THRESHOLD,
     DRY_RUN,
     ENABLE_LEAD_DISCOVERY,
+    ENABLE_REPLY_COPILOT,
     GROWTH_ACCOUNT_SUGGESTION_LIMIT,
     GROWTH_DIGEST_TIME,
     GROWTH_POST_QUERY_BUDGET,
@@ -41,6 +42,9 @@ from config import (
     OPPORTUNITY_CYCLE_TIMES,
     PUBLISH_GRACE_SECONDS,
     PUBLICATION_PLAN_GRACE_MINUTES,
+    REPLY_COPILOT_DAILY_LIMIT,
+    REPLY_COPILOT_MAX_AGE_HOURS,
+    REPLY_COPILOT_MAX_REGENERATIONS,
     PENDING_REVIEW_LIMIT,
     THIRD_POST_DAYS_PER_WEEK,
     THIRD_POST_TIMING_MIN_POSTS,
@@ -76,6 +80,7 @@ from modules.publication_queue import (
 )
 from modules.publication_cadence import PublicationCadencePolicy
 from modules.review_translation import ReviewTranslator
+from modules.reply_copilot import ReplyCopilotService
 from modules.scoring import TweetScorer
 from modules.source_ingestion import SourceIngestor
 from modules.source_refresh import (
@@ -130,6 +135,8 @@ class FlexDropinGrowthAgent:
         "publication_planner",
         "publication_cadence",
         "queue_replenisher",
+        "reply_copilot",
+        "reply_copilot_enabled",
         "review_translator",
         "scheduler",
         "scorer",
@@ -198,6 +205,11 @@ class FlexDropinGrowthAgent:
         self.lead_discovery_enabled = supplied.get(
             "lead_discovery_enabled", ENABLE_LEAD_DISCOVERY
         )
+        self.reply_copilot_enabled = supplied.get(
+            "reply_copilot_enabled", ENABLE_REPLY_COPILOT
+        )
+        if type(self.reply_copilot_enabled) is not bool:
+            raise ValueError("reply_copilot_enabled must be a boolean")
         self.lead_cycle_times = tuple(supplied.get(
             "lead_cycle_times", OPPORTUNITY_CYCLE_TIMES
         ))
@@ -398,6 +410,21 @@ class FlexDropinGrowthAgent:
                 cooldown_days=GROWTH_SUGGESTION_COOLDOWN_DAYS,
             ),
         )
+        self.reply_copilot = (
+            resolve(
+                "reply_copilot",
+                lambda: ReplyCopilotService(
+                    self.db,
+                    self.ai_generator,
+                    daily_limit=REPLY_COPILOT_DAILY_LIMIT,
+                    max_age_hours=REPLY_COPILOT_MAX_AGE_HOURS,
+                    max_regenerations=REPLY_COPILOT_MAX_REGENERATIONS,
+                    clock=self.clock,
+                ),
+            )
+            if self.reply_copilot_enabled
+            else None
+        )
         self.lead_finder = resolve(
             "lead_finder",
             lambda: LeadFinder(
@@ -424,6 +451,7 @@ class FlexDropinGrowthAgent:
                 media_matcher=self.media_matcher,
                 analytics=self.analytics,
                 growth_digest=self.growth_digest,
+                reply_copilot=self.reply_copilot,
                 scheduler_status=self.scheduler_status,
                 queue_service=self.queue_replenisher,
                 dry_run=self.dry_run,
@@ -643,9 +671,28 @@ class FlexDropinGrowthAgent:
         try:
             current = self._now() if now is None else now
             digest = self.growth_digest.build(current)
-            return self.telegram_controller.push_growth_digest(
+            growth_result = self.telegram_controller.push_growth_digest(
                 digest, explicit=False,
             )
+            if self.reply_copilot_enabled and type(digest) is dict:
+                observed_on = digest.get("observed_on")
+                try:
+                    valid_date = (
+                        date.fromisoformat(observed_on).isoformat() == observed_on
+                    )
+                except (TypeError, ValueError):
+                    valid_date = False
+                if valid_date:
+                    try:
+                        reply_summary = self.reply_copilot.build(
+                            observed_on, now=current,
+                        )
+                        self.telegram_controller.push_reply_digest(
+                            reply_summary, explicit=False,
+                        )
+                    except Exception as error:
+                        self._notify_error("reply_copilot_cycle", error)
+            return growth_result
         except Exception as error:
             self._notify_error("growth_digest_cycle", error)
             return "growth_digest_failed"
@@ -848,6 +895,11 @@ class FlexDropinGrowthAgent:
             {"command": "resume",  "description": "Riprendi scheduler"},
             {"command": "help",    "description": "Aiuto comandi"},
         ]
+        if self.reply_copilot_enabled:
+            commands.insert(6, {
+                "command": "replies",
+                "description": "Risposte X manuali suggerite",
+            })
         ok = register(commands)
         if not ok:
             logger.warning("set_my_commands failed — menu buttons not registered")

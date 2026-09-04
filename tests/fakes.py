@@ -125,13 +125,17 @@ class FakeXClient:
         self.posts = []
         self.engagement_writes = []
         self.followers = []
+        self.read_calls = []
+        self.write_calls = []
 
     def post_tweet(self, text, **kwargs):
         self.posts.append((text, kwargs))
+        self.write_calls.append(("post_tweet", text, kwargs))
         return SimpleNamespace(data={"id": "9001"})
 
     def post_thread(self, tweets, **kwargs):
         self.posts.append((tweets, kwargs))
+        self.write_calls.append(("post_thread", list(tweets), kwargs))
         return [str(9001 + i) for i in range(len(tweets))]
 
     def __getattr__(self, name):
@@ -142,33 +146,39 @@ class FakeXClient:
         raise AttributeError(name)
 
     def get_followers_profiles(self):
+        self.read_calls.append(("get_followers_profiles",))
         return list(self.followers)
 
     def read_followers_profiles(self):
+        self.read_calls.append(("read_followers_profiles",))
         return SimpleNamespace(profiles=list(self.followers), complete=True)
 
     def search_recent_authors(self, _query):
+        self.read_calls.append(("search_recent_authors", _query))
         return []
 
     def get_network_candidates(self, _seed_accounts):
+        self.read_calls.append(("get_network_candidates", tuple(_seed_accounts)))
         return []
 
     def get_latest_original_post(self, _user_id):
+        self.read_calls.append(("get_latest_original_post", _user_id))
         return None
 
     def get_tweet_metrics(self, _tweet_ids):
+        self.read_calls.append(("get_tweet_metrics", tuple(_tweet_ids)))
         return {}
 
     def search_tweets(self, _query, limit=10):
-        del limit
+        self.read_calls.append(("search_tweets", _query, limit))
         return []
 
     def search_relevant_posts(self, _query, limit=25):
-        del limit
+        self.read_calls.append(("search_relevant_posts", _query, limit))
         return []
 
     def read_relevant_posts(self, _query, limit=25):
-        del limit
+        self.read_calls.append(("read_relevant_posts", _query, limit))
         return SimpleNamespace(posts=(), complete=True)
 
 
@@ -216,6 +226,9 @@ class FakeGroundedGenerator:
     def translate_review_copy(self, english_text):
         return f"Traduzione italiana fedele: {english_text}"
 
+    def generate_value_reply(self, _source_excerpt):
+        return "Tracking attendance by time slot makes the quiet hours visible."
+
 
 class FakeEditorialScorer:
     def score_draft(self, _text, sources=None, recent_texts=None):
@@ -242,6 +255,11 @@ class FakeTelegramApi:
         self.deleted_messages = []
         self.callback_answers = []
         self.downloads = []
+        self.commands = []
+
+    def set_my_commands(self, commands):
+        self.commands = list(commands)
+        return True
 
     def send_message(self, chat_id, text, **kwargs):
         self.messages.append((str(chat_id), text, kwargs))
