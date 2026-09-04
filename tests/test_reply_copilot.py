@@ -8,6 +8,7 @@ import pytest
 
 from modules.database import Database
 from modules.reply_copilot import (
+    ReplyCopilotService,
     build_reply_web_intent,
     classify_reply_segment,
     normalize_and_validate_reply,
@@ -16,6 +17,19 @@ from modules.reply_copilot import (
 
 NOW = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)
 SAFE_REPLY = "Tracking attendance by time slot makes the quiet hours visible."
+
+
+class QueueReplyGenerator:
+    def __init__(self, responses=None):
+        self.responses = list(responses or [])
+        self.calls = []
+
+    def generate_value_reply(self, source_excerpt):
+        self.calls.append(source_excerpt)
+        response = self.responses.pop(0) if self.responses else SAFE_REPLY
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def _seed_growth_posts(db, count=1, *, observed_on="2026-09-03"):
@@ -83,6 +97,77 @@ def _reservation_candidate(suggestion):
         "audience_segment": classify_reply_segment(suggestion["reason_codes"]),
         "relevance_score": suggestion["score"],
     }
+
+
+def _seed_custom_growth_posts(
+    db,
+    specs,
+    *,
+    observed_on="2026-09-03",
+    completed_at=NOW,
+):
+    with db._conn() as connection:
+        for rank, spec in enumerate(specs):
+            tweet_id = str(spec.get("tweet_id", 8500 + rank))
+            username = spec.get("username", f"source{rank}")
+            reasons = list(spec.get("reasons", ["gym_owner"]))
+            created_at = spec.get(
+                "created_at", completed_at - timedelta(hours=rank + 1),
+            )
+            excerpt = spec.get(
+                "excerpt", f"Relevant operational source observation {rank}.",
+            )
+            payload = {
+                "id": tweet_id,
+                "author_id": str(9500 + rank),
+                "author_username": username,
+                "excerpt": excerpt,
+                "created_at": created_at.isoformat(),
+                "public_metrics": {
+                    "like_count": 20,
+                    "retweet_count": 4,
+                    "reply_count": 2,
+                    "quote_count": 1,
+                    "impression_count": 5000,
+                },
+                "reason_codes": reasons,
+            }
+            connection.execute(
+                """
+                INSERT INTO growth_suggestions (
+                    observed_on, kind, object_id, username, payload_json,
+                    score, reason_codes_json, suggested_at, cooldown_until,
+                    rank_position
+                ) VALUES (?, 'post', ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    observed_on,
+                    tweet_id,
+                    username,
+                    json.dumps(payload),
+                    spec.get("score", 90 - rank),
+                    json.dumps(reasons),
+                    completed_at.isoformat(),
+                    (completed_at + timedelta(days=30)).isoformat(),
+                    rank,
+                ),
+            )
+        connection.execute(
+            "INSERT INTO growth_digest_runs VALUES (?, ?, ?)",
+            (
+                observed_on,
+                completed_at.isoformat(),
+                json.dumps({
+                    "observed_on": observed_on,
+                    "counts": {
+                        "account": 0,
+                        "post": len(specs),
+                        "reevaluate": 0,
+                    },
+                }),
+            ),
+        )
+    return db.get_growth_digest(observed_on)
 
 
 def test_operator_reason_takes_precedence_over_end_user_reason():
@@ -426,3 +511,287 @@ def test_manual_transitions_are_revision_bound_and_idempotent(tmp_path):
         "dismissed": 0,
         "published_manually": 1,
     }
+
+
+def test_service_selects_even_day_four_operator_and_one_end_user(tmp_path):
+    database = Database(str(tmp_path / "reply-even-mix.db"))
+    specs = [
+        {"reasons": ["travel_context"], "score": 99},
+        {"reasons": ["travel_context"], "score": 98},
+        {"reasons": ["gym_owner"], "score": 97},
+        {"reasons": ["gym_owner"], "score": 96},
+        {"reasons": ["gym_owner"], "score": 95},
+        {"reasons": ["gym_owner"], "score": 94},
+        {"reasons": ["gym_owner"], "score": 93},
+    ]
+    _seed_custom_growth_posts(database, specs)
+    service = ReplyCopilotService(database, QueueReplyGenerator())
+
+    summary = service.build("2026-09-03", now=NOW)
+
+    assert summary["outcome"] == "created"
+    assert len(summary["suggestions"]) == 5
+    assert [
+        row["audience_segment"] for row in summary["suggestions"]
+    ].count("operator") == 4
+    assert [
+        row["audience_segment"] for row in summary["suggestions"]
+    ].count("end_user") == 1
+    assert {row["tweet_id"] for row in summary["suggestions"]} == {
+        "8500", "8502", "8503", "8504", "8505",
+    }
+
+
+def test_service_selects_odd_day_three_operator_and_two_end_users(tmp_path):
+    odd_now = datetime(2026, 9, 4, 8, 0, tzinfo=timezone.utc)
+    database = Database(str(tmp_path / "reply-odd-mix.db"))
+    specs = [
+        {"reasons": ["gym_owner"], "score": 99},
+        {"reasons": ["gym_owner"], "score": 98},
+        {"reasons": ["gym_owner"], "score": 97},
+        {"reasons": ["gym_owner"], "score": 96},
+        {"reasons": ["travel_context"], "score": 95},
+        {"reasons": ["travel_context"], "score": 94},
+    ]
+    _seed_custom_growth_posts(
+        database,
+        specs,
+        observed_on="2026-09-04",
+        completed_at=odd_now,
+    )
+    service = ReplyCopilotService(database, QueueReplyGenerator())
+
+    summary = service.build("2026-09-04", now=odd_now)
+
+    segments = [row["audience_segment"] for row in summary["suggestions"]]
+    assert segments.count("operator") == 3
+    assert segments.count("end_user") == 2
+
+
+def test_service_fills_a_missing_segment_without_reducing_batch(tmp_path):
+    database = Database(str(tmp_path / "reply-fallback.db"))
+    _seed_custom_growth_posts(
+        database,
+        [{"reasons": ["fitness_operations"]} for _index in range(7)],
+    )
+
+    summary = ReplyCopilotService(
+        database, QueueReplyGenerator(),
+    ).build("2026-09-03", now=NOW)
+
+    assert len(summary["suggestions"]) == 5
+    assert {row["audience_segment"] for row in summary["suggestions"]} == {
+        "operator"
+    }
+
+
+def test_service_applies_age_identity_and_segment_eligibility(tmp_path):
+    database = Database(str(tmp_path / "reply-eligibility.db"))
+    _seed_custom_growth_posts(database, [
+        {
+            "tweet_id": "8600",
+            "username": "ageboundary",
+            "created_at": NOW - timedelta(hours=48),
+            "reasons": ["drop_in"],
+            "score": 90,
+        },
+        {
+            "tweet_id": "8601",
+            "username": "too_old",
+            "created_at": NOW - timedelta(hours=48, seconds=1),
+            "reasons": ["gym_owner"],
+            "score": 99,
+        },
+        {
+            "tweet_id": "8602",
+            "username": "FlexDropin",
+            "created_at": NOW - timedelta(hours=1),
+            "reasons": ["gym_owner"],
+            "score": 98,
+        },
+        {
+            "tweet_id": "8603",
+            "username": "generic",
+            "created_at": NOW - timedelta(hours=1),
+            "reasons": ["recent"],
+            "score": 97,
+        },
+        {
+            "tweet_id": "8604",
+            "username": "futurepost",
+            "created_at": NOW + timedelta(minutes=1),
+            "reasons": ["gym_owner"],
+            "score": 96,
+        },
+    ])
+
+    summary = ReplyCopilotService(
+        database, QueueReplyGenerator(),
+    ).build("2026-09-03", now=NOW)
+
+    assert [row["tweet_id"] for row in summary["suggestions"]] == ["8600"]
+
+
+def test_service_ranks_by_score_then_recency_then_stable_id(tmp_path):
+    database = Database(str(tmp_path / "reply-rank.db"))
+    _seed_custom_growth_posts(database, [
+        {
+            "tweet_id": "8700", "score": 90,
+            "created_at": NOW - timedelta(hours=2),
+        },
+        {
+            "tweet_id": "8701", "score": 91,
+            "created_at": NOW - timedelta(hours=4),
+        },
+        {
+            "tweet_id": "8702", "score": 90,
+            "created_at": NOW - timedelta(hours=1),
+        },
+        {
+            "tweet_id": "8703", "score": 90,
+            "created_at": NOW - timedelta(hours=1),
+        },
+    ])
+
+    summary = ReplyCopilotService(
+        database, QueueReplyGenerator(), daily_limit=4,
+    ).build("2026-09-03", now=NOW)
+
+    assert [row["tweet_id"] for row in summary["suggestions"]] == [
+        "8701", "8702", "8703", "8700",
+    ]
+
+
+def test_service_repeated_build_does_not_duplicate_or_regenerate(tmp_path):
+    database = Database(str(tmp_path / "reply-repeat.db"))
+    _seed_growth_posts(database, 2)
+    generator = QueueReplyGenerator()
+    service = ReplyCopilotService(database, generator)
+
+    first = service.build("2026-09-03", now=NOW)
+    second = service.build("2026-09-03", now=NOW + timedelta(minutes=1))
+
+    assert first["outcome"] == "created"
+    assert second["outcome"] == "existing"
+    assert len(second["suggestions"]) == 2
+    assert len(generator.calls) == 2
+    assert all(row["generation_count"] == 1 for row in second["suggestions"])
+
+
+def test_service_isolates_generation_failures_and_requires_manual_regeneration(
+    tmp_path,
+):
+    database = Database(str(tmp_path / "reply-generation.db"))
+    _seed_growth_posts(database, 3)
+    generator = QueueReplyGenerator([
+        RuntimeError("secret provider payload"),
+        "Visit our site and sign up for the best option today.",
+        SAFE_REPLY,
+        SAFE_REPLY,
+        "Compare the quiet periods again before changing the class schedule.",
+    ])
+    service = ReplyCopilotService(database, generator)
+
+    first = service.build("2026-09-03", now=NOW)
+    assert first["failed"] == 2
+    assert first["ready"] == 1
+    failed = [
+        row for row in first["suggestions"]
+        if row["status"] == "generation_failed"
+    ]
+    assert all(row["reply_text"] is None for row in failed)
+
+    service.build("2026-09-03", now=NOW + timedelta(minutes=1))
+    assert len(generator.calls) == 3
+
+    row, outcome = service.regenerate(
+        failed[0]["id"], failed[0]["revision"],
+        now=NOW + timedelta(minutes=2),
+    )
+    assert outcome == "updated"
+    assert row["status"] == "ready"
+    assert row["generation_count"] == 2
+
+    row, outcome = service.regenerate(
+        row["id"], row["revision"],
+        now=NOW + timedelta(minutes=3),
+    )
+    assert outcome == "updated"
+    assert row["generation_count"] == 3
+    rejected, outcome = service.regenerate(
+        row["id"], row["revision"],
+        now=NOW + timedelta(minutes=4),
+    )
+    assert rejected == row
+    assert outcome == "rejected"
+    assert len(generator.calls) == 5
+
+
+def test_service_manual_actions_reload_exact_revision(tmp_path):
+    database = Database(str(tmp_path / "reply-actions.db"))
+    _seed_growth_posts(database, 2)
+    service = ReplyCopilotService(database, QueueReplyGenerator())
+    rows = service.build("2026-09-03", now=NOW)["suggestions"]
+
+    published, outcome = service.mark_published(
+        rows[0]["id"], rows[0]["revision"], now=NOW + timedelta(minutes=1),
+    )
+    assert outcome == "updated"
+    assert published["status"] == "published_manually"
+    duplicate, outcome = service.mark_published(
+        rows[0]["id"], rows[0]["revision"], now=NOW + timedelta(minutes=2),
+    )
+    assert outcome == "duplicate"
+    assert duplicate["status"] == "published_manually"
+
+    dismissed, outcome = service.dismiss(
+        rows[1]["id"], rows[1]["revision"], now=NOW + timedelta(minutes=1),
+    )
+    assert outcome == "updated"
+    assert dismissed["status"] == "dismissed"
+
+
+def test_service_uses_only_the_persisted_digest_database_boundary(tmp_path):
+    class DigestOnlyDatabase:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.digest_reads = 0
+
+        def get_growth_digest(self, observed_on):
+            self.digest_reads += 1
+            return self.wrapped.get_growth_digest(observed_on)
+
+        def list_reply_suggestions(self, observed_on, statuses=None):
+            return self.wrapped.list_reply_suggestions(observed_on, statuses)
+
+        def reserve_reply_suggestions(self, *args):
+            return self.wrapped.reserve_reply_suggestions(*args)
+
+        def claim_reply_generation(self, *args):
+            return self.wrapped.claim_reply_generation(*args)
+
+        def complete_reply_generation(self, *args):
+            return self.wrapped.complete_reply_generation(*args)
+
+        def fail_reply_generation(self, *args):
+            return self.wrapped.fail_reply_generation(*args)
+
+        def get_reply_suggestion(self, *args):
+            return self.wrapped.get_reply_suggestion(*args)
+
+        def get_reply_copilot_counts(self, observed_on):
+            return self.wrapped.get_reply_copilot_counts(observed_on)
+
+        def __getattr__(self, name):
+            raise AssertionError(f"unexpected database/X-like boundary: {name}")
+
+    real = Database(str(tmp_path / "reply-no-x.db"))
+    _seed_growth_posts(real)
+    boundary = DigestOnlyDatabase(real)
+
+    summary = ReplyCopilotService(
+        boundary, QueueReplyGenerator(),
+    ).build("2026-09-03", now=NOW)
+
+    assert summary["ready"] == 1
+    assert boundary.digest_reads == 1
