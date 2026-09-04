@@ -408,16 +408,18 @@ def _validate_reply_markup(reply_markup: Optional[Dict[str, Any]]) -> None:
                     raise ValueError("Invalid Telegram callback data")
             elif action == "url":
                 url = button["url"]
+                if not isinstance(url, str) or not 1 <= len(url) <= 2048:
+                    raise ValueError("Invalid Telegram URL button")
                 try:
                     parsed = urlparse(url)
                 except (TypeError, ValueError):
                     parsed = None
                 if (
-                    not isinstance(url, str)
-                    or not 1 <= len(url) <= 2048
-                    or parsed is None
+                    parsed is None
                     or parsed.scheme != "https"
-                    or not parsed.netloc
+                    or not parsed.hostname
+                    or parsed.username is not None
+                    or parsed.password is not None
                 ):
                     raise ValueError("Invalid Telegram URL button")
             else:

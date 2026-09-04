@@ -7876,6 +7876,12 @@ class Database:
             or result["revision"] < 0
         ):
             return None
+        if result["status"] in {"ready", "dismissed", "published_manually"}:
+            from modules.reply_copilot import normalize_and_validate_reply
+
+            reply_text = result.get("reply_text")
+            if normalize_and_validate_reply(reply_text) != reply_text:
+                return None
         return result
 
     def reserve_reply_suggestions(
@@ -7945,15 +7951,18 @@ class Database:
             for candidate in normalized:
                 source = conn.execute("""
                     SELECT id, observed_on, kind, object_id, username,
-                           payload_json, score
+                           payload_json, score, reason_codes_json
                     FROM growth_suggestions WHERE id = ?
                 """, (candidate["growth_suggestion_id"],)).fetchone()
                 if source is None:
                     return []
                 try:
                     payload = json.loads(source["payload_json"])
+                    reason_codes = json.loads(source["reason_codes_json"])
                 except (TypeError, ValueError, json.JSONDecodeError):
                     return []
+                from modules.reply_copilot import classify_reply_segment
+
                 if (
                     source["observed_on"] != observed_on
                     or source["kind"] != "post"
@@ -7961,7 +7970,13 @@ class Database:
                     or source["username"] != candidate["author_username"]
                     or source["score"] != candidate["relevance_score"]
                     or type(payload) is not dict
+                    or payload.get("id") != candidate["tweet_id"]
+                    or payload.get("author_username")
+                    != candidate["author_username"]
                     or payload.get("excerpt") != candidate["source_excerpt"]
+                    or payload.get("reason_codes") != reason_codes
+                    or classify_reply_segment(reason_codes)
+                    != candidate["audience_segment"]
                 ):
                     return []
                 verified.append(candidate)
@@ -8060,6 +8075,29 @@ class Database:
             rows = conn.execute(query, values).fetchall()
         return [row for item in rows if (row := self._reply_row(item)) is not None]
 
+    def get_existing_reply_tweet_ids(self, tweet_ids: List[str]) -> Set[str]:
+        if (
+            type(tweet_ids) is not list
+            or len(tweet_ids) > 10
+            or len(tweet_ids) != len(set(tweet_ids))
+            or any(
+                not isinstance(tweet_id, str)
+                or not self._canonical_growth_object_id(tweet_id)
+                for tweet_id in tweet_ids
+            )
+        ):
+            return set()
+        if not tweet_ids:
+            return set()
+        placeholders = ",".join("?" for _tweet_id in tweet_ids)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT tweet_id FROM reply_suggestions "
+                f"WHERE tweet_id IN ({placeholders})",
+                tweet_ids,
+            ).fetchall()
+        return {row["tweet_id"] for row in rows}
+
     def claim_reply_generation(
         self,
         reply_id: int,
@@ -8155,12 +8193,14 @@ class Database:
                     revision = revision + 1, updated_at = ?, decided_at = NULL
                 WHERE id = ? AND revision = ? AND status = 'reserved'
                   AND generation_claim_token = ?
+                  AND generation_claim_expires_at > ?
             """, (
                 reply,
                 completed_iso,
                 claim.reply_id,
                 claim.revision,
                 claim.claim_token,
+                completed_iso,
             ))
             return cursor.rowcount == 1
 
@@ -8188,12 +8228,14 @@ class Database:
                     revision = revision + 1, updated_at = ?, decided_at = NULL
                 WHERE id = ? AND revision = ? AND status = 'reserved'
                   AND generation_claim_token = ?
+                  AND generation_claim_expires_at > ?
             """, (
                 failure_code,
                 failed_iso,
                 claim.reply_id,
                 claim.revision,
                 claim.claim_token,
+                failed_iso,
             ))
             return cursor.rowcount == 1
 

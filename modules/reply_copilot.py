@@ -28,17 +28,23 @@ _END_USER_REASON_CODES = frozenset({
     "discipline_match",
 })
 _URL_PATTERN = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+_DOMAIN_PATTERN = re.compile(
+    r"(?<![@\w])(?:[A-Z0-9-]+\.)+[A-Z]{2,63}(?:/[A-Z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?",
+    re.IGNORECASE,
+)
 _EMAIL_PATTERN = re.compile(
     r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])",
     re.IGNORECASE,
 )
 _HASHTAG_PATTERN = re.compile(r"(?<!\w)#[A-Z0-9_]+", re.IGNORECASE)
 _MENTION_PATTERN = re.compile(r"(?<!\w)@[A-Z0-9_]+", re.IGNORECASE)
-_BRAND_PATTERN = re.compile(r"\bflex[\s_-]*drop[\s_-]*in\b", re.IGNORECASE)
+_BRAND_PATTERN = re.compile(r"\bflex[\s_.-]*drop[\s_.-]*in\b", re.IGNORECASE)
 _PROMOTION_PATTERN = re.compile(
     r"\b(?:download(?:\s+the)?\s+app|sign\s+up|try\s+our\s+app|"
     r"visit\s+our\s+(?:site|website)|book\s+with\s+us|dm\s+us|"
-    r"learn\s+more|follow\s+us)\b",
+    r"learn\s+more|follow\s+us|check\s+out\s+our|contact\s+us|"
+    r"get\s+started|we\s+can\s+help|our\s+(?:app|platform|product|"
+    r"service|solution))\b",
     re.IGNORECASE,
 )
 _PROMPT_INJECTION_PATTERN = re.compile(
@@ -78,7 +84,7 @@ def normalize_and_validate_reply(value: object) -> Optional[str]:
     try:
         if any(unicodedata.category(character).startswith("C") for character in value):
             return None
-        normalized = unicodedata.normalize("NFC", value)
+        normalized = unicodedata.normalize("NFKC", value)
     except (TypeError, ValueError, UnicodeError):
         return None
     normalized = " ".join(normalized.strip().split())
@@ -86,6 +92,7 @@ def normalize_and_validate_reply(value: object) -> Optional[str]:
         return None
     if any(pattern.search(normalized) for pattern in (
         _URL_PATTERN,
+        _DOMAIN_PATTERN,
         _EMAIL_PATTERN,
         _HASHTAG_PATTERN,
         _MENTION_PATTERN,
@@ -382,6 +389,15 @@ class ReplyCopilotService:
             return self._empty_summary(observed_on, "no_digest")
         existing = self.db.list_reply_suggestions(observed_on)
         candidates = self._eligible_candidates(digest, current)
+        known_tweets = self.db.get_existing_reply_tweet_ids([
+            candidate["tweet_id"] for candidate in candidates
+        ])
+        current_tweets = {row.get("tweet_id") for row in existing}
+        candidates = [
+            candidate for candidate in candidates
+            if candidate["tweet_id"] not in known_tweets
+            or candidate["tweet_id"] in current_tweets
+        ]
         selected = self._allocate(candidates, observed_on, existing)
         inserted = self.db.reserve_reply_suggestions(
             observed_on, selected, self.daily_limit, current,

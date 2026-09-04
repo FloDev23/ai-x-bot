@@ -2977,6 +2977,10 @@ def test_telegram_api_rejects_malformed_copy_text_buttons_before_network(tmp_pat
             "copy_text": {"text": "safe"},
             "callback_data": "also-a-callback",
         }]]},
+        {"inline_keyboard": [[{"text": "Bad URL", "url": 123}]]},
+        {"inline_keyboard": [[{
+            "text": "Credential URL", "url": "https://user:pass@example.com/path",
+        }]]},
     ]
 
     for reply_markup in invalid_markups:
