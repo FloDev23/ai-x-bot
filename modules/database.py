@@ -191,6 +191,63 @@ class Database:
         return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
+    def _legacy_sqlite_utc_iso(value: Any) -> Optional[str]:
+        if (
+            type(value) is not str
+            or re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2} "
+                r"[0-9]{2}:[0-9]{2}:[0-9]{2}",
+                value,
+            ) is None
+        ):
+            return None
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=timezone.utc).isoformat()
+
+    @classmethod
+    def _repair_legacy_editorial_queue_in_conn(cls, conn) -> None:
+        timestamp_columns = {
+            "post_drafts": (
+                "created_at",
+                "updated_at",
+                "approved_at",
+            ),
+            "editorial_queue": (
+                "review_ready_at",
+                "approved_queue_at",
+                "not_before",
+                "created_at",
+                "updated_at",
+            ),
+        }
+        for table, columns in timestamp_columns.items():
+            key = "id" if table == "post_drafts" else "draft_id"
+            for column in columns:
+                rows = conn.execute(
+                    f"SELECT {key}, {column} FROM {table} "
+                    f"WHERE typeof({column}) = 'text' AND length({column}) = 19"
+                ).fetchall()
+                for row in rows:
+                    repaired = cls._legacy_sqlite_utc_iso(row[column])
+                    if repaired is not None:
+                        conn.execute(
+                            f"UPDATE {table} SET {column} = ? WHERE {key} = ?",
+                            (repaired, row[key]),
+                        )
+
+        conn.execute("""
+            UPDATE editorial_queue
+            SET translation_status = 'pending', review_ready_at = NULL,
+                updated_at = ?, revision = revision + 1
+            WHERE translation_policy = 'advisory'
+              AND translation_status = 'ready'
+              AND translation_it IS NULL
+        """, (cls._now_iso(),))
+
+    @staticmethod
     def _as_utc(value: datetime) -> datetime:
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
@@ -1009,6 +1066,8 @@ class Database:
                         ELSE 'required'
                     END
                 """)
+
+            self._repair_legacy_editorial_queue_in_conn(c)
 
             lifecycle_migration = c.execute(
                 "SELECT value FROM bot_state WHERE key = ?",
