@@ -238,14 +238,31 @@ class Database:
                             (repaired, row[key]),
                         )
 
-        conn.execute("""
-            UPDATE editorial_queue
-            SET translation_status = 'pending', review_ready_at = NULL,
-                updated_at = ?, revision = revision + 1
+        advisory_rows = conn.execute("""
+            SELECT draft_id, review_ready_at, updated_at
+            FROM editorial_queue
             WHERE translation_policy = 'advisory'
               AND translation_status = 'ready'
               AND translation_it IS NULL
-        """, (cls._now_iso(),))
+        """).fetchall()
+        repaired_at = cls._now_iso()
+        for row in advisory_rows:
+            if cls._strict_aware_datetime(row["updated_at"]) is None:
+                continue
+            if (
+                row["review_ready_at"] is not None
+                and cls._strict_aware_datetime(row["review_ready_at"]) is None
+            ):
+                continue
+            conn.execute("""
+                UPDATE editorial_queue
+                SET translation_status = 'pending', review_ready_at = NULL,
+                    updated_at = ?, revision = revision + 1
+                WHERE draft_id = ?
+                  AND translation_policy = 'advisory'
+                  AND translation_status = 'ready'
+                  AND translation_it IS NULL
+            """, (repaired_at, row["draft_id"]))
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:

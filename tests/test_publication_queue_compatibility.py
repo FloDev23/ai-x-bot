@@ -139,6 +139,45 @@ def test_startup_repairs_exact_legacy_queue_timestamps_and_advisory_state(tmp_pa
     assert second_repair == first_repair
 
 
+@pytest.mark.parametrize("malformed_column", ["updated_at", "review_ready_at"])
+def test_startup_does_not_hide_malformed_advisory_queue_timestamps(
+    tmp_path,
+    malformed_column,
+):
+    path = tmp_path / f"malformed-advisory-{malformed_column}.db"
+    db = Database(str(path))
+    draft_id = _create_manual_approved_draft(
+        db,
+        token=f"malformed{malformed_column.replace('_', '')}01",
+    )
+    aware = "2020-03-01T13:00:00+00:00"
+    queue_updated_at = (
+        "malformed-updated-at" if malformed_column == "updated_at" else aware
+    )
+    review_ready_at = "malformed-review-ready-at" if (
+        malformed_column == "review_ready_at"
+    ) else aware
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE editorial_queue SET translation_it = NULL, "
+            "translation_status = 'ready', review_ready_at = ?, updated_at = ? "
+            "WHERE draft_id = ?",
+            (review_ready_at, queue_updated_at, draft_id),
+        )
+
+    reopened = Database(str(path))
+
+    assert reopened.get_queue_draft(draft_id) is None
+    assert reopened.list_approved_queue(datetime(2020, 3, 2, tzinfo=timezone.utc)) == []
+    with sqlite3.connect(path) as conn:
+        queue = conn.execute(
+            "SELECT translation_status, review_ready_at, updated_at "
+            "FROM editorial_queue WHERE draft_id = ?",
+            (draft_id,),
+        ).fetchone()
+    assert queue == ("ready", review_ready_at, queue_updated_at)
+
+
 def test_startup_does_not_repair_required_translation_without_text(tmp_path):
     path = tmp_path / "required-missing-translation.db"
     db = Database(str(path))
@@ -196,4 +235,3 @@ def test_startup_leaves_nonlegacy_invalid_timestamps_fail_closed(
             (draft_id,),
         ).fetchone()[0]
     assert stored == invalid_timestamp
-

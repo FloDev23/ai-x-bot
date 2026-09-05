@@ -21,3 +21,15 @@ Implementation:
 - Advisory `ready` rows without translation text become `pending`, clear `review_ready_at`, preserve queue approval, and receive an aware update timestamp.
 - Required missing translations and other malformed/general naive timestamps remain fail-closed.
 - Both one-off translation scripts now persist aware UTC ISO update timestamps.
+
+Quality review repair:
+- Verified issue: advisory state repair overwrote malformed `updated_at` and
+  cleared malformed `review_ready_at`, making corrupt rows decodable.
+- RED: focused malformed advisory timestamp regression: `2 failed`.
+- GREEN: focused review regression: `2 passed`; all incident regressions:
+  `8 passed`.
+- Nearest affected suites plus regressions: `96 passed, 1 pre-existing Tweepy
+  deprecation warning`.
+- Full suite: `1320 passed, 1 pre-existing Tweepy deprecation warning`.
+- State repair now skips rows unless every timestamp it would overwrite is
+  already strict-aware after legacy normalization (or nullable and `NULL`).
