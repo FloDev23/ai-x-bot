@@ -4,6 +4,7 @@
 Targets source IDs 34-53 and their corresponding drafts (#19-38).
 """
 import sqlite3
+from datetime import datetime, timezone
 
 DB = "/home/ubuntu/ai-x-bot/bot_data.db"
 
@@ -153,6 +154,7 @@ def main():
     conn = sqlite3.connect(DB)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
+    updated_at = datetime.now(timezone.utc).isoformat()
 
     updated_sources = 0
     updated_drafts = 0
@@ -182,8 +184,8 @@ def main():
             errors.append(f"source #{source_id}: no draft with source_ids_json=[{source_id}]")
             continue
         conn.execute(
-            "UPDATE post_drafts SET text = ?, category = ?, updated_at = datetime('now') WHERE id = ?",
-            (english_text, category, draft["id"]),
+            "UPDATE post_drafts SET text = ?, category = ?, updated_at = ? WHERE id = ?",
+            (english_text, category, updated_at, draft["id"]),
         )
         updated_drafts += 1
         print(f"  #{draft['id']} (source #{source_id}): {english_text[:60].strip()!r}")

@@ -2,6 +2,7 @@
 """Replace Italian thread content with English translations (drafts #16, #17, #18)."""
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 DB = "/home/ubuntu/ai-x-bot/bot_data.db"
 
@@ -117,6 +118,7 @@ THREADS = [
 def main():
     conn = sqlite3.connect(DB)
     conn.execute("PRAGMA journal_mode=WAL")
+    updated_at = datetime.now(timezone.utc).isoformat()
 
     for thread in THREADS:
         draft_id = thread["draft_id"]
@@ -133,9 +135,9 @@ def main():
         conn.execute(
             """UPDATE post_drafts
                SET text = ?, category = ?, thread_tweets_json = ?,
-                   updated_at = datetime('now')
+                   updated_at = ?
                WHERE id = ?""",
-            (first_tweet, category, thread_tweets_json, draft_id),
+            (first_tweet, category, thread_tweets_json, updated_at, draft_id),
         )
         print(f"  draft #{draft_id}: updated ({len(tweets)} tweets, first: {first_tweet[:55].strip()!r})")
 
