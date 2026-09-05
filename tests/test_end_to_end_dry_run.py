@@ -1164,6 +1164,82 @@ def test_adaptive_cycles_use_one_clock_read_and_stop_event(tmp_path):
     assert clock.calls == 4
 
 
+def test_translation_retry_silently_repairs_already_approved_draft(tmp_path):
+    dependencies = dependency_bundle(tmp_path)
+    agent = FlexDropinGrowthAgent(dependencies)
+    state_key = "telegram_session:approved-translation-retry"
+    session_token = "approvedTranslationRetry01"
+    state = json.dumps(
+        {"token": session_token, "v": 1},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    agent.db.set_state(state_key, state)
+    draft, outcome = agent.db.create_manual_approved_draft_consuming_state_atomic(
+        text="An already approved operator post awaiting its review translation.",
+        category="gym_strategy",
+        source_ids=[],
+        media_id=None,
+        intended_slot="2026-08-11T14:00:00+00:00",
+        state_key=state_key,
+        expected_state_value=state,
+        session_token=session_token,
+        operator="floriano",
+        now=NOW,
+    )
+
+    assert outcome == "created"
+    queued = agent.db.get_queue_draft(draft["id"])
+    assert queued["status"] == "approved"
+    assert queued["translation_status"] == "pending"
+    messages_before_retry = list(dependencies["telegram_api"].messages)
+
+    assert agent.translation_retry_cycle(now=NOW + timedelta(minutes=30)) == []
+
+    repaired = agent.db.get_queue_draft(draft["id"])
+    assert repaired["status"] == "approved"
+    assert repaired["translation_status"] == "ready"
+    assert dependencies["telegram_api"].messages == messages_before_retry
+
+
+def test_translation_retry_announces_draft_still_awaiting_approval(tmp_path):
+    dependencies = dependency_bundle(tmp_path)
+    agent = FlexDropinGrowthAgent(dependencies)
+    source_id = agent.db.add_content_source(
+        "founder_note",
+        "A useful operator note grounded in direct experience.",
+        metadata={"publishable": True},
+        verified_by="floriano",
+    )
+    draft_id = agent.db.create_post_draft(
+        "A pending operator post awaiting its review translation.",
+        "gym_strategy",
+        [source_id],
+        {"total": 90},
+        "2026-08-11T14:00:00+00:00",
+        "translation-retry:pending-approval",
+    )
+    queued = agent.db.ensure_editorial_queue(draft_id)
+    assert queued["status"] == "pending_approval"
+    assert queued["translation_status"] == "pending"
+
+    assert agent.translation_retry_cycle(now=NOW + timedelta(minutes=30)) == [
+        draft_id
+    ]
+
+    ready = agent.db.get_queue_draft(draft_id)
+    assert ready["status"] == "pending_approval"
+    assert ready["translation_status"] == "ready"
+    callbacks = {
+        button["callback_data"]
+        for row in dependencies["telegram_api"].messages[-1][2]["reply_markup"][
+            "inline_keyboard"
+        ]
+        for button in row
+    }
+    assert f"draft:approve:{draft_id}" in callbacks
+
+
 @pytest.mark.parametrize(
     ("blog_error", "news_error", "expected"),
     [

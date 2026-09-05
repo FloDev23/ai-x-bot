@@ -630,7 +630,11 @@ class FlexDropinGrowthAgent:
                 if type(draft_id) is not int or draft_id <= 0:
                     continue
                 draft = self.db.get_queue_draft(draft_id)
-                if draft is None or draft.get("translation_status") != "ready":
+                if (
+                    draft is None
+                    or draft.get("status") != "pending_approval"
+                    or draft.get("translation_status") != "ready"
+                ):
                     continue
                 self.telegram_controller._send_draft_card(
                     self.authorized_chat_id,
