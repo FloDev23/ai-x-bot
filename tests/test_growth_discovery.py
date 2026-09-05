@@ -104,6 +104,7 @@ def discovery(tmp_path, fake_x, **overrides):
 def test_relevant_gym_owner_has_exact_approved_score_components():
     result = score_growth_candidate(profile(), post(), NOW)
     assert result == {
+        "relevance_policy": "managed_fitness_facility_v2",
         "role_bio": 30,
         "recent_topic_fit": 25,
         "activity": 15,
@@ -126,8 +127,8 @@ def test_relevant_gym_owner_has_exact_approved_score_components():
 def test_score_caps_each_component_and_total_at_approved_maximums():
     rich_profile = profile(
         description=(
-            "Owner founder manager coach trainer studio gym box pilates yoga "
-            "fitness tech FlexDropin class booking drop-in"
+            "Owner and founder of a CrossFit gym and Pilates studio. "
+            "Manager using FlexDropin for class booking and drop-in access"
         ),
         followers_count=5000,
         following_count=700,
@@ -182,13 +183,133 @@ def test_hard_filters_reject_disallowed_profiles(candidate_profile, latest_post,
     )
 
 
-def test_hard_filter_accepts_sufficient_post_context_when_bio_is_empty():
+def test_hard_filter_rejects_account_without_managed_facility_identity():
     accepted, reason = passes_candidate_filters(
         profile(description=""),
         post(text="Pilates class booking and occupancy planning"),
         NOW,
     )
-    assert (accepted, reason) == (True, "accepted")
+    assert (accepted, reason) == (
+        False,
+        "no_managed_fitness_facility_context",
+    )
+
+
+@pytest.mark.parametrize(
+    ("description", "latest_text"),
+    [
+        (
+            "Camera operator and filmmaker",
+            "Our members use the new class booking schedule in the app.",
+        ),
+        (
+            "Personal trainer and fitness creator",
+            "Class schedules and member bookings are changing this week.",
+        ),
+        (
+            "CrossFit athlete training at a CrossFit gym",
+            "Class schedules and member bookings are changing this week.",
+        ),
+        (
+            "Product manager, CrossFit gym member",
+            "Class schedules and member bookings are changing this week.",
+        ),
+        (
+            "Camera operator and filmmaker. Member at a CrossFit gym",
+            "Class schedules and member bookings are changing this week.",
+        ),
+        (
+            "Gym enthusiast and business owner",
+            "Class schedules and member bookings are changing this week.",
+        ),
+    ],
+)
+def test_generic_roles_do_not_qualify_without_facility_management_link(
+    description,
+    latest_text,
+):
+    candidate_profile = profile(description=description)
+    latest_post = post(text=latest_text)
+
+    assert passes_candidate_filters(candidate_profile, latest_post, NOW) == (
+        False,
+        "no_managed_fitness_facility_context",
+    )
+    assert score_growth_candidate(candidate_profile, latest_post, NOW)["total"] < 75
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "CrossFit gym and weightlifting facility in Bristol",
+        "HYROX gym in Manchester offering daily classes",
+        "Parkour training facility in Berlin",
+        "Swimming centre with classes and memberships",
+        "Martial arts academy in Bristol",
+        "Boutique yoga studio in Rome",
+    ],
+)
+def test_physical_fitness_facility_account_qualifies_without_personal_role(
+    description,
+):
+    candidate_profile = profile(
+        description=description,
+    )
+    latest_post = post(text="New class schedule and drop-in booking slots")
+
+    assert passes_candidate_filters(candidate_profile, latest_post, NOW) == (
+        True,
+        "accepted",
+    )
+    assert score_growth_candidate(candidate_profile, latest_post, NOW)["total"] >= 75
+
+
+def test_cached_candidate_from_previous_relevance_policy_is_re_evaluated(tmp_path):
+    db = Database(str(tmp_path / "old-policy.db"))
+    activity_at = (NOW - timedelta(days=1)).isoformat()
+    db.upsert_growth_candidate({
+        "user_id": "old-policy",
+        "username": "old_policy",
+        "profile": profile("old-policy", "old_policy"),
+        "latest_post": post("899", created_at=activity_at),
+        "score": 95,
+        "score_data": {
+            "total": 95,
+            "audience_segment": "primary",
+            "reasons": ["primary_operator_role"],
+            "activity_at": activity_at,
+            "hard_filter_passed": True,
+            "filter_reason": "accepted",
+        },
+        "discovery_source": "topic_search",
+        "profile_expires_at": (NOW + timedelta(days=7)).isoformat(),
+        "last_evaluated_at": NOW.isoformat(),
+    })
+
+    assert db.get_growth_candidate("old-policy") is not None
+    assert db.get_cached_growth_candidate("old-policy", NOW) is None
+
+    fake_x = FakeX()
+    fake_x.followers = [profile("old-policy", "old_policy")]
+    fake_x.latest_posts["old-policy"] = post("898")
+    growth = GrowthDiscovery(
+        fake_x,
+        db,
+        score_threshold=75,
+        query_budget=1,
+        new_profile_budget=25,
+        profile_cache_days=7,
+        digest_limit=5,
+        seed_accounts=(),
+        topic_queries=("topic-one", "topic-two"),
+    )
+
+    assert [row["user_id"] for row in growth.run(NOW)] == ["old-policy"]
+    assert fake_x.latest_calls == ["old-policy"]
+    refreshed = db.get_cached_growth_candidate("old-policy", NOW)
+    assert refreshed["score_data"]["relevance_policy"] == (
+        "managed_fitness_facility_v2"
+    )
 
 
 def test_discovery_caps_queries_and_new_profiles_even_on_errors_and_duplicates(tmp_path):
@@ -336,8 +457,11 @@ def test_low_score_and_hard_filtered_candidates_are_stored_only_for_audit(tmp_pa
 
     low = growth.db.get_growth_candidate("low")
     inactive = growth.db.get_growth_candidate("inactive")
-    assert low["score"] == 65
-    assert low["score_data"]["hard_filter_passed"] is True
+    assert low["score"] == 55
+    assert low["score_data"]["hard_filter_passed"] is False
+    assert low["score_data"]["filter_reason"] == (
+        "no_managed_fitness_facility_context"
+    )
     assert inactive["score"] == 80
     assert inactive["score_data"]["hard_filter_passed"] is False
     assert inactive["score_data"]["filter_reason"] == (
@@ -377,6 +501,7 @@ def test_sqlite_digest_sorts_by_score_then_latest_activity_and_limits_five(tmp_p
             "latest_post": post(str(910 + index), activity.isoformat()),
             "score": score,
             "score_data": {
+                "relevance_policy": "managed_fitness_facility_v2",
                 "total": score,
                 "audience_segment": "primary",
                 "reasons": ["primary_operator_role"],

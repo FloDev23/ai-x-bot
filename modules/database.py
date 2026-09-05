@@ -36,6 +36,7 @@ from modules.media_store import (
     verify_pinned_media,
 )
 from modules.growth_candidate_schema import (
+    GROWTH_RELEVANCE_POLICY,
     evaluate_growth_candidate_filters,
     is_canonical_growth_latest_post,
     is_canonical_growth_profile,
@@ -8927,6 +8928,7 @@ class Database:
                 or not is_json_safe_mapping(profile)
                 or not is_json_safe_mapping(latest_post)
                 or not is_json_safe_mapping(score_data)
+                or score_data.get("relevance_policy") != GROWTH_RELEVANCE_POLICY
             ):
                 return None
 

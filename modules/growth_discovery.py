@@ -16,8 +16,10 @@ from config import (
     GROWTH_SEED_ACCOUNTS,
 )
 from modules.growth_candidate_schema import (
+    GROWTH_RELEVANCE_POLICY,
     as_utc,
     evaluate_growth_candidate_filters,
+    has_managed_fitness_facility_context,
     is_canonical_growth_latest_post,
     is_canonical_growth_profile,
     parse_growth_datetime,
@@ -27,7 +29,7 @@ from modules.growth_candidate_schema import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOPIC_QUERIES = (
-    '("gym owner" OR "studio owner" OR "box owner" OR "fitness center" OR '
+    '("gym owner" OR "fitness studio owner" OR "CrossFit box owner" OR "fitness center" OR '
     '"CrossFit box" OR "boxing gym" OR "martial arts school" OR "pilates studio" OR '
     '"yoga studio" OR "fitness studio" OR "spinning studio" OR "barre studio" OR '
     '"climbing gym" OR "dojo") '
@@ -41,57 +43,6 @@ DEFAULT_TOPIC_QUERIES = (
     '(studio OR gym OR box OR "training center" OR "fitness center" OR dojo) '
     '(owner OR founder OR manager OR operator OR "head coach") '
     'lang:en -is:retweet',
-)
-_PRIMARY_ROLE_TERMS = ("owner", "founder", "manager", "operator")
-_AMPLIFIER_ROLE_TERMS = (
-    "coach",
-    "trainer",
-    "fitness tech",
-    "consultant",
-    "journalist",
-    "creator",
-)
-_END_USER_TERMS = (
-    "studio",
-    "gym",
-    "box",
-    "dojo",
-    # Functional / strength
-    "crossfit",
-    "hyrox",
-    "athx",
-    "functional training",
-    "functional fitness",
-    "calisthenics",
-    "weightlifting",
-    "powerlifting",
-    "bootcamp",
-    "hiit",
-    "circuit training",
-    # Cardio
-    "spinning",
-    "indoor cycling",
-    "rowing",
-    # Mind / body
-    "pilates",
-    "yoga",
-    "barre",
-    "meditation",
-    # Combat
-    "boxing",
-    "mma",
-    "muay thai",
-    "karate",
-    "bjj",
-    "jiu-jitsu",
-    "martial arts",
-    # Water / outdoor / alternative
-    "swimming",
-    "climbing",
-    "pole dance",
-    "parkour",
-    # Generic
-    "fitness",
 )
 _OPERATING_TOPIC_TERMS = (
     "class",
@@ -147,18 +98,10 @@ def score_growth_candidate(
     recent_text = post_text.lower() if type(post_text) is str else ""
     reasons = []
 
-    if any(_contains(bio_text, term) for term in _PRIMARY_ROLE_TERMS):
+    if has_managed_fitness_facility_context(profile):
         segment = "primary"
         role_bio = 30
         reasons.append("primary_operator_role")
-    elif any(_contains(bio_text, term) for term in _AMPLIFIER_ROLE_TERMS):
-        segment = "amplifier"
-        role_bio = 20
-        reasons.append("amplifier_role")
-    elif any(_contains(bio_text, term) for term in _END_USER_TERMS):
-        segment = "end_user"
-        role_bio = 10
-        reasons.append("relevant_end_user")
     else:
         segment = "end_user"
         role_bio = 0
@@ -221,6 +164,7 @@ def score_growth_candidate(
     }
     total = min(sum(components.values()), 100)
     return {
+        "relevance_policy": GROWTH_RELEVANCE_POLICY,
         **components,
         "total": total,
         "audience_segment": segment,

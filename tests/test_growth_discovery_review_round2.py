@@ -220,6 +220,7 @@ def _persist_complete_candidate(database, user_id="cache-user", username="cache_
         "latest_post": review_post("810"),
         "score": 95,
         "score_data": {
+            "relevance_policy": "managed_fitness_facility_v2",
             "total": 95,
             "audience_segment": "primary",
             "reasons": ["primary_operator_role"],

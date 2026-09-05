@@ -69,7 +69,7 @@ FILTER_CASES = [
         "post-context-only",
         {"description": " \t "},
         {},
-        (True, "accepted"),
+        (False, "no_managed_fitness_facility_context"),
     ),
     (
         "bio-context-only",
@@ -242,6 +242,7 @@ def test_hard_filter_cache_and_digest_share_canonical_eligibility_matrix(
         "latest_post": latest_post,
         "score": 85,
         "score_data": {
+            "relevance_policy": "managed_fitness_facility_v2",
             "total": 85,
             "audience_segment": "primary",
             "reasons": ["primary_operator_role"],
@@ -292,6 +293,7 @@ def test_whitespace_only_context_is_excluded_from_cache_digest_and_full_run(
         "latest_post": latest_post,
         "score": 85,
         "score_data": {
+            "relevance_policy": "managed_fitness_facility_v2",
             "total": 85,
             "audience_segment": "primary",
             "reasons": ["primary_operator_role"],

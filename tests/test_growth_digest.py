@@ -802,6 +802,7 @@ def test_reevaluation_requires_complete_absent_snapshot_after_fourteen_days(tmp_
         },
         "score": 90,
         "score_data": {
+            "relevance_policy": "managed_fitness_facility_v2",
             "total": 90, "audience_segment": "primary",
             "reasons": ["primary_operator_role"],
             "activity_at": (NOW - timedelta(days=1)).isoformat(),
@@ -855,6 +856,7 @@ def test_reevaluation_accepts_older_complete_snapshot_after_accounts_own_boundar
         },
         "score": 90,
         "score_data": {
+            "relevance_policy": "managed_fitness_facility_v2",
             "total": 90, "audience_segment": "primary",
             "reasons": ["primary_operator_role"],
             "activity_at": (NOW - timedelta(days=1)).isoformat(),
@@ -1004,6 +1006,32 @@ def test_fitness_business_operations_are_relevant_without_a_second_topic():
 
     assert scored is not None
     assert "fitness_operations" in scored["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Our photography studio now offers a day pass for visiting creators.",
+        "The recording studio launches its first class for new producers today.",
+        "Our coworking studio welcomes drop-in day-pass members.",
+    ],
+)
+def test_ambiguous_non_fitness_drop_in_posts_are_rejected(text):
+    assert score_growth_post(_normalized_post(text=text), NOW) is None
+
+
+def test_fitness_access_request_remains_relevant():
+    scored = score_growth_post(
+        _normalized_post(
+            text="Looking for a CrossFit gym day pass while visiting Madrid."
+        ),
+        NOW,
+    )
+
+    assert scored is not None
+    assert {"day_pass_model", "travel_context", "discipline_match"} <= set(
+        scored["reason_codes"]
+    )
 
 
 def test_service_replays_exact_persisted_rows_before_any_x_read(tmp_path):

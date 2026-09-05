@@ -101,7 +101,7 @@ def _discovery(client, database, *, score_threshold=75):
     )
 
 
-def test_none_description_from_tweepy_is_eligible_end_to_end(tmp_path):
+def test_none_description_from_tweepy_is_audited_but_not_growth_eligible(tmp_path):
     user = _tweepy_user(101, "none_bio", None)
     tweet = _tweepy_tweet(
         901,
@@ -121,22 +121,21 @@ def test_none_description_from_tweepy_is_eligible_end_to_end(tmp_path):
     ).run(NOW)
 
     assert backend.latest_calls == ["101"]
-    assert [row["user_id"] for row in rows] == ["101"]
+    assert rows == []
     audit = database.get_growth_candidate("101")
     assert audit["profile"]["description"] == ""
     assert audit["latest_post"]["text"].strip()
     assert audit["score"] == 70
-    assert audit["score_data"]["hard_filter_passed"] is True
-    assert audit["score_data"]["filter_reason"] == "accepted"
-    assert passes_candidate_filters(audit["profile"], audit["latest_post"], NOW) == (
-        True,
-        "accepted",
+    assert audit["score_data"]["hard_filter_passed"] is False
+    assert audit["score_data"]["filter_reason"] == (
+        "no_managed_fitness_facility_context"
     )
-    assert database.get_cached_growth_candidate("101", NOW) is not None
-    assert [
-        row["user_id"]
-        for row in database.get_digest_candidates(now=NOW, threshold=70)
-    ] == ["101"]
+    assert passes_candidate_filters(audit["profile"], audit["latest_post"], NOW) == (
+        False,
+        "no_managed_fitness_facility_context",
+    )
+    assert database.get_cached_growth_candidate("101", NOW) is None
+    assert database.get_digest_candidates(now=NOW, threshold=70) == []
 
 
 def test_none_lang_from_tweepy_is_eligible_without_market_points(tmp_path):

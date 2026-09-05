@@ -21,8 +21,9 @@ POST_QUERY_PORTFOLIO: Tuple[Tuple[str, str], ...] = (
         '("drop-in" OR "day pass" OR "gym without membership" OR "pay per class" OR '
         '"pay per visit" OR "no contract gym" OR "trial class" OR "first class" OR '
         '"want to try" OR "looking for a gym" OR "gym recommendations") '
-        '(gym OR studio OR CrossFit OR Pilates OR yoga OR boxing OR BJJ OR '
-        '"martial arts" OR fitness OR "training center") '
+        '(gym OR "fitness studio" OR "fitness center" OR CrossFit OR HYROX OR '
+        'Pilates OR yoga OR boxing OR BJJ OR "martial arts" OR barre OR '
+        'calisthenics OR weightlifting OR climbing) '
         'lang:en -is:retweet -is:reply '
         '-"home gym" -"garage gym" -airdrop -dropshipping -crypto',
     ),
@@ -87,28 +88,15 @@ _NOISE_PATTERN = re.compile(
     r"airdrop|dropshipping|crypto drop|album drop|sneaker drop|price drop|"
     r"job offer|job opening|we.re hiring|giveaway|contest|sweepstakes|"
     r"personal trainer certification|trainer certification|pt certification|"
-    r"workout (?:plan|program|routine) (?:pdf|free)|online personal trainer)\b",
+    r"workout (?:plan|program|routine) (?:pdf|free)|online personal trainer|"
+    r"photography studio|photo studio|recording studio|music studio|"
+    r"coworking(?: space| studio)?|childcare|daycare|retail (?:store|event|pop-up))\b",
     re.IGNORECASE,
 )
-_VENUE_PATTERN = re.compile(
-    r"\b(?:gym|studio|class|fitness center|training center|"
-    # Functional / strength
-    r"crossfit|hyrox|athx|functional (?:training|fitness)|calisthenics|"
-    r"weightlifting|bodybuilding|circuit training|bootcamp|hiit|trx|fitcamp|"
-    # Cardio
-    r"spinning|indoor cycling|rowing|cardio fitness|"
-    # Mind / body
-    r"yoga|pilates|barre|meditation|stretching|postural gymnastics|"
-    # Dance
-    r"zumba|dance fitness|aqua zumba|"
-    # Combat
-    r"boxing|mma|muay thai|karate|bjj|jiu[ -]?jitsu|dojo|"
-    # Water
-    r"swimming|aqua fitness|hydrospinning|"
-    # Outdoor / alternative
-    r"climbing|bouldering|pole dance|parkour|"
-    # Generic venue
-    r"fitness|studio)\b",
+_FITNESS_FACILITY_PATTERN = re.compile(
+    r"\b(?:gyms?|fitness (?:business|studio|center|centre|club|facilit(?:y|ies))|"
+    r"health club|crossfit (?:box|gym|affiliate)|boxing gym|martial arts school|"
+    r"training (?:gym|facility))\b",
     re.IGNORECASE,
 )
 _DISCIPLINE_PATTERN = re.compile(
@@ -166,8 +154,12 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
     # Hard noise exclusion before any scoring
     if _NOISE_PATTERN.search(lowered):
         return None
-    # Must contain a fitness venue or discipline term
-    if not _VENUE_PATTERN.search(lowered):
+    # Ambiguous words such as "studio", "class" and "drop-in" never establish
+    # fitness relevance on their own.
+    if not (
+        _FITNESS_FACILITY_PATTERN.search(lowered)
+        or _DISCIPLINE_PATTERN.search(lowered)
+    ):
         return None
     weighted_reasons: List[Tuple[str, int]] = []
     # Operator identity signals
