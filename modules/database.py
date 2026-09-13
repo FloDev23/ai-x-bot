@@ -132,6 +132,7 @@ _GROWTH_ACCOUNT_REASONS = frozenset({
     "multiple_operating_topics", "one_operating_topic",
     "active_within_7_days", "active_within_30_days", "english_market",
     "plausible_public_metrics", "direct_drop_in_affinity",
+    "us_market",
     "no_follow_back_after_14_days",
 })
 _GROWTH_POST_REASONS = frozenset({
@@ -141,6 +142,7 @@ _GROWTH_POST_REASONS = frozenset({
     # legacy codes kept for existing rows
     "functional_fitness", "crossfit", "pilates", "martial_arts",
     "recent", "credible_author",
+    "followed_account",
 })
 _GROWTH_PUBLIC_METRIC_KEYS = frozenset({
     "followers_count", "following_count", "tweet_count", "listed_count",
@@ -188,6 +190,7 @@ class ReplyGenerationClaim:
     revision: int
     claim_token: str
     source_excerpt: str
+    reply_kind: str
 
 
 class Database:
@@ -885,6 +888,15 @@ class Database:
                     audience_segment TEXT NOT NULL CHECK (
                         audience_segment IN ('operator','end_user')
                     ),
+                    source_kind TEXT NOT NULL DEFAULT 'discovery' CHECK (
+                        source_kind IN ('discovery','following')
+                    ),
+                    reply_kind TEXT NOT NULL DEFAULT 'value' CHECK (
+                        reply_kind IN (
+                            'value','promotion_capacity',
+                            'promotion_booking','promotion_single_class'
+                        )
+                    ),
                     relevance_score INTEGER NOT NULL,
                     reply_text TEXT,
                     status TEXT NOT NULL DEFAULT 'reserved' CHECK (
@@ -923,6 +935,21 @@ class Database:
                     )
                 )
             """)
+            reply_suggestion_columns = {
+                row["name"] for row in c.execute(
+                    "PRAGMA table_info(reply_suggestions)"
+                )
+            }
+            if "source_kind" not in reply_suggestion_columns:
+                c.execute(
+                    "ALTER TABLE reply_suggestions ADD COLUMN "
+                    "source_kind TEXT NOT NULL DEFAULT 'discovery'"
+                )
+            if "reply_kind" not in reply_suggestion_columns:
+                c.execute(
+                    "ALTER TABLE reply_suggestions ADD COLUMN "
+                    "reply_kind TEXT NOT NULL DEFAULT 'value'"
+                )
             c.execute("""
                 CREATE INDEX IF NOT EXISTS idx_reply_suggestions_daily_status
                 ON reply_suggestions(
@@ -7943,6 +7970,11 @@ class Database:
             or type(result.get("growth_suggestion_id")) is not int
             or result["growth_suggestion_id"] <= 0
             or result.get("audience_segment") not in {"operator", "end_user"}
+            or result.get("source_kind") not in {"discovery", "following"}
+            or result.get("reply_kind") not in {
+                "value", "promotion_capacity", "promotion_booking",
+                "promotion_single_class",
+            }
             or result.get("status") not in {
                 "reserved", "ready", "generation_failed", "dismissed",
                 "published_manually",
@@ -7957,7 +7989,9 @@ class Database:
             from modules.reply_copilot import normalize_and_validate_reply
 
             reply_text = result.get("reply_text")
-            if normalize_and_validate_reply(reply_text) != reply_text:
+            if normalize_and_validate_reply(
+                reply_text, reply_kind=result["reply_kind"],
+            ) != reply_text:
                 return None
         return result
 
@@ -7987,6 +8021,7 @@ class Database:
         expected_keys = {
             "growth_suggestion_id", "tweet_id", "author_username",
             "source_excerpt", "audience_segment", "relevance_score",
+            "source_kind", "reply_kind",
         }
         normalized = []
         seen_sources, seen_tweets = set(), set()
@@ -7998,6 +8033,8 @@ class Database:
             username = candidate["author_username"]
             excerpt = candidate["source_excerpt"]
             segment = candidate["audience_segment"]
+            source_kind = candidate["source_kind"]
+            reply_kind = candidate["reply_kind"]
             score = candidate["relevance_score"]
             if (
                 type(source_id) is not int
@@ -8012,6 +8049,11 @@ class Database:
                 or excerpt != excerpt.strip()
                 or not 1 <= len(excerpt) <= 500
                 or segment not in {"operator", "end_user"}
+                or source_kind not in {"discovery", "following"}
+                or reply_kind not in {
+                    "value", "promotion_capacity", "promotion_booking",
+                    "promotion_single_class",
+                }
                 or type(score) is not int
                 or not 0 <= score <= 100
             ):
@@ -8038,7 +8080,19 @@ class Database:
                     reason_codes = json.loads(source["reason_codes_json"])
                 except (TypeError, ValueError, json.JSONDecodeError):
                     return []
-                from modules.reply_copilot import classify_reply_segment
+                from modules.reply_copilot import (
+                    classify_reply_kind,
+                    classify_reply_segment,
+                )
+
+                supported_reply_kind = classify_reply_kind(
+                    reason_codes, candidate["source_excerpt"],
+                )
+                supported_source_kind = (
+                    "following"
+                    if "followed_account" in reason_codes
+                    else "discovery"
+                )
 
                 if (
                     source["observed_on"] != observed_on
@@ -8054,6 +8108,9 @@ class Database:
                     or payload.get("reason_codes") != reason_codes
                     or classify_reply_segment(reason_codes)
                     != candidate["audience_segment"]
+                    or supported_source_kind != candidate["source_kind"]
+                    or candidate["reply_kind"]
+                    not in {"value", supported_reply_kind}
                 ):
                     return []
                 verified.append(candidate)
@@ -8070,9 +8127,9 @@ class Database:
                     INSERT OR IGNORE INTO reply_suggestions (
                         growth_suggestion_id, observed_on, tweet_id,
                         author_username, source_excerpt, audience_segment,
-                        relevance_score, status, generation_count, revision,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', 0, 0, ?, ?)
+                        source_kind, reply_kind, relevance_score, status,
+                        generation_count, revision, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', 0, 0, ?, ?)
                 """, (
                     candidate["growth_suggestion_id"],
                     observed_on,
@@ -8080,6 +8137,8 @@ class Database:
                     candidate["author_username"],
                     candidate["source_excerpt"],
                     candidate["audience_segment"],
+                    candidate["source_kind"],
+                    candidate["reply_kind"],
                     candidate["relevance_score"],
                     reserved_iso,
                     reserved_iso,
@@ -8241,6 +8300,7 @@ class Database:
                 revision=expected_revision + 1,
                 claim_token=claim_token,
                 source_excerpt=row["source_excerpt"],
+                reply_kind=row["reply_kind"],
             )
 
     def complete_reply_generation(
@@ -8256,7 +8316,9 @@ class Database:
             or not self._valid_reply_boundary_time(completed_at)
         ):
             return False
-        reply = normalize_and_validate_reply(reply_text)
+        reply = normalize_and_validate_reply(
+            reply_text, reply_kind=claim.reply_kind,
+        )
         if reply is None:
             return False
         completed_iso = completed_at.astimezone(timezone.utc).isoformat()
@@ -8500,7 +8562,7 @@ class Database:
                 type(builder_token) is not str
                 or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", builder_token) is None
                 or type(query_claim_tokens) is not dict
-                or not 1 <= len(query_claim_tokens) <= 2
+                or not 1 <= len(query_claim_tokens) <= 3
                 or any(
                     type(key) is not str
                     or key.startswith("__")
@@ -8620,7 +8682,7 @@ class Database:
             or expires_at.tzinfo is None
             or expires_at.utcoffset() is None
             or type(budget) is not int
-            or not 1 <= budget <= 2
+            or not 1 <= budget <= 3
         ):
             return "invalid", None
         claimed = claimed_at.astimezone(timezone.utc)
@@ -9005,6 +9067,7 @@ class Database:
                 or not is_json_safe_mapping(latest_post)
                 or not is_json_safe_mapping(score_data)
                 or score_data.get("relevance_policy") != GROWTH_RELEVANCE_POLICY
+                or score_data.get("market_priority") not in {0, 1}
             ):
                 return None
 
@@ -9067,6 +9130,7 @@ class Database:
             result["audience_segment"] = score_data["audience_segment"]
             result["reasons"] = reasons
             result["activity_at"] = score_data["activity_at"]
+            result["market_priority"] = score_data["market_priority"]
             result["direct_url"] = (
                 f"https://x.com/{username}/status/{latest_id}"
             )
@@ -9194,7 +9258,9 @@ class Database:
         eligible.sort(key=lambda candidate: candidate["user_id"])
         eligible.sort(
             key=lambda candidate: (
-                candidate["score"], activity_timestamp(candidate)
+                candidate["market_priority"],
+                candidate["score"],
+                activity_timestamp(candidate),
             ),
             reverse=True,
         )

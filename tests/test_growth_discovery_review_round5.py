@@ -161,7 +161,7 @@ def test_none_lang_from_tweepy_is_eligible_without_market_points(tmp_path):
     assert [row["user_id"] for row in rows] == ["102"]
     audit = database.get_growth_candidate("102")
     assert audit["latest_post"]["lang"] == ""
-    assert audit["score"] == 85
+    assert audit["score"] == 90
     assert audit["score_data"]["market"] == 0
     assert "english_market" not in audit["score_data"]["reasons"]
     assert audit["score_data"]["hard_filter_passed"] is True

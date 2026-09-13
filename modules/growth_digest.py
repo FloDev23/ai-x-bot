@@ -42,6 +42,7 @@ _ACCOUNT_REASON_CODES = frozenset({
     "multiple_operating_topics", "one_operating_topic",
     "active_within_7_days", "active_within_30_days", "english_market",
     "plausible_public_metrics", "direct_drop_in_affinity",
+    "us_market",
 })
 _POST_METRIC_KEYS = frozenset({
     "like_count", "retweet_count", "reply_count", "quote_count",
@@ -133,6 +134,7 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
     created_at = parse_growth_datetime(post.get("created_at"))
     metrics = post.get("public_metrics")
     author_metrics = post.get("author_public_metrics")
+    source_kind = post.get("source_kind", "discovery")
     if (
         not _canonical_id(post_id)
         or not _canonical_id(author_id)
@@ -144,6 +146,7 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
         or created_at is None
         or not _closed_metrics(metrics, _POST_METRIC_KEYS)
         or not _closed_metrics(author_metrics, _AUTHOR_METRIC_KEYS)
+        or source_kind not in {"discovery", "following"}
     ):
         return None
     current = now.astimezone(timezone.utc)
@@ -248,6 +251,8 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
         reasons.append("recent")
     if author_quality >= 10:
         reasons.append("credible_author")
+    if source_kind == "following":
+        reasons.append("followed_account")
     return {
         "score": relevance + recency + author_quality + specificity,
         "created_at": created_at,
@@ -406,7 +411,12 @@ class GrowthDigestService:
             ):
                 continue
             prior = best.get(post["id"])
-            rank = (scored["score"], scored["created_at"], post["id"])
+            rank = (
+                scored["score"],
+                int("followed_account" in scored["reason_codes"]),
+                scored["created_at"],
+                post["id"],
+            )
             if prior is not None and prior[0] >= rank:
                 continue
             best[post["id"]] = (rank, post, scored)
@@ -498,13 +508,15 @@ class GrowthDigestService:
     ) -> Optional[Tuple[List[Dict], Dict[str, str]]]:
         rows = []
         claim_tokens = {}
+        following_reader = getattr(self.x, "read_following_timeline", None)
+        read_budget = self.post_query_budget + int(callable(following_reader))
         for query_key, query in POST_QUERY_PORTFOLIO[: self.post_query_budget]:
             claim, claim_token = self.db.claim_growth_read_query(
                 observed_on,
                 query_key,
                 now,
                 now + self.claim_ttl,
-                budget=self.post_query_budget,
+                budget=read_budget,
             )
             if claim != "claimed" or claim_token is None:
                 self._fail_claims(observed_on, claim_tokens)
@@ -533,6 +545,34 @@ class GrowthDigestService:
                 self._fail_claims(observed_on, claim_tokens)
                 return None
             rows.extend(page_rows)
+        if callable(following_reader):
+            query_key = "following_timeline"
+            claim, claim_token = self.db.claim_growth_read_query(
+                observed_on,
+                query_key,
+                now,
+                now + self.claim_ttl,
+                budget=read_budget,
+            )
+            if claim != "claimed" or claim_token is None:
+                self._fail_claims(observed_on, claim_tokens)
+                return None
+            claim_tokens[query_key] = claim_token
+            try:
+                result = following_reader(limit=25)
+                page_rows = getattr(result, "posts", None)
+                complete = getattr(result, "complete", None)
+                if complete is not True or not isinstance(page_rows, (list, tuple)):
+                    self._fail_claims(observed_on, claim_tokens)
+                    return None
+            except Exception as error:
+                logger.warning(
+                    "growth_digest_following_read_failed error_type=%s",
+                    type(error).__name__,
+                )
+                self._fail_claims(observed_on, claim_tokens)
+                return None
+            rows.extend({**post, "source_kind": "following"} for post in page_rows)
         return rows, claim_tokens
 
     def build(self, now: datetime) -> Dict:

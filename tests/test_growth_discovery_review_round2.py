@@ -220,7 +220,8 @@ def _persist_complete_candidate(database, user_id="cache-user", username="cache_
         "latest_post": review_post("810"),
         "score": 95,
         "score_data": {
-            "relevance_policy": "managed_fitness_facility_v2",
+            "relevance_policy": "managed_fitness_facility_us_priority_v3",
+            "market_priority": 0,
             "total": 95,
             "audience_segment": "primary",
             "reasons": ["primary_operator_role"],
@@ -283,9 +284,9 @@ def test_malformed_cache_fields_force_full_run_reevaluation(
 
     assert x_client.latest_calls == ["cache-user"]
     refreshed = database.get_growth_candidate("cache-user")
-    assert refreshed["score"] == 95
+    assert refreshed["score"] == 100
     assert refreshed["username"] == "cache_owner"
-    assert refreshed["score_data"]["total"] == 95
+    assert refreshed["score_data"]["total"] == 100
 
 
 def test_latest_post_error_consumes_persistent_user_claim_and_one_slot(tmp_path):

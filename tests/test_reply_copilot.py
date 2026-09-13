@@ -10,7 +10,9 @@ from modules.database import Database
 from modules.reply_copilot import (
     ReplyCopilotService,
     build_reply_web_intent,
+    build_promotional_reply,
     classify_reply_segment,
+    classify_reply_kind,
     normalize_and_validate_reply,
 )
 
@@ -89,13 +91,19 @@ def _seed_growth_posts(db, count=1, *, observed_on="2026-09-03"):
 
 
 def _reservation_candidate(suggestion):
+    reasons = suggestion["reason_codes"]
+    excerpt = suggestion["payload"]["excerpt"]
     return {
         "growth_suggestion_id": suggestion["id"],
         "tweet_id": suggestion["object_id"],
         "author_username": suggestion["username"],
-        "source_excerpt": suggestion["payload"]["excerpt"],
-        "audience_segment": classify_reply_segment(suggestion["reason_codes"]),
+        "source_excerpt": excerpt,
+        "audience_segment": classify_reply_segment(reasons),
         "relevance_score": suggestion["score"],
+        "source_kind": (
+            "following" if "followed_account" in reasons else "discovery"
+        ),
+        "reply_kind": classify_reply_kind(reasons, excerpt),
     }
 
 
@@ -176,6 +184,34 @@ def test_operator_reason_takes_precedence_over_end_user_reason():
 
 def test_end_user_reason_is_classified_without_operator_reason():
     assert classify_reply_segment(["explicit_intent", "drop_in"]) == "end_user"
+
+
+@pytest.mark.parametrize(
+    ("reasons", "excerpt", "expected"),
+    [
+        (["gym_owner", "empty_capacity"], "Our gym has empty class spots.", "promotion_capacity"),
+        (["gym_owner", "booking_problem"], "Manual bookings take too much time.", "promotion_booking"),
+        (["gym_owner", "drop_in"], "We want to sell drop-in classes.", "promotion_single_class"),
+        (["gym_owner", "drop_in"], "Drop-in training was fun today.", "value"),
+        (["fitness_operations"], "A useful note about retention.", "value"),
+    ],
+)
+def test_reply_kind_requires_an_explicit_product_fit(reasons, excerpt, expected):
+    assert classify_reply_kind(reasons, excerpt) == expected
+
+
+def test_promotional_reply_uses_only_verified_transparent_commercial_copy():
+    reply = build_promotional_reply("promotion_single_class")
+
+    assert "FlexDropin" in reply
+    assert "free partner activation" in reply
+    assert "15%" in reply
+    assert normalize_and_validate_reply(
+        reply, reply_kind="promotion_single_class"
+    ) == reply
+    assert build_reply_web_intent(
+        "123456789", reply, reply_kind="promotion_single_class"
+    ) is not None
 
 
 @pytest.mark.parametrize("reason_codes", [None, "gym_owner", [], ["recent"]])
@@ -299,6 +335,7 @@ def test_reply_schema_is_additive_and_preserves_existing_rows(tmp_path):
         "growth_suggestion_id", "tweet_id", "audience_segment", "status",
         "generation_count", "generation_claim_token",
         "generation_claim_expires_at", "revision", "failure_code",
+        "source_kind", "reply_kind",
     } <= columns
     assert {
         "idx_reply_suggestions_daily_status",
@@ -658,6 +695,56 @@ def test_service_fills_a_missing_segment_without_reducing_batch(tmp_path):
     assert {row["audience_segment"] for row in summary["suggestions"]} == {
         "operator"
     }
+
+
+def test_service_caps_followed_sources_at_two_and_keeps_discovery_in_batch(tmp_path):
+    database = Database(str(tmp_path / "reply-following-mix.db"))
+    _seed_custom_growth_posts(database, [
+        {"reasons": ["gym_owner", "followed_account"], "score": 99},
+        {"reasons": ["gym_owner", "followed_account"], "score": 98},
+        {"reasons": ["gym_owner", "followed_account"], "score": 97},
+        {"reasons": ["gym_owner"], "score": 96},
+        {"reasons": ["gym_owner"], "score": 95},
+        {"reasons": ["gym_owner"], "score": 94},
+    ])
+
+    summary = ReplyCopilotService(
+        database, QueueReplyGenerator(),
+    ).build("2026-09-03", now=NOW)
+
+    assert len(summary["suggestions"]) == 5
+    assert [
+        row["source_kind"] for row in summary["suggestions"]
+    ].count("following") == 2
+
+
+def test_service_generates_at_most_three_contextual_promotions_per_day(tmp_path):
+    database = Database(str(tmp_path / "reply-promotion-cap.db"))
+    _seed_custom_growth_posts(database, [
+        {
+            "reasons": ["gym_owner", "empty_capacity"],
+            "excerpt": f"Our gym has empty class spots number {index}.",
+            "score": 99 - index,
+        }
+        for index in range(4)
+    ] + [{
+        "reasons": ["travel_context"],
+        "excerpt": "Looking for a gym while visiting this week.",
+        "score": 90,
+    }])
+    generator = QueueReplyGenerator()
+
+    summary = ReplyCopilotService(database, generator).build(
+        "2026-09-03", now=NOW,
+    )
+
+    promotional = [
+        row for row in summary["suggestions"] if row["reply_kind"] != "value"
+    ]
+    assert len(promotional) == 3
+    assert all("FlexDropin" in row["reply_text"] for row in promotional)
+    assert all("15%" in row["reply_text"] for row in promotional)
+    assert len(generator.calls) == 2
 
 
 def test_service_applies_age_identity_and_segment_eligibility(tmp_path):

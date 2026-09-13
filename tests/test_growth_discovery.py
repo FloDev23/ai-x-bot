@@ -12,6 +12,7 @@ from modules.growth_discovery import (
     passes_candidate_filters,
     score_growth_candidate,
 )
+from modules import growth_candidate_schema
 from modules.twitter_client import TwitterClient
 
 
@@ -104,14 +105,15 @@ def discovery(tmp_path, fake_x, **overrides):
 def test_relevant_gym_owner_has_exact_approved_score_components():
     result = score_growth_candidate(profile(), post(), NOW)
     assert result == {
-        "relevance_policy": "managed_fitness_facility_v2",
-        "role_bio": 30,
+        "relevance_policy": "managed_fitness_facility_us_priority_v3",
+        "market_priority": 0,
+        "role_bio": 35,
         "recent_topic_fit": 25,
         "activity": 15,
         "market": 15,
         "account_quality": 10,
         "affinity": 0,
-        "total": 95,
+        "total": 100,
         "audience_segment": "primary",
         "reasons": [
             "primary_operator_role",
@@ -122,6 +124,48 @@ def test_relevant_gym_owner_has_exact_approved_score_components():
         ],
         "activity_at": "2026-08-09T10:00:00+00:00",
     }
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("Austin, TX", "usa"),
+        ("California, United States", "usa"),
+        ("New York, NY, USA", "usa"),
+        ("U.S.", "usa"),
+        (None, "unknown"),
+        ("", "unknown"),
+        ("London, UK", "other"),
+    ],
+)
+def test_growth_market_classifies_us_without_excluding_other_locations(
+    location,
+    expected,
+):
+    assert growth_candidate_schema.classify_growth_market(
+        profile(location=location)
+    ) == expected
+
+
+def test_managed_gym_account_reaches_threshold_without_operating_topic_post():
+    candidate_profile = profile(
+        description="Independent strength and conditioning gym",
+        location="London, UK",
+    )
+    latest = post(text="Great work from everyone who trained with us today")
+
+    assert passes_candidate_filters(candidate_profile, latest, NOW) == (
+        True,
+        "accepted",
+    )
+    assert score_growth_candidate(candidate_profile, latest, NOW)["total"] >= 75
+
+
+def test_us_market_is_recorded_for_digest_priority():
+    scored = score_growth_candidate(profile(location="Denver, CO"), post(), NOW)
+
+    assert scored["market_priority"] == 1
+    assert "us_market" in scored["reasons"]
 
 
 def test_score_caps_each_component_and_total_at_approved_maximums():
@@ -144,7 +188,7 @@ def test_score_caps_each_component_and_total_at_approved_maximums():
         "role_bio", "recent_topic_fit", "activity", "market",
         "account_quality", "affinity", "total",
     )} == {
-        "role_bio": 30,
+        "role_bio": 35,
         "recent_topic_fit": 25,
         "activity": 15,
         "market": 15,
@@ -274,6 +318,8 @@ def test_cached_candidate_from_previous_relevance_policy_is_re_evaluated(tmp_pat
         "latest_post": post("899", created_at=activity_at),
         "score": 95,
         "score_data": {
+            "relevance_policy": "managed_fitness_facility_v2",
+            "market_priority": 0,
             "total": 95,
             "audience_segment": "primary",
             "reasons": ["primary_operator_role"],
@@ -308,7 +354,7 @@ def test_cached_candidate_from_previous_relevance_policy_is_re_evaluated(tmp_pat
     assert fake_x.latest_calls == ["old-policy"]
     refreshed = db.get_cached_growth_candidate("old-policy", NOW)
     assert refreshed["score_data"]["relevance_policy"] == (
-        "managed_fitness_facility_v2"
+        "managed_fitness_facility_us_priority_v3"
     )
 
 
@@ -462,7 +508,7 @@ def test_low_score_and_hard_filtered_candidates_are_stored_only_for_audit(tmp_pa
     assert low["score_data"]["filter_reason"] == (
         "no_managed_fitness_facility_context"
     )
-    assert inactive["score"] == 80
+    assert inactive["score"] == 85
     assert inactive["score_data"]["hard_filter_passed"] is False
     assert inactive["score_data"]["filter_reason"] == (
         "no_original_post_within_30_days"
@@ -501,7 +547,8 @@ def test_sqlite_digest_sorts_by_score_then_latest_activity_and_limits_five(tmp_p
             "latest_post": post(str(910 + index), activity.isoformat()),
             "score": score,
             "score_data": {
-                "relevance_policy": "managed_fitness_facility_v2",
+                "relevance_policy": "managed_fitness_facility_us_priority_v3",
+                "market_priority": 0,
                 "total": score,
                 "audience_segment": "primary",
                 "reasons": ["primary_operator_role"],
@@ -520,6 +567,57 @@ def test_sqlite_digest_sorts_by_score_then_latest_activity_and_limits_five(tmp_p
     assert len(rows) == 5
     assert rows[0]["direct_url"] == "https://x.com/owner_0/status/910"
     assert rows[0]["audience_segment"] == "primary"
+
+
+def test_sqlite_digest_prioritizes_us_market_before_global_score(tmp_path):
+    db = Database(str(tmp_path / "us-priority.db"))
+    activity = NOW - timedelta(hours=1)
+    for user_id, username, location, score, market_priority in (
+        ("1001", "global_gym", "London, UK", 95, 0),
+        ("1002", "us_gym", "Austin, TX", 75, 1),
+    ):
+        candidate_profile = profile(
+            user_id,
+            username,
+            location=location,
+        )
+        latest = post(str(9900 + int(user_id)), activity.isoformat())
+        db.upsert_growth_candidate({
+            "user_id": user_id,
+            "username": username,
+            "profile": candidate_profile,
+            "latest_post": latest,
+            "score": score,
+            "score_data": {
+                "relevance_policy": "managed_fitness_facility_us_priority_v3",
+                "market_priority": market_priority,
+                "total": score,
+                "audience_segment": "primary",
+                "reasons": ["primary_operator_role"],
+                "activity_at": activity.isoformat(),
+                "hard_filter_passed": True,
+                "filter_reason": "accepted",
+            },
+            "discovery_source": "topic_search",
+            "profile_expires_at": (NOW + timedelta(days=7)).isoformat(),
+            "last_evaluated_at": NOW.isoformat(),
+        })
+
+    rows = db.get_digest_candidates(limit=5, now=NOW, threshold=75)
+
+    assert [row["user_id"] for row in rows] == ["1002", "1001"]
+
+
+def test_empty_seed_configuration_uses_a_real_us_search_instead_of_network(tmp_path):
+    fake_x = FakeX()
+    growth = discovery(tmp_path, fake_x, seed_accounts=())
+
+    growth.run(NOW)
+
+    source_calls = [call for call in fake_x.calls if call[0] != "followers"]
+    assert len(source_calls) == 3
+    assert {call[0] for call in source_calls} == {"search"}
+    assert any("place_country:US" in call[1] for call in source_calls)
 
 
 def test_source_order_rotates_between_daily_runs_in_sqlite(tmp_path):

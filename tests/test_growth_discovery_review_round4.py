@@ -242,7 +242,8 @@ def test_hard_filter_cache_and_digest_share_canonical_eligibility_matrix(
         "latest_post": latest_post,
         "score": 85,
         "score_data": {
-            "relevance_policy": "managed_fitness_facility_v2",
+            "relevance_policy": "managed_fitness_facility_us_priority_v3",
+            "market_priority": 0,
             "total": 85,
             "audience_segment": "primary",
             "reasons": ["primary_operator_role"],
@@ -293,7 +294,8 @@ def test_whitespace_only_context_is_excluded_from_cache_digest_and_full_run(
         "latest_post": latest_post,
         "score": 85,
         "score_data": {
-            "relevance_policy": "managed_fitness_facility_v2",
+            "relevance_policy": "managed_fitness_facility_us_priority_v3",
+            "market_priority": 0,
             "total": 85,
             "audience_segment": "primary",
             "reasons": ["primary_operator_role"],
@@ -339,7 +341,7 @@ def test_empty_language_from_collector_remains_eligible_end_to_end(tmp_path):
         "accepted",
     )
     assert [row["user_id"] for row in rows] == ["empty-lang-user"]
-    assert rows[0]["score"] == 85
+    assert rows[0]["score"] == 90
     assert database.get_cached_growth_candidate("empty-lang-user", NOW) is not None
     assert [
         row["user_id"] for row in database.get_digest_candidates(now=NOW)

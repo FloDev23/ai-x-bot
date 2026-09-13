@@ -41,7 +41,8 @@ def review_post(post_id="900", created_at=None, **overrides):
 
 def accepted_score(total=95, activity_at=None):
     return {
-        "relevance_policy": "managed_fitness_facility_v2",
+        "relevance_policy": "managed_fitness_facility_us_priority_v3",
+        "market_priority": 0,
         "total": total,
         "audience_segment": "primary",
         "reasons": ["primary_operator_role"],

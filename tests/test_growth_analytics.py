@@ -60,8 +60,9 @@ def latest_post(post_id="900", created_at=None, **overrides):
 
 def accepted_score(total=95, activity_at=None):
     return {
-        "relevance_policy": "managed_fitness_facility_v2",
-        "role_bio": 30,
+        "relevance_policy": "managed_fitness_facility_us_priority_v3",
+        "market_priority": 0,
+        "role_bio": 35,
         "recent_topic_fit": 25,
         "activity": 15,
         "market": 15,

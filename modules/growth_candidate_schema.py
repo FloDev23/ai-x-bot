@@ -7,7 +7,34 @@ from typing import Any, Dict, Optional, Tuple
 
 
 _USERNAME_PATTERN = re.compile(r"[A-Za-z0-9_]{1,15}")
-GROWTH_RELEVANCE_POLICY = "managed_fitness_facility_v2"
+GROWTH_RELEVANCE_POLICY = "managed_fitness_facility_us_priority_v3"
+
+_US_STATE_NAMES = (
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
+    "maine", "maryland", "massachusetts", "michigan", "minnesota",
+    "mississippi", "missouri", "montana", "nebraska", "nevada",
+    "new hampshire", "new jersey", "new mexico", "new york",
+    "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
+    "pennsylvania", "rhode island", "south carolina", "south dakota",
+    "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+    "west virginia", "wisconsin", "wyoming", "district of columbia",
+)
+_US_STATE_CODES = (
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI",
+    "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI",
+    "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC",
+    "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT",
+    "VT", "VA", "WA", "WV", "WI", "WY", "DC",
+)
+_US_LOCATION_PATTERN = re.compile(
+    r"\b(?:united states(?: of america)?|usa)\b|"
+    r"(?<!\w)u\.s(?:\.a)?\.?(?!\w)|"
+    + r"\b(?:" + "|".join(re.escape(name) for name in _US_STATE_NAMES) + r")\b|"
+    + r"(?:,\s*|^)(?:" + "|".join(_US_STATE_CODES) + r")(?:\s+\d{5}(?:-\d{4})?)?\s*$",
+    re.IGNORECASE,
+)
 
 _FACILITY_MANAGEMENT_ROLE_PATTERN = re.compile(
     r"\b(?:co[- ]?(?:owners?|founders?)|owners?|founders?|managers?|operators?|directors?|"
@@ -89,6 +116,18 @@ def is_json_safe_mapping(value: Any) -> bool:
     except (OverflowError, RecursionError, TypeError, ValueError):
         return False
     return True
+
+
+def classify_growth_market(profile: Any) -> str:
+    """Classify a public profile location without excluding global accounts."""
+    if not isinstance(profile, dict):
+        return "unknown"
+    location = profile.get("location")
+    if location is None or (type(location) is str and not location.strip()):
+        return "unknown"
+    if type(location) is not str:
+        return "unknown"
+    return "usa" if _US_LOCATION_PATTERN.search(location.strip()) else "other"
 
 
 def has_managed_fitness_facility_context(profile: Any) -> bool:

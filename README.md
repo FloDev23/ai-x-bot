@@ -42,7 +42,8 @@ automaticamente l'ora legale statunitense. Il processo registra soltanto:
 - controllo dei piani dovuti ogni 5 minuti;
 - digest growth read-only alle 09:00 `Europe/Rome`; se Reply Copilot è attivo,
   le bozze di risposta vengono generate subito dopo dagli stessi risultati già
-  persistiti, senza un altro job o un'altra lettura X;
+  persistiti, senza un altro job; il digest include una lettura della timeline
+  degli account seguiti da `@FlexDropin`;
 - snapshot follower alle 23:15;
 - metriche dei post propri e ricalcolo dei pesi editoriali alle 23:30;
 - report growth Telegram il lunedì alle 09:00.
@@ -103,13 +104,16 @@ raw raggiunge mai Telegram.
 
 Il digest growth arriva alle 09:00 `Europe/Rome` con al massimo 5 account, 10
 post e 5 da rivalutare. Ogni azione di follow, unfollow o like resta manuale su
-X; il bot marca solo la decisione locale in SQLite.
+X; il bot marca solo la decisione locale in SQLite. La discovery dà precedenza
+alle palestre con località USA dichiarata, ma conserva come fallback sia gli
+account senza località sia quelli di altri Paesi.
 
 ## Reply Copilot manuale
 
-Reply Copilot usa esclusivamente i post già salvati dal Growth Digest. Non
-esegue ricerche X aggiuntive e il relativo servizio non riceve `TwitterClient`,
-`Publisher` o credenziali X. Le opzioni sono disabilitate per default:
+Reply Copilot usa esclusivamente i post già salvati dal Growth Digest. Il digest
+legge anche una pagina della timeline degli account seguiti da `@FlexDropin`;
+il servizio Reply Copilot non riceve `TwitterClient`, `Publisher` o credenziali
+X. Le opzioni sono disabilitate per default:
 
 ```dotenv
 ENABLE_REPLY_COPILOT=false
@@ -123,12 +127,16 @@ riservate al massimo cinque risposte in inglese: sui due batch pieni
 consecutivi la ripartizione alterna `4 operator + 1 end_user` e
 `3 operator + 2 end_user`, ottenendo il mix 70/30. Ogni fonte deve avere al
 massimo 48 ore. Il primo tentativo AI è automatico; l'operatore può richiedere
-al massimo due rigenerazioni.
+al massimo due rigenerazioni. In un batch entrano al massimo due post provenienti
+da account seguiti, lasciando spazio anche alla discovery esterna.
 
-Il guard deterministico accetta solo testo di 30–256 caratteri e rifiuta brand,
+Le risposte normali restano value-first e il guard deterministico rifiuta brand,
 link, email, hashtag, menzioni, call to action, prompt injection e consigli ad
-alto rischio. La risposta deve essere pertinente al post e utile di per sé,
-senza invitare al sito o all'app.
+alto rischio. Se il post dichiara esplicitamente capacità inutilizzata, problemi
+di prenotazione o la volontà di vendere lezioni singole, fino a tre risposte al
+giorno possono proporre FlexDropin. Questi testi sono deterministici e dichiarano
+sia l'attivazione partner gratuita sia la commissione del 15% sulle prenotazioni
+effettuate tramite l'app.
 
 Il flusso operatore è:
 

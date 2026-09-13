@@ -18,6 +18,7 @@ from config import (
 from modules.growth_candidate_schema import (
     GROWTH_RELEVANCE_POLICY,
     as_utc,
+    classify_growth_market,
     evaluate_growth_candidate_filters,
     has_managed_fitness_facility_context,
     is_canonical_growth_latest_post,
@@ -35,7 +36,7 @@ DEFAULT_TOPIC_QUERIES = (
     '"climbing gym" OR "dojo") '
     '(booking OR schedule OR "class management" OR "drop-in" OR "day pass" OR '
     '"no-show" OR waitlist OR software OR app OR capacity) '
-    'lang:en -is:retweet',
+    'lang:en place_country:US -is:retweet',
     '(CrossFit OR HYROX OR ATHX OR Pilates OR Yoga OR Boxing OR BJJ OR '
     '"Muay Thai" OR Karate OR MMA OR Spinning OR Barre OR Calisthenics OR '
     '"Functional Training" OR HIIT OR Bootcamp OR Climbing OR Swimming OR '
@@ -43,6 +44,12 @@ DEFAULT_TOPIC_QUERIES = (
     '(studio OR gym OR box OR "training center" OR "fitness center" OR dojo) '
     '(owner OR founder OR manager OR operator OR "head coach") '
     'lang:en -is:retweet',
+)
+_NO_SEED_US_FACILITY_QUERY = (
+    '("our gym" OR "our fitness studio" OR "our CrossFit box" OR '
+    '"our pilates studio" OR "our yoga studio") '
+    '(classes OR members OR membership OR schedule OR "drop-in" OR "day pass") '
+    'lang:en place_country:US -is:retweet'
 )
 _OPERATING_TOPIC_TERMS = (
     "class",
@@ -100,7 +107,7 @@ def score_growth_candidate(
 
     if has_managed_fitness_facility_context(profile):
         segment = "primary"
-        role_bio = 30
+        role_bio = 35
         reasons.append("primary_operator_role")
     else:
         segment = "end_user"
@@ -154,8 +161,12 @@ def score_growth_candidate(
     if affinity:
         reasons.append("direct_drop_in_affinity")
 
+    market_priority = int(classify_growth_market(profile) == "usa")
+    if market_priority:
+        reasons.append("us_market")
+
     components = {
-        "role_bio": min(role_bio, 30),
+        "role_bio": min(role_bio, 35),
         "recent_topic_fit": min(recent_topic_fit, 25),
         "activity": min(activity, 15),
         "market": min(market, 15),
@@ -165,6 +176,7 @@ def score_growth_candidate(
     total = min(sum(components.values()), 100)
     return {
         "relevance_policy": GROWTH_RELEVANCE_POLICY,
+        "market_priority": market_priority,
         **components,
         "total": total,
         "audience_segment": segment,
@@ -244,7 +256,20 @@ class GrowthDiscovery:
                 f"topic_search:{self.topic_queries[1]}",
                 lambda: self.x.search_recent_authors(self.topic_queries[1]),
             ),
-            ("network", lambda: self.x.get_network_candidates(self.seed_accounts)),
+            (
+                "network" if self.seed_accounts else (
+                    f"topic_search:{_NO_SEED_US_FACILITY_QUERY}"
+                ),
+                (
+                    (lambda: self.x.get_network_candidates(self.seed_accounts))
+                    if self.seed_accounts
+                    else (
+                        lambda: self.x.search_recent_authors(
+                            _NO_SEED_US_FACILITY_QUERY
+                        )
+                    )
+                ),
+            ),
         ]
         results = []
         while True:

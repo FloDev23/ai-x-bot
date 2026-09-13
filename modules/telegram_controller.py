@@ -1008,17 +1008,33 @@ class TelegramController:
         reply_id = row["id"]
         revision = row["revision"]
         status = self._clean_text(row.get("status"), 40) or "sconosciuto"
+        source_kind = row.get("source_kind", "discovery")
+        reply_kind = row.get("reply_kind", "value")
+        source_label = (
+            "account seguito da @FlexDropin"
+            if source_kind == "following"
+            else "scoperta Growth"
+        )
+        reply_label = (
+            "promozionale contestuale"
+            if reply_kind != "value"
+            else "di valore"
+        )
         text_lines = [
             f"Post di @{self._clean_text(row.get('author_username'), 15)}",
             f"Estratto: {self._clean_text(row.get('source_excerpt'), 500)}",
+            f"Fonte: {source_label}",
             f"Segmento: {self._clean_text(row.get('audience_segment'), 20)}",
+            f"Tipo: {reply_label}",
             f"Rilevanza: {row.get('relevance_score')}",
             f"Stato: {status}",
         ]
         reply = row.get("reply_text")
         rows = []
         if status == "ready" and isinstance(reply, str):
-            intent = build_reply_web_intent(row.get("tweet_id"), reply)
+            intent = build_reply_web_intent(
+                row.get("tweet_id"), reply, reply_kind=reply_kind,
+            )
             text_lines.extend([
                 "",
                 "Risposta suggerita:",
@@ -1034,7 +1050,7 @@ class TelegramController:
                     {"text": "Rispondi su X", "url": intent},
                 ])
             actions = []
-            if row.get("generation_count", 3) < 3:
+            if reply_kind == "value" and row.get("generation_count", 3) < 3:
                 actions.append(self._callback_button(
                     "Rigenera", f"rpa:g:{token}:{reply_id}:{revision}",
                 ))
@@ -1050,7 +1066,7 @@ class TelegramController:
             rows.append(actions)
         elif status == "generation_failed":
             text_lines.append("Generazione non riuscita: puoi riprovare manualmente.")
-            if row.get("generation_count", 3) < 3:
+            if reply_kind == "value" and row.get("generation_count", 3) < 3:
                 rows.append([self._callback_button(
                     "Rigenera", f"rpa:g:{token}:{reply_id}:{revision}",
                 )])

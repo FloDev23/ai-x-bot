@@ -764,6 +764,72 @@ class TwitterClient:
         result = self.read_relevant_posts(query, limit)
         return list(result.posts) if result.complete is True else []
 
+    def read_following_timeline(self, limit: int = 25) -> RelevantPostsRead:
+        """Read one bounded page of original posts from accounts we follow."""
+        if type(limit) is not int or limit <= 0:
+            return RelevantPostsRead((), False)
+        requested = min(limit, 100)
+        params = {
+            "max_results": requested,
+            "exclude": ["retweets", "replies"],
+            "tweet_fields": [
+                "id", "text", "author_id", "created_at", "lang",
+                "public_metrics", "referenced_tweets", "entities",
+            ],
+            "expansions": ["author_id"],
+            "user_fields": [
+                "id", "username", "protected", "public_metrics",
+            ],
+            "user_auth": True,
+        }
+        try:
+            response = self._metered_read(
+                "owned_read",
+                requested,
+                lambda: self._client.get_home_timeline(**params),
+            )
+            response_rows = getattr(response, "data", None)
+            includes = getattr(response, "includes", None)
+            metadata = getattr(response, "meta", None)
+            if (
+                response_rows is None
+                and isinstance(metadata, Mapping)
+                and metadata.get("result_count") == 0
+            ):
+                response_rows = []
+            if not isinstance(response_rows, (list, tuple)):
+                raise ValueError("malformed following timeline page")
+            if includes is None and not response_rows:
+                includes = {}
+            if not isinstance(includes, Mapping):
+                raise ValueError("incomplete following timeline includes")
+            users = includes.get("users")
+            if users is None and not response_rows:
+                users = []
+            if not isinstance(users, (list, tuple)):
+                raise ValueError("incomplete following timeline authors")
+            authors = {}
+            for user in users:
+                normalized = self._relevant_author_dict(user)
+                if normalized is not None:
+                    authors[normalized["id"]] = normalized
+            now = datetime.now(timezone.utc)
+            rows = []
+            seen_ids = set()
+            for tweet in response_rows:
+                normalized = self._relevant_post_dict(tweet, authors, now)
+                if normalized is None or normalized["id"] in seen_ids:
+                    continue
+                seen_ids.add(normalized["id"])
+                rows.append(normalized)
+            return RelevantPostsRead(tuple(rows), True)
+        except Exception as error:
+            logger.warning(
+                "x_following_timeline_read_failed error_type=%s",
+                type(error).__name__,
+            )
+            return RelevantPostsRead((), False)
+
     def get_authenticated_user_id_cached(self) -> Optional[str]:
         """Wrapper con cache in memoria per evitare letture ripetute inutili"""
         if not hasattr(self, '_cached_self_id'):

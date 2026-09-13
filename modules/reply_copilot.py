@@ -60,6 +60,34 @@ _HIGH_RISK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _TWEET_ID_PATTERN = re.compile(r"[1-9][0-9]{0,19}")
+_REPLY_KINDS = frozenset({
+    "value",
+    "promotion_capacity",
+    "promotion_booking",
+    "promotion_single_class",
+})
+_SINGLE_CLASS_COMMERCIAL_PATTERN = re.compile(
+    r"\b(?:sell|selling|offer|offering|promote|list|monetize|monetise|"
+    r"fill)\b.{0,80}\b(?:single|individual|drop[ -]?in|day pass|"
+    r"class(?:es)?|spots?)\b",
+    re.IGNORECASE,
+)
+_PROMOTIONAL_REPLIES = {
+    "promotion_capacity": (
+        "If you want to sell those spare class spots, FlexDropin offers free "
+        "partner activation; a 15% commission applies to bookings made through the app."
+    ),
+    "promotion_booking": (
+        "If single-class bookings are taking too much admin, FlexDropin offers "
+        "free partner activation; a 15% commission applies to app bookings."
+    ),
+    "promotion_single_class": (
+        "If you want to sell individual classes, FlexDropin offers free partner "
+        "activation; a 15% commission applies to bookings made through the app."
+    ),
+}
+_MAX_FOLLOWING_REPLIES = 2
+_MAX_PROMOTIONAL_REPLIES = 3
 
 
 def classify_reply_segment(reason_codes: object) -> Optional[str]:
@@ -77,9 +105,39 @@ def classify_reply_segment(reason_codes: object) -> Optional[str]:
     return None
 
 
-def normalize_and_validate_reply(value: object) -> Optional[str]:
+def classify_reply_kind(reason_codes: object, source_excerpt: object) -> str:
+    """Choose a promotion only for an explicit operator-side product fit."""
+    if (
+        not isinstance(reason_codes, (list, tuple, set, frozenset))
+        or not isinstance(source_excerpt, str)
+    ):
+        return "value"
+    reasons = {reason for reason in reason_codes if isinstance(reason, str)}
+    if "empty_capacity" in reasons:
+        return "promotion_capacity"
+    if "booking_problem" in reasons:
+        return "promotion_booking"
+    if (
+        "gym_owner" in reasons
+        and reasons & {"drop_in", "day_pass_model"}
+        and _SINGLE_CLASS_COMMERCIAL_PATTERN.search(source_excerpt)
+    ):
+        return "promotion_single_class"
+    return "value"
+
+
+def build_promotional_reply(reply_kind: object) -> Optional[str]:
+    """Return one exact, verified product statement for a qualified context."""
+    return _PROMOTIONAL_REPLIES.get(reply_kind)
+
+
+def normalize_and_validate_reply(
+    value: object,
+    *,
+    reply_kind: str = "value",
+) -> Optional[str]:
     """Return normalized safe reply copy, or ``None`` when it fails closed."""
-    if not isinstance(value, str):
+    if not isinstance(value, str) or reply_kind not in _REPLY_KINDS:
         return None
     try:
         if any(unicodedata.category(character).startswith("C") for character in value):
@@ -96,20 +154,30 @@ def normalize_and_validate_reply(value: object) -> Optional[str]:
         _EMAIL_PATTERN,
         _HASHTAG_PATTERN,
         _MENTION_PATTERN,
-        _BRAND_PATTERN,
-        _PROMOTION_PATTERN,
         _PROMPT_INJECTION_PATTERN,
         _HIGH_RISK_PATTERN,
     )):
         return None
+    if reply_kind == "value" and any(pattern.search(normalized) for pattern in (
+        _BRAND_PATTERN,
+        _PROMOTION_PATTERN,
+    )):
+        return None
+    if reply_kind != "value" and normalized != build_promotional_reply(reply_kind):
+        return None
     return normalized
 
 
-def build_reply_web_intent(tweet_id: object, reply_text: object) -> Optional[str]:
+def build_reply_web_intent(
+    tweet_id: object,
+    reply_text: object,
+    *,
+    reply_kind: str = "value",
+) -> Optional[str]:
     """Build a manual X composer URL without using X API credentials."""
     if not isinstance(tweet_id, str) or _TWEET_ID_PATTERN.fullmatch(tweet_id) is None:
         return None
-    reply = normalize_and_validate_reply(reply_text)
+    reply = normalize_and_validate_reply(reply_text, reply_kind=reply_kind)
     if reply is None:
         return None
     return "https://x.com/intent/tweet?" + urlencode({
@@ -259,6 +327,12 @@ class ReplyCopilotService:
                 "source_excerpt": excerpt,
                 "audience_segment": segment,
                 "relevance_score": score,
+                "source_kind": (
+                    "following"
+                    if "followed_account" in reason_codes
+                    else "discovery"
+                ),
+                "_promotion_kind": classify_reply_kind(reason_codes, excerpt),
                 "_created_at": created_at,
             })
         ranked.sort(key=lambda item: (
@@ -296,6 +370,9 @@ class ReplyCopilotService:
         existing_end_user = sum(
             row.get("audience_segment") == "end_user" for row in existing
         )
+        following_count = sum(
+            row.get("source_kind") == "following" for row in existing
+        )
         operator_need = max(0, operator_target - existing_operator)
         end_user_need = max(0, end_user_target - existing_end_user)
         operators = [
@@ -304,16 +381,52 @@ class ReplyCopilotService:
         end_users = [
             item for item in available if item["audience_segment"] == "end_user"
         ]
-        selected = operators[:operator_need] + end_users[:end_user_need]
-        selected_ids = {item["growth_suggestion_id"] for item in selected}
-        selected.extend(
-            item for item in available
-            if item["growth_suggestion_id"] not in selected_ids
+        selected = []
+        selected_ids = set()
+
+        def append_from(items: List[Dict], limit: int) -> None:
+            nonlocal following_count
+            added = 0
+            for item in items:
+                if added >= limit or len(selected) >= remaining:
+                    break
+                suggestion_id = item["growth_suggestion_id"]
+                if suggestion_id in selected_ids:
+                    continue
+                if (
+                    item["source_kind"] == "following"
+                    and following_count >= _MAX_FOLLOWING_REPLIES
+                ):
+                    continue
+                selected.append(item)
+                selected_ids.add(suggestion_id)
+                added += 1
+                if item["source_kind"] == "following":
+                    following_count += 1
+
+        append_from(operators, operator_need)
+        append_from(end_users, end_user_need)
+        append_from(available, remaining - len(selected))
+        selected.sort(key=lambda item: item["_rank"])
+
+        promotional_count = sum(
+            row.get("reply_kind", "value") != "value" for row in existing
         )
-        selected = sorted(selected[:remaining], key=lambda item: item["_rank"])
-        return [{
-            key: value for key, value in item.items() if not key.startswith("_")
-        } for item in selected]
+        result = []
+        for item in selected:
+            reply_kind = "value"
+            if (
+                item["_promotion_kind"] != "value"
+                and promotional_count < _MAX_PROMOTIONAL_REPLIES
+            ):
+                reply_kind = item["_promotion_kind"]
+                promotional_count += 1
+            result.append({
+                key: value
+                for key, value in item.items()
+                if not key.startswith("_")
+            } | {"reply_kind": reply_kind})
+        return result
 
     def _generate_row(
         self,
@@ -339,7 +452,12 @@ class ReplyCopilotService:
         if claim is None:
             return self.db.get_reply_suggestion(row.get("id")), "rejected"
         try:
-            generated = self.generator.generate_value_reply(claim.source_excerpt)
+            if claim.reply_kind == "value":
+                generated = self.generator.generate_value_reply(
+                    claim.source_excerpt,
+                )
+            else:
+                generated = build_promotional_reply(claim.reply_kind)
         except Exception as error:
             logger.warning(
                 "reply_generation_failed reply_id=%s error_type=%s",
@@ -352,7 +470,9 @@ class ReplyCopilotService:
                 self.db.get_reply_suggestion(claim.reply_id),
                 "failed" if completed else "rejected",
             )
-        reply = normalize_and_validate_reply(generated)
+        reply = normalize_and_validate_reply(
+            generated, reply_kind=claim.reply_kind,
+        )
         if reply is None:
             completed = self.db.fail_reply_generation(
                 claim, "invalid_output", current,

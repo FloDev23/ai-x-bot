@@ -9,6 +9,7 @@ from tests.test_reply_copilot import (
     NOW,
     QueueReplyGenerator,
     SAFE_REPLY,
+    _seed_custom_growth_posts,
     _seed_growth_posts,
 )
 
@@ -92,6 +93,29 @@ def test_replies_command_builds_manual_card_with_copy_and_web_intent(tmp_path):
     assert "callback_data" not in buttons["Rispondi su X"]
     row = database.list_reply_suggestions("2026-09-03")[0]
     assert row["status"] == "ready"
+
+
+def test_promotional_following_card_explains_source_and_has_no_regenerate(tmp_path):
+    database = Database(str(tmp_path / "reply-promotional-card.db"))
+    _seed_custom_growth_posts(database, [{
+        "reasons": ["gym_owner", "empty_capacity", "followed_account"],
+        "excerpt": "Our gym has empty spots in tomorrow's class.",
+        "score": 99,
+    }])
+    controller, _db, telegram, _service, generator, _notifier = _controller(
+        tmp_path, count=0, database=database,
+    )
+
+    assert controller.process_update(_message_update(20, "/replies")) == "processed"
+
+    assert generator.calls == []
+    card = telegram.messages[1]
+    assert "Fonte: account seguito da @FlexDropin" in card[1]
+    assert "Tipo: promozionale contestuale" in card[1]
+    buttons = {button["text"]: button for button in _buttons(card)}
+    assert "Rigenera" not in buttons
+    intent = urlparse(buttons["Rispondi su X"]["url"])
+    assert "FlexDropin" in parse_qs(intent.query)["text"][0]
 
 
 def test_replies_command_without_persisted_digest_never_generates(tmp_path):

@@ -108,6 +108,35 @@ def test_relevant_post_read_requests_exact_fields_and_returns_closed_projection(
     assert json.loads(json.dumps(rows, allow_nan=False)) == rows
 
 
+def test_following_timeline_read_uses_one_owned_read_and_closed_projection():
+    class Backend:
+        def __init__(self):
+            self.calls = []
+
+        def get_home_timeline(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                data=[_post()], includes={"users": [_author()]}, meta={}
+            )
+
+    backend = Backend()
+    result = _client(backend).read_following_timeline(limit=25)
+
+    assert result.complete is True
+    assert [row["id"] for row in result.posts] == ["9001"]
+    assert backend.calls == [{
+        "max_results": 25,
+        "exclude": ["retweets", "replies"],
+        "tweet_fields": [
+            "id", "text", "author_id", "created_at", "lang",
+            "public_metrics", "referenced_tweets", "entities",
+        ],
+        "expansions": ["author_id"],
+        "user_fields": ["id", "username", "protected", "public_metrics"],
+        "user_auth": True,
+    }]
+
+
 def test_relevant_post_read_isolates_malformed_and_unsafe_records():
     now = datetime.now(timezone.utc)
     invalid = [
@@ -802,7 +831,8 @@ def test_reevaluation_requires_complete_absent_snapshot_after_fourteen_days(tmp_
         },
         "score": 90,
         "score_data": {
-            "relevance_policy": "managed_fitness_facility_v2",
+            "relevance_policy": "managed_fitness_facility_us_priority_v3",
+            "market_priority": 0,
             "total": 90, "audience_segment": "primary",
             "reasons": ["primary_operator_role"],
             "activity_at": (NOW - timedelta(days=1)).isoformat(),
@@ -856,7 +886,8 @@ def test_reevaluation_accepts_older_complete_snapshot_after_accounts_own_boundar
         },
         "score": 90,
         "score_data": {
-            "relevance_policy": "managed_fitness_facility_v2",
+            "relevance_policy": "managed_fitness_facility_us_priority_v3",
+            "market_priority": 0,
             "total": 90, "audience_segment": "primary",
             "reasons": ["primary_operator_role"],
             "activity_at": (NOW - timedelta(days=1)).isoformat(),
@@ -951,16 +982,23 @@ class DigestDiscovery:
 
 
 class DigestX:
-    def __init__(self, pages=None, complete=True):
+    def __init__(self, pages=None, complete=True, following_rows=None):
         self.pages = pages or {}
         self.complete = complete
+        self.following_rows = list(following_rows or [])
         self.queries = []
+        self.following_reads = 0
         self.engagement_writes = []
 
     def read_relevant_posts(self, query, limit=25):
         self.queries.append((query, limit))
         rows = self.pages.get(len(self.queries) - 1, [])
         return RelevantPostsRead(tuple(rows), self.complete)
+
+    def read_following_timeline(self, limit=25):
+        assert limit == 25
+        self.following_reads += 1
+        return RelevantPostsRead(tuple(self.following_rows), self.complete)
 
 
 def test_service_builds_closed_ranked_daily_digest_with_fixed_read_budget(tmp_path):
@@ -994,6 +1032,43 @@ def test_service_builds_closed_ranked_daily_digest_with_fixed_read_budget(tmp_pa
     assert "source body" not in serialized
     assert "generic fitness motivation" not in serialized
     assert x_client.engagement_writes == []
+
+
+def test_service_includes_relevant_posts_from_accounts_followed_on_x(tmp_path):
+    followed = _normalized_post(
+        "9090",
+        "Our gym has spare class spots available for drop-in bookings.",
+        author_username="followedgym",
+    )
+    x_client = DigestX({0: [], 1: []}, following_rows=[followed])
+
+    digest = GrowthDigestService(
+        x_client,
+        Database(str(tmp_path / "following-posts.db")),
+        discovery=DigestDiscovery([]),
+    ).build(NOW)
+
+    assert x_client.following_reads == 1
+    assert [row["object_id"] for row in digest["posts"]] == ["9090"]
+    assert "followed_account" in digest["posts"][0]["reason_codes"]
+
+
+def test_duplicate_search_post_keeps_followed_account_provenance(tmp_path):
+    shared = _normalized_post(
+        "9091",
+        "Our gym has spare class spots available for drop-in bookings.",
+        author_username="followedgym",
+    )
+    x_client = DigestX({0: [shared], 1: []}, following_rows=[shared])
+
+    digest = GrowthDigestService(
+        x_client,
+        Database(str(tmp_path / "duplicate-following-post.db")),
+        discovery=DigestDiscovery([]),
+    ).build(NOW)
+
+    assert [row["object_id"] for row in digest["posts"]] == ["9091"]
+    assert "followed_account" in digest["posts"][0]["reason_codes"]
 
 
 def test_fitness_business_operations_are_relevant_without_a_second_topic():
@@ -1264,7 +1339,7 @@ def test_two_processes_share_one_completed_digest_and_exact_rows(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM growth_read_claims "
             "WHERE substr(query_key, 1, 2) != '__' AND state = 'completed'"
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == 3
 
 
 def test_hard_crash_before_commit_recovers_only_after_lease_expiry(tmp_path):
@@ -1287,7 +1362,7 @@ def test_hard_crash_before_commit_recovers_only_after_lease_expiry(tmp_path):
     with Database(path)._conn() as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM growth_read_claims WHERE state = 'completed'"
-        ).fetchone()[0] == 3
+        ).fetchone()[0] == 4
 
 
 def test_hard_crash_after_commit_replays_without_any_read(tmp_path):
