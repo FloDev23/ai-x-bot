@@ -8,3 +8,5 @@ __pycache__/
 venv/
 media_library/
 .worktrees/
+backups/
+bot_data.db.bak-*

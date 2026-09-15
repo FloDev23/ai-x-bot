@@ -46,7 +46,7 @@ def _database_integrity(db_path):
     return "ok"
 
 
-def run_preflight(*, require_dry_run, db_path):
+def run_preflight(*, require_dry_run, db_path, allow_live=False):
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             config.validate_config()
@@ -55,7 +55,11 @@ def run_preflight(*, require_dry_run, db_path):
 
     if config.APPROVAL_REQUIRED is not True:
         _fail("approval_required")
-    if require_dry_run is not True or config.DRY_RUN is not True:
+    live_mode = allow_live is True and require_dry_run is not True
+    if live_mode:
+        if type(config.DRY_RUN) is not bool:
+            _fail("invalid_dry_run")
+    elif require_dry_run is not True or config.DRY_RUN is not True:
         _fail("persistent_dry_run_required")
 
     integrity = _database_integrity(db_path)
@@ -67,7 +71,7 @@ def run_preflight(*, require_dry_run, db_path):
         "approval_required": True,
         "config_valid": True,
         "database_integrity": integrity,
-        "dry_run": True,
+        "dry_run": config.DRY_RUN,
         "news_key_present": bool(
             isinstance(config.NEWSAPI_KEY, str) and config.NEWSAPI_KEY.strip()
         ),
@@ -77,7 +81,9 @@ def run_preflight(*, require_dry_run, db_path):
 
 def _parser():
     parser = argparse.ArgumentParser(add_help=True, exit_on_error=False)
-    parser.add_argument("--require-dry-run", action="store_true", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--require-dry-run", action="store_true")
+    mode.add_argument("--allow-live", action="store_true")
     parser.add_argument("--db-path", required=True)
     return parser
 
@@ -100,6 +106,7 @@ def run_cli(argv=None):
     try:
         result = run_preflight(
             require_dry_run=arguments.require_dry_run,
+            allow_live=arguments.allow_live,
             db_path=arguments.db_path,
         )
     except ProductionPreflightError as error:

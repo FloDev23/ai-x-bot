@@ -198,7 +198,9 @@ venv/bin/python scripts/preflight_production.py \
   --db-path ./bot_data.db
 ```
 
-Il comando restituisce soltanto stato di configurazione, booleani, conteggio domini e integrità del database. Non stampa credenziali. `./deploy.sh` esegue lo stesso controllo automaticamente prima di toccare i servizi e si ferma se non passa.
+Il comando restituisce soltanto stato di configurazione, booleani, conteggio domini e integrità del database. Non stampa credenziali. Dopo l'attivazione live usare `--allow-live` al posto di `--require-dry-run`: accetta `DRY_RUN=true` o `false`, ma richiede sempre `APPROVAL_REQUIRED=true`, configurazione valida e database integro.
+
+`./deploy.sh` funziona in entrambe le modalità. Ignora i file non tracciati, salva database e `.env` in `backups/` (ultimi 10), esegue `git pull --ff-only`, lancia il preflight con `--allow-live` prima di toccare i servizi e, dopo il riavvio, si ferma se nei log del bot compare un `Traceback`. In caso di errore stampa il comando per tornare alla versione precedente. Con `DRY_RUN=false` mostra l'avviso `LIVE`.
 
 ## 8. Esecuzione persistente
 

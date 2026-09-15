@@ -179,7 +179,7 @@ def test_deploy_runs_preflight_before_any_service_restart():
     preflight = deploy.index("scripts/preflight_production.py")
     first_restart = deploy.index('systemctl restart "$BOT_SERVICE"')
     assert preflight < first_restart
-    assert "--require-dry-run" in deploy
+    assert "--allow-live" in deploy
     assert "cat .env" not in deploy
     assert "printenv" not in deploy
 
@@ -199,3 +199,93 @@ def test_preflight_script_is_importable_when_invoked_by_path():
 
     assert result.returncode == 0
     assert "ModuleNotFoundError" not in result.stderr
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_live_preflight_accepts_either_canonical_dry_run_value(
+    tmp_path, monkeypatch, dry_run,
+):
+    database_path = tmp_path / "bot_data.db"
+    _database(database_path)
+    _valid_config(monkeypatch, dry_run=dry_run)
+
+    result = preflight_production.run_preflight(
+        require_dry_run=False,
+        allow_live=True,
+        db_path=database_path,
+    )
+
+    assert result["dry_run"] is dry_run
+    assert result["approval_required"] is True
+    assert result["database_integrity"] == "ok"
+
+
+@pytest.mark.parametrize(
+    ("dry_run", "approval_required", "expected"),
+    [
+        ("false", True, "invalid_dry_run"),
+        (None, True, "invalid_dry_run"),
+        (False, False, "approval_required"),
+    ],
+)
+def test_live_preflight_still_fails_closed(
+    tmp_path, monkeypatch, dry_run, approval_required, expected,
+):
+    database_path = tmp_path / "bot_data.db"
+    _database(database_path)
+    _valid_config(
+        monkeypatch, dry_run=dry_run, approval_required=approval_required,
+    )
+
+    with pytest.raises(preflight_production.ProductionPreflightError) as error:
+        preflight_production.run_preflight(
+            require_dry_run=False,
+            allow_live=True,
+            db_path=database_path,
+        )
+
+    assert error.value.code == expected
+
+
+def test_preflight_requires_exactly_one_mode(tmp_path, monkeypatch):
+    database_path = tmp_path / "bot_data.db"
+    _database(database_path)
+    _valid_config(monkeypatch)
+
+    with pytest.raises(preflight_production.ProductionPreflightError) as error:
+        preflight_production.run_preflight(
+            require_dry_run=False,
+            allow_live=False,
+            db_path=database_path,
+        )
+    assert error.value.code == "persistent_dry_run_required"
+
+    for argv in (
+        ["--db-path", str(database_path)],
+        ["--require-dry-run", "--allow-live", "--db-path", str(database_path)],
+    ):
+        assert preflight_production.run_cli(argv) == 2
+
+
+def test_cli_live_mode_reports_real_dry_run_value(tmp_path, monkeypatch, capsys):
+    database_path = tmp_path / "bot_data.db"
+    _database(database_path)
+    _valid_config(monkeypatch, dry_run=False)
+
+    code = preflight_production.run_cli(
+        ["--allow-live", "--db-path", str(database_path)]
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["dry_run"] is False
+
+
+def test_deploy_backs_up_before_pull_and_ignores_untracked_files():
+    deploy = (REPOSITORY_ROOT / "deploy.sh").read_text(encoding="utf-8")
+
+    assert "--untracked-files=no" in deploy
+    assert "--ff-only" in deploy
+    backup = deploy.index(".backup(")
+    pull = deploy.index("git pull --ff-only origin")
+    assert backup < pull
+    assert "Traceback" in deploy

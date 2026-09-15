@@ -144,9 +144,10 @@ coda bilingue → approvazione Telegram → riserva da 14 → due/tre piani ET �
 simulazioni, incluso un riavvio senza duplicati, `/newpost` e zero scritture
 X/engagement.
 
-Prima di ogni riavvio sul VPS, `deploy.sh` esegue un preflight in sola lettura
-che richiede `APPROVAL_REQUIRED=true`, `DRY_RUN=true`, configurazione valida e
-`PRAGMA integrity_check=ok`. Il passaggio alla pubblicazione automatica reale è
+Prima di ogni riavvio sul VPS, `deploy.sh` salva database e `.env` in
+`backups/` ed esegue un preflight in sola lettura che richiede
+`APPROVAL_REQUIRED=true`, configurazione valida e `PRAGMA integrity_check=ok`,
+sia in dry-run sia in modalità live. Il passaggio alla pubblicazione automatica reale è
 una fase separata: richiede due giornate USA simulate, una riserva di 14 post,
 `/errors` pulito e una nuova autorizzazione esplicita prima di cambiare
 `DRY_RUN`. La procedura completa è in [SETUP.md](SETUP.md).
