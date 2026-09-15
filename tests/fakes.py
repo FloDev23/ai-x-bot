@@ -125,6 +125,7 @@ class FakeXClient:
         self.posts = []
         self.engagement_writes = []
         self.followers = []
+        self.following = []
         self.read_calls = []
         self.write_calls = []
 
@@ -152,6 +153,10 @@ class FakeXClient:
     def read_followers_profiles(self):
         self.read_calls.append(("read_followers_profiles",))
         return SimpleNamespace(profiles=list(self.followers), complete=True)
+
+    def read_following_profiles(self):
+        self.read_calls.append(("read_following_profiles",))
+        return SimpleNamespace(profiles=list(self.following), complete=True)
 
     def search_recent_authors(self, _query):
         self.read_calls.append(("search_recent_authors", _query))

@@ -914,8 +914,8 @@ class TwitterClient:
             "public_metrics",
         ]
 
-    def read_followers_profiles(self) -> FollowerProfilesRead:
-        """Read one full follower traversal with an explicit completion bit."""
+    def _read_owned_user_graph(self, label: str, request) -> FollowerProfilesRead:
+        """Read one full owned follower/following traversal with a completion bit."""
         self_id = self.get_authenticated_user_id_cached()
         if not self_id:
             return FollowerProfilesRead((), False)
@@ -939,21 +939,23 @@ class TwitterClient:
                 response = self._metered_read(
                     "owned_read",
                     params["max_results"],
-                    lambda: self._client.get_users_followers(**params),
+                    lambda: request(params),
                 )
             except Exception as error:
                 logger.warning(
-                    "x_growth_followers_read_failed error_type=%s",
+                    "x_growth_%s_read_failed error_type=%s",
+                    label,
                     type(error).__name__,
                 )
                 return FollowerProfilesRead(tuple(profiles), False)
             try:
                 response_users = getattr(response, "data", None)
                 if not isinstance(response_users, (list, tuple)):
-                    raise ValueError("malformed follower page data")
+                    raise ValueError(f"malformed {label} page data")
             except Exception as error:
                 logger.warning(
-                    "x_growth_followers_page_skipped error_type=%s",
+                    "x_growth_%s_page_skipped error_type=%s",
+                    label,
                     type(error).__name__,
                 )
                 return FollowerProfilesRead(tuple(profiles), False)
@@ -962,7 +964,8 @@ class TwitterClient:
                     profile = self._profile_dict(user)
                 except Exception as error:
                     logger.warning(
-                        "x_growth_follower_record_skipped error_type=%s",
+                        "x_growth_%s_record_skipped error_type=%s",
+                        label,
                         type(error).__name__,
                     )
                     continue
@@ -973,11 +976,12 @@ class TwitterClient:
             try:
                 meta = getattr(response, "meta", None)
                 if not isinstance(meta, Mapping):
-                    raise ValueError("malformed follower page metadata")
+                    raise ValueError(f"malformed {label} page metadata")
                 next_token = meta.get("next_token")
             except Exception as error:
                 logger.warning(
-                    "x_growth_followers_page_skipped error_type=%s",
+                    "x_growth_%s_page_skipped error_type=%s",
+                    label,
                     type(error).__name__,
                 )
                 return FollowerProfilesRead(tuple(profiles), False)
@@ -987,6 +991,20 @@ class TwitterClient:
                 return FollowerProfilesRead(tuple(profiles), False)
             pagination_token = next_token
         return FollowerProfilesRead(tuple(profiles), False)
+
+    def read_followers_profiles(self) -> FollowerProfilesRead:
+        """Read one full follower traversal with an explicit completion bit."""
+        return self._read_owned_user_graph(
+            "followers",
+            lambda params: self._client.get_users_followers(**params),
+        )
+
+    def read_following_profiles(self) -> FollowerProfilesRead:
+        """Read the complete list of accounts @FlexDropin follows."""
+        return self._read_owned_user_graph(
+            "following",
+            lambda params: self._client.get_users_following(**params),
+        )
 
     def get_followers_profiles(self) -> List[Dict]:
         """Legacy Task 10 boundary: retain valid rows from a partial traversal."""
@@ -1103,13 +1121,23 @@ class TwitterClient:
             or type(lang) is not str
         ):
             return None
-        return {
+        result = {
             "id": normalized_id,
             "text": text,
             "created_at": created_at,
             "lang": lang,
             "is_original": True,
         }
+        metrics = self._bounded_metrics(
+            getattr(latest, "public_metrics", None),
+            (
+                "like_count", "retweet_count", "reply_count", "quote_count",
+                "impression_count",
+            ),
+        )
+        if metrics is not None:
+            result["public_metrics"] = metrics
+        return result
 
     def get_user_info(self, username: str) -> Optional[Dict]:
         """
