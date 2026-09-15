@@ -135,6 +135,7 @@ _GROWTH_ACCOUNT_REASONS = frozenset({
     "plausible_public_metrics", "direct_drop_in_affinity",
     "us_market",
     "no_follow_back_after_14_days",
+    "no_follow_back_after_30_days",
 })
 _GROWTH_POST_REASONS = frozenset({
     "gym_owner", "empty_capacity", "booking_problem", "fitness_operations",
@@ -144,6 +145,7 @@ _GROWTH_POST_REASONS = frozenset({
     "functional_fitness", "crossfit", "pilates", "martial_arts",
     "recent", "credible_author",
     "followed_account",
+    "followed_gym", "suggested_gym", "operator_pain",
 })
 _GROWTH_PUBLIC_METRIC_KEYS = frozenset({
     "followers_count", "following_count", "tweet_count", "listed_count",
@@ -7790,6 +7792,22 @@ class Database:
                 or payload.get("reason_codes") != reasons
             ):
                 return None
+        elif kind == "reevaluate" and set(payload) == {
+            "user_id", "username", "public_metrics", "followed_since",
+            "reason_codes",
+        }:
+            followed_since = parse_growth_datetime(payload.get("followed_since"))
+            if (
+                payload.get("user_id") != object_id
+                or payload.get("username") != username
+                or not cls._growth_metrics_are_closed(
+                    payload.get("public_metrics"), _GROWTH_PUBLIC_METRIC_KEYS
+                )
+                or followed_since is None
+                or followed_since > completed_at
+                or payload.get("reason_codes") != reasons
+            ):
+                return None
         else:
             if set(payload) != {
                 "user_id", "username", "public_metrics", "latest_activity_id",
@@ -7890,7 +7908,8 @@ class Database:
                     suggested_at is None
                     or item["decision"] not in {
                         "new", "saved", "followed_manually", "dismissed",
-                        "still_relevant",
+                        "still_relevant", "not_relevant", "liked_manually",
+                        "skipped", "unfollowed_manually", "keep", "marked_gym",
                     }
                     or (item["decision_at"] is not None and decision_at is None)
                 ):
@@ -8475,15 +8494,19 @@ class Database:
         decided_at: Optional[datetime] = None,
     ) -> str:
         allowed = {
-            "account": {"followed_manually"},
-            "reevaluate": {"still_relevant", "dismissed"},
+            "account": {"followed_manually", "not_relevant"},
+            "post": {"liked_manually", "skipped"},
+            "reevaluate": {
+                "still_relevant", "dismissed",
+                "unfollowed_manually", "keep", "marked_gym",
+            },
         }
         if (
             type(suggestion_id) is not int
             or suggestion_id <= 0
             or type(expected_revision) is not int
             or expected_revision < 0
-            or decision not in {"followed_manually", "still_relevant", "dismissed"}
+            or decision not in set().union(*allowed.values())
         ):
             return "invalid"
         current = datetime.now(timezone.utc) if decided_at is None else decided_at
@@ -8519,6 +8542,7 @@ class Database:
             )
             if cursor.rowcount != 1:
                 return "rejected"
+            current_utc = current.astimezone(timezone.utc)
             if decision == "followed_manually":
                 conn.execute(
                     """
@@ -8529,6 +8553,49 @@ class Database:
                     WHERE user_id = ? AND decision IN ('new', 'saved')
                     """,
                     (decided_iso, decided_iso, row["object_id"]),
+                )
+            elif decision == "not_relevant":
+                conn.execute(
+                    """
+                    UPDATE growth_candidates
+                    SET decision = 'rejected', rejection_reason = 'not_relevant',
+                        decision_at = ?, suppressed_until = ?
+                    WHERE user_id = ? AND decision IN ('new', 'saved')
+                    """,
+                    (
+                        decided_iso,
+                        (current_utc + timedelta(days=30)).isoformat(),
+                        row["object_id"],
+                    ),
+                )
+            elif decision == "unfollowed_manually":
+                conn.execute(
+                    """
+                    UPDATE x_following
+                    SET unfollow_decision = 'unfollowed_manually',
+                        unfollow_decision_at = ?
+                    WHERE user_id = ? AND unfollowed_at IS NULL
+                    """,
+                    (decided_iso, row["object_id"]),
+                )
+            elif decision == "keep":
+                conn.execute(
+                    """
+                    UPDATE x_following
+                    SET unfollow_decision = 'keep', unfollow_decision_at = ?,
+                        keep_until = ?
+                    WHERE user_id = ?
+                    """,
+                    (
+                        decided_iso,
+                        (current_utc + timedelta(days=90)).isoformat(),
+                        row["object_id"],
+                    ),
+                )
+            elif decision == "marked_gym":
+                conn.execute(
+                    "UPDATE x_following SET gym_override = 'gym' WHERE user_id = ?",
+                    (row["object_id"],),
                 )
             return "updated"
 
@@ -9897,6 +9964,104 @@ class Database:
             for row in rows
             if self._canonical_growth_object_id(row["user_id"])
         }
+
+    def get_unfollow_proposals(
+        self,
+        now: datetime,
+        *,
+        limit: int = 5,
+        review_days: int = 30,
+    ) -> List[Dict]:
+        """Return non-gym followed accounts that never followed back."""
+        if (
+            type(now) is not datetime
+            or now.tzinfo is None
+            or now.utcoffset() is None
+            or type(limit) is not int
+            or limit <= 0
+            or type(review_days) is not int
+            or review_days < 30
+        ):
+            return []
+        current = now.astimezone(timezone.utc)
+        rome_today = current.astimezone(ZoneInfo("Europe/Rome")).date()
+        week_start = (rome_today - timedelta(days=rome_today.weekday())).isoformat()
+        maturity = timedelta(days=review_days)
+        with self._conn() as conn:
+            used = conn.execute("""
+                SELECT COUNT(*) AS count FROM growth_suggestions
+                WHERE kind = 'reevaluate' AND observed_on >= ?
+            """, (week_start,)).fetchone()["count"]
+            rows = conn.execute("""
+                SELECT * FROM x_following
+                WHERE unfollowed_at IS NULL AND follows_back = 0
+            """).fetchall()
+        remaining = min(limit, 5) - (used if type(used) is int else 5)
+        if remaining <= 0:
+            return []
+        eligible = []
+        for row in rows:
+            first_seen = parse_growth_datetime(row["first_seen_following_at"])
+            checked = parse_growth_datetime(row["follows_back_checked_at"])
+            keep_until = parse_growth_datetime(row["keep_until"])
+            if (
+                not self._canonical_growth_object_id(row["user_id"])
+                or first_seen is None
+                or checked is None
+                or first_seen > current - maturity
+                or checked < first_seen + maturity
+                or checked > current
+                or self._effective_gym(row["is_gym"], row["gym_override"])
+                or row["unfollow_decision"] == "unfollowed_manually"
+                or (
+                    row["unfollow_decision"] == "keep"
+                    and (keep_until is None or keep_until > current)
+                )
+            ):
+                continue
+            try:
+                stored = json.loads(row["profile_json"])
+            except (TypeError, ValueError):
+                continue
+            if type(stored) is not dict:
+                continue
+            metrics = {key: stored.get(key) for key in _GROWTH_PUBLIC_METRIC_KEYS}
+            if not self._growth_metrics_are_closed(metrics, _GROWTH_PUBLIC_METRIC_KEYS):
+                continue
+            eligible.append({
+                "user_id": row["user_id"],
+                "username": row["username"],
+                "public_metrics": metrics,
+                "followed_since": first_seen.isoformat(),
+                "days_following": (current - first_seen).days,
+            })
+        eligible.sort(key=lambda item: (item["followed_since"], item["user_id"]))
+        return eligible[:remaining]
+
+    def get_recent_growth_post_authors(self, since: datetime) -> Set[str]:
+        """Return author ids of like suggestions made at or after ``since``."""
+        if (
+            type(since) is not datetime
+            or since.tzinfo is None
+            or since.utcoffset() is None
+        ):
+            return set()
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT payload_json FROM growth_suggestions
+                WHERE kind = 'post'
+                  AND julianday(suggested_at) >= julianday(?)
+            """, (since.astimezone(timezone.utc).isoformat(),)).fetchall()
+        authors = set()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            author_id = payload.get("author_id") if type(payload) is dict else None
+            if self._canonical_growth_object_id(author_id):
+                authors.add(author_id)
+        return authors
 
     def mark_candidate_followed_back(self, user_id: str, observed_at: str) -> bool:
         if type(user_id) is not str or not user_id:
