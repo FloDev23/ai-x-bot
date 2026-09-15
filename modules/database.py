@@ -38,6 +38,7 @@ from modules.media_store import (
 from modules.growth_candidate_schema import (
     GROWTH_RELEVANCE_POLICY,
     evaluate_growth_candidate_filters,
+    has_managed_fitness_facility_context,
     is_canonical_growth_latest_post,
     is_canonical_growth_profile,
     is_json_safe_mapping,
@@ -797,6 +798,28 @@ class Database:
                         f"ALTER TABLE follower_snapshot_runs "
                         f"ADD COLUMN {column} {definition}"
                     )
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS x_following (
+                    user_id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    profile_json TEXT NOT NULL,
+                    first_seen_following_at TEXT NOT NULL,
+                    last_seen_following_at TEXT NOT NULL,
+                    unfollowed_at TEXT,
+                    follows_back INTEGER NOT NULL DEFAULT 0,
+                    follows_back_checked_at TEXT,
+                    is_gym INTEGER NOT NULL DEFAULT 0,
+                    gym_override TEXT CHECK (
+                        gym_override IN ('gym', 'not_gym')
+                    ),
+                    unfollow_decision TEXT CHECK (
+                        unfollow_decision IN ('keep', 'unfollowed_manually')
+                    ),
+                    unfollow_decision_at TEXT,
+                    keep_until TEXT
+                )
+            """)
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS growth_suggestions (
@@ -9709,6 +9732,171 @@ class Database:
                     WHERE observed_on < ?
                 """, (before_date,)).fetchall()
         return {row["user_id"] for row in rows}
+
+    # ---------- Real X following list ----------
+
+    @staticmethod
+    def _effective_gym(is_gym: Any, override: Any) -> bool:
+        return override == "gym" or (is_gym == 1 and override != "not_gym")
+
+    def sync_following_snapshot(
+        self,
+        observed_at: datetime,
+        profiles: List[Dict],
+        *,
+        complete: bool,
+    ) -> Optional[Dict]:
+        """Diff one complete following traversal into ``x_following``."""
+        if (
+            complete is not True
+            or type(observed_at) is not datetime
+            or observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+            or not isinstance(profiles, (list, tuple))
+        ):
+            return None
+        current = observed_at.astimezone(timezone.utc)
+        observed_iso = current.isoformat()
+        valid: Dict[str, Dict] = {}
+        for item in profiles:
+            if not is_canonical_growth_profile(item):
+                continue
+            user_id = item.get("user_id", item.get("id"))
+            if not self._canonical_growth_object_id(user_id) or user_id in valid:
+                continue
+            valid[user_id] = item
+        summary = {
+            "following_total": len(valid),
+            "new_following": 0,
+            "unfollowed": 0,
+            "gyms_following": 0,
+            "still_followed_after_unfollow": [],
+        }
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            follower_ids = None
+            follower_checked_at = None
+            for run in conn.execute("""
+                SELECT observed_on, captured_at FROM follower_snapshot_runs
+                WHERE completed = 1
+                ORDER BY julianday(captured_at) DESC
+            """).fetchall():
+                captured = parse_growth_datetime(run["captured_at"])
+                if captured is None or captured > current:
+                    continue
+                follower_checked_at = captured.isoformat()
+                follower_ids = {
+                    row["user_id"]
+                    for row in conn.execute("""
+                        SELECT user_id FROM follower_snapshots
+                        WHERE observed_on = ? AND captured_at IS NOT NULL
+                    """, (run["observed_on"],)).fetchall()
+                }
+                break
+            existing = {
+                row["user_id"]: row
+                for row in conn.execute("SELECT * FROM x_following").fetchall()
+            }
+            for user_id, item in valid.items():
+                is_gym = 1 if has_managed_fitness_facility_context(item) else 0
+                profile_json = json.dumps(item, allow_nan=False, sort_keys=True)
+                row = existing.get(user_id)
+                override = row["gym_override"] if row is not None else None
+                if row is None or row["unfollowed_at"] is not None:
+                    summary["new_following"] += 1
+                    conn.execute("""
+                        INSERT INTO x_following (
+                            user_id, username, profile_json,
+                            first_seen_following_at, last_seen_following_at,
+                            is_gym
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            username = excluded.username,
+                            profile_json = excluded.profile_json,
+                            first_seen_following_at =
+                                excluded.first_seen_following_at,
+                            last_seen_following_at =
+                                excluded.last_seen_following_at,
+                            unfollowed_at = NULL,
+                            unfollow_decision = NULL,
+                            unfollow_decision_at = NULL,
+                            keep_until = NULL,
+                            is_gym = excluded.is_gym
+                    """, (
+                        user_id, item["username"], profile_json,
+                        observed_iso, observed_iso, is_gym,
+                    ))
+                else:
+                    if row["unfollow_decision"] == "unfollowed_manually":
+                        summary["still_followed_after_unfollow"].append(
+                            item["username"]
+                        )
+                    conn.execute("""
+                        UPDATE x_following
+                        SET username = ?, profile_json = ?,
+                            last_seen_following_at = ?, is_gym = ?,
+                            unfollow_decision = CASE
+                                WHEN unfollow_decision = 'unfollowed_manually'
+                                THEN NULL ELSE unfollow_decision END,
+                            unfollow_decision_at = CASE
+                                WHEN unfollow_decision = 'unfollowed_manually'
+                                THEN NULL ELSE unfollow_decision_at END
+                        WHERE user_id = ?
+                    """, (
+                        item["username"], profile_json, observed_iso, is_gym,
+                        user_id,
+                    ))
+                if follower_ids is not None:
+                    conn.execute("""
+                        UPDATE x_following
+                        SET follows_back = ?, follows_back_checked_at = ?
+                        WHERE user_id = ?
+                    """, (
+                        1 if user_id in follower_ids else 0,
+                        follower_checked_at,
+                        user_id,
+                    ))
+                if self._effective_gym(is_gym, override):
+                    summary["gyms_following"] += 1
+                conn.execute("""
+                    UPDATE growth_candidates
+                    SET decision = 'followed_manually',
+                        decision_at = (
+                            SELECT first_seen_following_at FROM x_following
+                            WHERE user_id = ?
+                        ),
+                        manual_followed_at = COALESCE(manual_followed_at, (
+                            SELECT first_seen_following_at FROM x_following
+                            WHERE user_id = ?
+                        )),
+                        rejection_reason = NULL, suppressed_until = NULL
+                    WHERE user_id = ? AND decision IN ('new', 'saved')
+                """, (user_id, user_id, user_id))
+            for user_id, row in existing.items():
+                if user_id in valid or row["unfollowed_at"] is not None:
+                    continue
+                cursor = conn.execute("""
+                    UPDATE x_following SET unfollowed_at = ?
+                    WHERE user_id = ? AND unfollowed_at IS NULL
+                """, (observed_iso, user_id))
+                summary["unfollowed"] += cursor.rowcount
+        return summary
+
+    def get_following_state(self) -> Dict[str, Dict]:
+        """Return accounts currently followed, keyed by user id."""
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT user_id, username, is_gym, gym_override
+                FROM x_following WHERE unfollowed_at IS NULL
+            """).fetchall()
+        return {
+            row["user_id"]: {
+                "username": row["username"],
+                "is_gym": self._effective_gym(row["is_gym"], row["gym_override"]),
+            }
+            for row in rows
+            if self._canonical_growth_object_id(row["user_id"])
+        }
 
     def mark_candidate_followed_back(self, user_id: str, observed_at: str) -> bool:
         if type(user_id) is not str or not user_id:
