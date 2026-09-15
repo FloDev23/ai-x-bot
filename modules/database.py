@@ -8494,12 +8494,9 @@ class Database:
         decided_at: Optional[datetime] = None,
     ) -> str:
         allowed = {
-            "account": {"followed_manually", "not_relevant"},
+            "account": {"not_relevant"},
             "post": {"liked_manually", "skipped"},
-            "reevaluate": {
-                "still_relevant", "dismissed",
-                "unfollowed_manually", "keep", "marked_gym",
-            },
+            "reevaluate": {"unfollowed_manually", "keep", "marked_gym"},
         }
         if (
             type(suggestion_id) is not int
@@ -8543,18 +8540,7 @@ class Database:
             if cursor.rowcount != 1:
                 return "rejected"
             current_utc = current.astimezone(timezone.utc)
-            if decision == "followed_manually":
-                conn.execute(
-                    """
-                    UPDATE growth_candidates
-                    SET decision = 'followed_manually', decision_at = ?,
-                        manual_followed_at = COALESCE(manual_followed_at, ?),
-                        rejection_reason = NULL, suppressed_until = NULL
-                    WHERE user_id = ? AND decision IN ('new', 'saved')
-                    """,
-                    (decided_iso, decided_iso, row["object_id"]),
-                )
-            elif decision == "not_relevant":
+            if decision == "not_relevant":
                 conn.execute(
                     """
                     UPDATE growth_candidates

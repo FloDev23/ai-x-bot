@@ -269,6 +269,7 @@ def test_status_and_help_describe_reply_copilot_without_exposing_copy(tmp_path):
     assert SAFE_REPLY not in status
 
     controller.process_update(_message_update(41, "/help"))
-    assert "/replies — risposte X da pubblicare manualmente" in (
+    assert "/replies" not in telegram.messages[-1][1]
+    assert "/growth — palestre da seguire, like e unfollow suggeriti" in (
         telegram.messages[-1][1]
     )

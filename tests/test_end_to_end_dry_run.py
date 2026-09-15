@@ -808,9 +808,9 @@ def test_daily_growth_digest_restart_and_all_callbacks_never_write_x(tmp_path):
     }
 
     assert agent.telegram_controller.process_update(
-        callback_update(761, navigation["Account"])
+        callback_update(761, navigation["Seguire"])
     ) == "processed"
-    account_action = _buttons(dependencies["telegram_api"].messages[-1])[1][
+    account_action = _buttons(dependencies["telegram_api"].messages[-1])[2][
         "callback_data"
     ]
     assert agent.telegram_controller.process_update(
@@ -818,10 +818,10 @@ def test_daily_growth_digest_restart_and_all_callbacks_never_write_x(tmp_path):
     ) == "processed"
 
     assert agent.telegram_controller.process_update(
-        callback_update(763, navigation["Post"])
+        callback_update(763, navigation["Like"])
     ) == "processed"
     assert agent.telegram_controller.process_update(
-        callback_update(764, navigation["Da rivalutare"])
+        callback_update(764, navigation["Unfollow"])
     ) == "processed"
     reevaluate_actions = _buttons(dependencies["telegram_api"].messages[-1])
     assert agent.telegram_controller.process_update(
@@ -844,7 +844,7 @@ def test_daily_growth_digest_restart_and_all_callbacks_never_write_x(tmp_path):
     assert restarted.telegram_controller.process_update(
         callback_update(768, account_action)
     ) == "processed"
-    assert "nessuna azione" in restart_dependencies["telegram_api"].messages[-1][
+    assert "non pertinente" in restart_dependencies["telegram_api"].messages[-1][
         1
     ].lower()
 
@@ -1805,16 +1805,16 @@ def test_operator_acceptance_story_dry_run(tmp_path):
     digest_msg = api.messages[-1]
     assert "Growth giornaliero" in digest_msg[1]
 
-    account_nav = btn(digest_msg, "Account")
+    account_nav = btn(digest_msg, "Seguire")
     assert agent.telegram_controller.process_update(cb(account_nav)) == "processed"
     account_detail = api.messages[-1]
     assert "@studio_owner" in account_detail[1]
 
-    follow_cb_data = btn(account_detail, "Segnala come seguito")
+    follow_cb_data = btn(account_detail, "Non pertinente")
     assert agent.telegram_controller.process_update(cb(follow_cb_data)) == "processed"
     assert dependencies["x_client"].engagement_writes == []
 
-    post_nav = btn(digest_msg, "Post")
+    post_nav = btn(digest_msg, "Like")
     assert agent.telegram_controller.process_update(cb(post_nav)) == "processed"
     post_detail_msg = api.messages[-1]
     all_btns = [
@@ -1822,7 +1822,7 @@ def test_operator_acceptance_story_dry_run(tmp_path):
         for b in row
     ]
     assert any(b.get("url", "").startswith("https://x.com/") for b in all_btns)
-    assert all("gda" not in (b.get("callback_data") or "") for b in all_btns)
+    assert [b["text"] for b in all_btns if b.get("callback_data")] == ["Like messo", "Salta"]
 
     # ── Step 7: Adaptive planning + dry-run simulation ────────────────────────
     plan_time = ACCEPTANCE_NOW.replace(hour=12)

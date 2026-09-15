@@ -21,6 +21,7 @@ from config import (
     POSTS_PER_DAY,
     X_API_MONTHLY_BUDGET_MICROUSD,
 )
+from modules.growth_candidate_schema import parse_growth_datetime
 from modules.media_store import open_verified_media
 from modules.reply_copilot import build_reply_web_intent
 from modules.telegram_media_browser import MediaBrowser
@@ -63,6 +64,11 @@ _SOURCE_TYPES = {
     "verified_news": "Verified news",
 }
 _SOURCE_TRUST_LABELS = {"verified": "Verificata"}
+_LIKE_SOURCE_LABELS = {
+    "followed_gym": "palestra seguita",
+    "suggested_gym": "palestra suggerita",
+    "operator_pain": "gestore",
+}
 _MANUAL_CATEGORY_LABELS = {
     "gym_strategy": "Strategia palestra",
     "fitness_business_insight": "Business fitness",
@@ -861,16 +867,16 @@ class TelegramController:
             return "growth_digest_empty"
 
         lines = [
-            "Growth giornaliero — azioni solo manuali",
-            f"Account: {len(collections['accounts'])}",
-            f"Post: {len(collections['posts'])}",
-            f"Da rivalutare: {len(collections['reevaluate'])}",
+            "Growth giornaliero — azioni manuali su X",
+            f"Palestre da seguire: {len(collections['accounts'])}",
+            f"Like: {len(collections['posts'])}",
+            f"Unfollow proposti: {len(collections['reevaluate'])}",
         ]
         rows = []
         for collection, label, code in (
-            ("accounts", "Account", "a"),
-            ("posts", "Post", "p"),
-            ("reevaluate", "Da rivalutare", "r"),
+            ("accounts", "Seguire", "a"),
+            ("posts", "Like", "p"),
+            ("reevaluate", "Unfollow", "r"),
         ):
             if not collections[collection]:
                 continue
@@ -1186,49 +1192,90 @@ class TelegramController:
         username = suggestion["username"]
         payload = suggestion["payload"]
         reason = ", ".join(suggestion["reason_codes"])
+        suggestion_id_text = f"{suggestion_id}:{revision}"
         if expected_kind == "post":
+            source = next(
+                (
+                    _LIKE_SOURCE_LABELS[code]
+                    for code in suggestion["reason_codes"]
+                    if code in _LIKE_SOURCE_LABELS
+                ),
+                "discussione pertinente",
+            )
+            created_at = parse_growth_datetime(payload.get("created_at"))
+            age_hours = (
+                max(int((self._now() - created_at).total_seconds() // 3600), 0)
+                if created_at is not None
+                else 0
+            )
             text = "\n".join([
-                f"Post di @{username}",
+                f"Like — {source}",
+                f"@{username} · {age_hours} h fa",
                 f"Estratto: {self._clean_text(payload.get('excerpt'), 500)}",
                 f"Motivo: {reason}",
             ])
-            rows = [[{
-                "text": "Apri post su X",
-                "url": f"https://x.com/{username}/status/{suggestion['object_id']}",
-            }]]
-        else:
+            rows = [
+                [{
+                    "text": "Apri post su X",
+                    "url": f"https://x.com/{username}/status/{suggestion['object_id']}",
+                }],
+                [
+                    self._callback_button("Like messo", f"gda:l:{suggestion_id_text}"),
+                    self._callback_button("Salta", f"gda:s:{suggestion_id_text}"),
+                ],
+            ]
+        elif expected_kind == "account":
             metrics = payload["public_metrics"]
             text = "\n".join([
-                (
-                    f"{'Account' if expected_kind == 'account' else 'Da rivalutare'} "
-                    f"@{username}"
-                ),
+                f"Palestra da seguire @{username}",
                 f"follower: {metrics['followers_count']}",
                 f"following: {metrics['following_count']}",
                 f"post: {metrics['tweet_count']}",
-                f"liste: {metrics['listed_count']}",
                 f"Motivo: {reason}",
+                "Segui manualmente su X: il bot rileva il follow entro 24 ore.",
             ])
-            rows = [[{
-                "text": "Apri account su X",
-                "url": f"https://x.com/{username}",
-            }]]
-            if expected_kind == "account":
-                rows.append([self._callback_button(
-                    "Segnala come seguito",
-                    f"gda:a:{suggestion_id}:{revision}",
-                )])
-            else:
-                rows.append([
+            rows = [
+                [
+                    {"text": "Apri profilo", "url": f"https://x.com/{username}"},
+                    {
+                        "text": "Apri ultimo post",
+                        "url": (
+                            f"https://x.com/{username}/status/"
+                            f"{payload['latest_activity_id']}"
+                        ),
+                    },
+                ],
+                [self._callback_button(
+                    "Non pertinente", f"gda:n:{suggestion_id_text}",
+                )],
+            ]
+        else:
+            metrics = payload["public_metrics"]
+            followed_since = payload.get("followed_since")
+            text_lines = [
+                f"Unfollow proposto @{username}",
+                f"follower: {metrics['followers_count']}",
+                f"following: {metrics['following_count']}",
+            ]
+            if type(followed_since) is str:
+                text_lines.append(f"Seguito dal: {followed_since[:10]}")
+            text_lines.extend([
+                "Non ti segue e non risulta una palestra.",
+                "Se decidi, togli il segui manualmente su X.",
+            ])
+            text = "\n".join(text_lines)
+            rows = [
+                [{"text": "Apri profilo", "url": f"https://x.com/{username}"}],
+                [
                     self._callback_button(
-                        "Segna ancora pertinente",
-                        f"gda:r:{suggestion_id}:{revision}",
+                        "Unfollow fatto", f"gda:u:{suggestion_id_text}",
                     ),
-                    self._callback_button(
-                        "Ignora suggerimento",
-                        f"gda:d:{suggestion_id}:{revision}",
-                    ),
-                ])
+                    self._callback_button("Tieni", f"gda:k:{suggestion_id_text}"),
+                ],
+                [self._callback_button(
+                    "È una palestra", f"gda:g:{suggestion_id_text}",
+                )],
+            ]
         digest = self.db.get_growth_digest(suggestion["observed_on"])
         collection_name = {
             "account": "accounts", "post": "posts", "reevaluate": "reevaluate",
@@ -1262,9 +1309,20 @@ class TelegramController:
 
     def _growth_digest_action(self, chat_id: str, parts):
         decisions = {
-            "a": "followed_manually",
-            "r": "still_relevant",
-            "d": "dismissed",
+            "n": "not_relevant",
+            "l": "liked_manually",
+            "s": "skipped",
+            "u": "unfollowed_manually",
+            "k": "keep",
+            "g": "marked_gym",
+        }
+        confirmations = {
+            "n": "Account segnato come non pertinente per 30 giorni.",
+            "l": "Like registrato solo localmente; nessuna azione è stata inviata a X.",
+            "s": "Post saltato.",
+            "u": "Unfollow registrato solo localmente; il controllo notturno lo verifica.",
+            "k": "Account tenuto: non verrà riproposto per 90 giorni.",
+            "g": "Segnato come palestra: non verrà mai proposto per l'unfollow.",
         }
         if len(parts) != 4 or parts[1] not in decisions:
             self._send(chat_id, "Azione locale non valida.")
@@ -1283,17 +1341,8 @@ class TelegramController:
         if outcome not in {"updated", "duplicate"}:
             self._send(chat_id, "Azione non disponibile o già sostituita.")
             return "growth_digest_action_rejected"
-        if parts[1] == "a":
-            self._send(
-                chat_id,
-                "Seguito registrato solo localmente; nessuna azione è stata inviata a X.",
-            )
-            return "followed_manually"
-        if parts[1] == "r":
-            self._send(chat_id, "Pertinenza registrata solo localmente.")
-            return "still_relevant"
-        self._send(chat_id, "Suggerimento ignorato solo localmente.")
-        return "dismissed"
+        self._send(chat_id, confirmations[parts[1]])
+        return decisions[parts[1]]
 
     def _build_weekly_analytics_report(self, end_date):
         report = None
@@ -1854,8 +1903,7 @@ class TelegramController:
             "Comandi",
             "/status — stato e prossimi job",
             "/posts — bozze in coda (no pubblicati)",
-            "/growth — candidati manuali",
-            "/replies — risposte X da pubblicare manualmente",
+            "/growth — palestre da seguire, like e unfollow suggeriti",
             "/stats — riepilogo performance",
             "/ideas — aggiungi una fonte",
             "/newpost — aggiungi un post manuale alla coda",

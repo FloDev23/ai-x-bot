@@ -142,11 +142,11 @@ def test_manual_command_and_scheduled_push_share_one_compact_formatter(tmp_path)
 
     assert service.calls == [NOW]
     assert len(telegram.messages) == 1
-    assert "Account: 1" in telegram.messages[0][1]
-    assert "Post: 1" in telegram.messages[0][1]
-    assert "Da rivalutare: 1" in telegram.messages[0][1]
+    assert "Palestre da seguire: 1" in telegram.messages[0][1]
+    assert "Like: 1" in telegram.messages[0][1]
+    assert "Unfollow proposti: 1" in telegram.messages[0][1]
     assert [button["text"] for button in _buttons(telegram.messages[0])] == [
-        "Account", "Post", "Da rivalutare",
+        "Seguire", "Like", "Unfollow",
     ]
     assert len(telegram.messages[0][1]) <= 4096
     assert all(
@@ -224,7 +224,7 @@ def test_category_navigation_reaches_every_persisted_suggestion(tmp_path):
     )
 
 
-def test_account_detail_uses_public_url_and_local_idempotent_follow_ack(tmp_path):
+def test_account_detail_offers_profile_links_and_local_not_relevant(tmp_path):
     db = Database(str(tmp_path / "digest.db"))
     db.upsert_growth_candidate({
         "user_id": "101",
@@ -240,87 +240,86 @@ def test_account_detail_uses_public_url_and_local_idempotent_follow_ack(tmp_path
     controller.push_growth_digest(digest, explicit=True)
     navigation = _buttons(telegram.messages[-1])[0]
 
-    assert controller.process_update(callback_update(10, navigation["callback_data"])) == (
-        "processed"
-    )
+    assert controller.process_update(
+        callback_update(10, navigation["callback_data"])
+    ) == "processed"
     detail = telegram.messages[-1]
-    assert "@studio_owner" in detail[1]
+    assert "Palestra da seguire @studio_owner" in detail[1]
     assert "follower: 1200" in detail[1]
-    assert "primary_operator_role" in detail[1]
     buttons = _buttons(detail)
-    assert buttons[0] == {
-        "text": "Apri account su X", "url": "https://x.com/studio_owner",
+    assert buttons[0] == {"text": "Apri profilo", "url": "https://x.com/studio_owner"}
+    assert buttons[1] == {
+        "text": "Apri ultimo post",
+        "url": "https://x.com/studio_owner/status/9001",
     }
-    assert buttons[1]["text"] == "Segnala come seguito"
-    assert "follow" not in buttons[1]["callback_data"].lower()
+    assert buttons[2]["text"] == "Non pertinente"
 
-    acknowledgement = buttons[1]["callback_data"]
-    assert controller.process_update(callback_update(11, acknowledgement)) == "processed"
-    assert "nessuna azione" in telegram.messages[-1][1].lower()
-    assert "X" in telegram.messages[-1][1]
+    action = buttons[2]["callback_data"]
+    assert controller.process_update(callback_update(11, action)) == "processed"
+    assert "non pertinente" in telegram.messages[-1][1].lower()
     with db._conn() as conn:
         saved = conn.execute(
             "SELECT decision, revision FROM growth_suggestions"
         ).fetchone()
         candidate = conn.execute(
-            "SELECT decision, manual_followed_at FROM growth_candidates "
-            "WHERE user_id = '101'"
+            "SELECT decision FROM growth_candidates WHERE user_id = '101'"
         ).fetchone()
-    assert tuple(saved) == ("followed_manually", 1)
-    assert candidate["decision"] == "followed_manually"
-    assert candidate["manual_followed_at"] == NOW.astimezone(timezone.utc).isoformat()
+    assert tuple(saved) == ("not_relevant", 1)
+    assert candidate["decision"] == "rejected"
 
     restarted = TelegramController(
         FakeTelegramApi(tmp_path / "restart-media"), Database(db.db_path),
         NoopNotifier(), "42", growth_digest=FixedDigest(digest), now_fn=lambda: NOW,
     )
-    assert restarted.process_update(callback_update(12, acknowledgement)) == "processed"
-    assert "nessuna azione" in restarted.telegram_api.messages[-1][1].lower()
+    assert restarted.process_update(callback_update(12, action)) == "processed"
+    assert "non pertinente" in restarted.telegram_api.messages[-1][1].lower()
     with db._conn() as conn:
-        saved = conn.execute(
+        assert tuple(conn.execute(
             "SELECT decision, revision FROM growth_suggestions"
-        ).fetchone()
-    assert tuple(saved) == ("followed_manually", 1)
+        ).fetchone()) == ("not_relevant", 1)
 
 
-def test_post_and_reevaluation_details_never_offer_x_write_callbacks(tmp_path):
+def test_like_and_unfollow_cards_only_record_local_decisions(tmp_path):
     db = Database(str(tmp_path / "digest.db"))
     digest = _seed_digest(db, kinds=("post", "reevaluate"))
     controller, _db, telegram, _service = _controller(tmp_path, digest, db=db)
     controller.push_growth_digest(digest, explicit=True)
     navigation = {button["text"]: button for button in _buttons(telegram.messages[-1])}
 
-    controller.process_update(callback_update(20, navigation["Post"]["callback_data"]))
-    post_buttons = _buttons(telegram.messages[-1])
-    assert post_buttons == [{
+    controller.process_update(callback_update(20, navigation["Like"]["callback_data"]))
+    post_card = telegram.messages[-1]
+    post_buttons = _buttons(post_card)
+    assert post_card[1].startswith("Like — ")
+    assert post_buttons[0] == {
         "text": "Apri post su X",
         "url": "https://x.com/gym_writer/status/7001",
-    }]
-    assert "like" not in json.dumps(post_buttons).lower()
-
-    controller.process_update(
-        callback_update(21, navigation["Da rivalutare"]["callback_data"])
-    )
-    reevaluate_buttons = _buttons(telegram.messages[-1])
-    assert reevaluate_buttons[0] == {
-        "text": "Apri account su X", "url": "https://x.com/old_contact",
     }
-    assert [button["text"] for button in reevaluate_buttons[1:]] == [
-        "Segna ancora pertinente", "Ignora suggerimento",
-    ]
-    assert "unfollow" not in json.dumps(reevaluate_buttons).lower()
+    assert [button["text"] for button in post_buttons[1:]] == ["Like messo", "Salta"]
+    assert all(
+        button["callback_data"].startswith("gda:") for button in post_buttons[1:]
+    )
+    controller.process_update(callback_update(21, post_buttons[1]["callback_data"]))
 
     controller.process_update(
-        callback_update(22, reevaluate_buttons[1]["callback_data"])
+        callback_update(22, navigation["Unfollow"]["callback_data"])
     )
+    unfollow_buttons = _buttons(telegram.messages[-1])
+    assert unfollow_buttons[0] == {
+        "text": "Apri profilo", "url": "https://x.com/old_contact",
+    }
+    assert [button["text"] for button in unfollow_buttons[1:]] == [
+        "Unfollow fatto", "Tieni", "È una palestra",
+    ]
+    controller.process_update(callback_update(23, unfollow_buttons[2]["callback_data"]))
+
     with db._conn() as conn:
-        decision = conn.execute(
-            "SELECT decision FROM growth_suggestions WHERE kind = 'reevaluate'"
-        ).fetchone()[0]
-    assert decision == "still_relevant"
+        decisions = dict(conn.execute(
+            "SELECT kind, decision FROM growth_suggestions"
+        ).fetchall())
+    assert decisions == {"post": "liked_manually", "reevaluate": "keep"}
 
 
-def test_reevaluation_dismiss_is_local_and_wrong_revision_fails_closed(tmp_path):
+def test_unfollow_keep_is_local_and_wrong_revision_fails_closed(tmp_path):
     db = Database(str(tmp_path / "digest.db"))
     digest = _seed_digest(db, kinds=("reevaluate",))
     controller, _db, telegram, _service = _controller(tmp_path, digest, db=db)
@@ -333,7 +332,7 @@ def test_reevaluation_dismiss_is_local_and_wrong_revision_fails_closed(tmp_path)
     with db._conn() as conn:
         assert conn.execute(
             "SELECT decision FROM growth_suggestions"
-        ).fetchone()[0] == "dismissed"
+        ).fetchone()[0] == "keep"
 
     prior_messages = len(telegram.messages)
     assert controller.process_update(callback_update(25, "gd:r:1:0")) == "processed"
@@ -350,7 +349,7 @@ def test_follow_ack_has_one_sqlite_winner_and_rolls_back_on_error(tmp_path):
 
     def acknowledge():
         return Database(path).mark_growth_suggestion_decision(
-            suggestion["id"], suggestion["revision"], "followed_manually",
+            suggestion["id"], suggestion["revision"], "not_relevant",
             decided_at=NOW,
         )
 
@@ -360,7 +359,7 @@ def test_follow_ack_has_one_sqlite_winner_and_rolls_back_on_error(tmp_path):
     with db._conn() as conn:
         assert tuple(conn.execute(
             "SELECT decision, revision FROM growth_suggestions"
-        ).fetchone()) == ("followed_manually", 1)
+        ).fetchone()) == ("not_relevant", 1)
 
     failing_path = str(tmp_path / "failing.db")
     failing = Database(failing_path)
@@ -374,7 +373,7 @@ def test_follow_ack_has_one_sqlite_winner_and_rolls_back_on_error(tmp_path):
     try:
         failing.mark_growth_suggestion_decision(
             failing_suggestion["id"], failing_suggestion["revision"],
-            "followed_manually", decided_at=NOW,
+            "not_relevant", decided_at=NOW,
         )
     except sqlite3.IntegrityError:
         pass
@@ -400,3 +399,17 @@ def test_unauthorized_growth_command_and_callback_reveal_nothing(tmp_path):
     assert service.calls == []
     assert telegram.messages == []
     assert telegram.callback_answers == []
+
+
+def test_legacy_growth_decisions_are_rejected(tmp_path):
+    db = Database(str(tmp_path / "legacy-decisions.db"))
+    digest = _seed_digest(db)
+    account = digest["accounts"][0]
+    reevaluate = digest["reevaluate"][0]
+
+    assert db.mark_growth_suggestion_decision(
+        account["id"], account["revision"], "followed_manually", decided_at=NOW,
+    ) == "invalid"
+    assert db.mark_growth_suggestion_decision(
+        reevaluate["id"], reevaluate["revision"], "dismissed", decided_at=NOW,
+    ) == "invalid"
