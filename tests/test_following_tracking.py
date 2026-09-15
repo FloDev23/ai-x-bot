@@ -167,3 +167,106 @@ def test_manual_unfollow_still_listed_is_reported_and_cleared(tmp_path):
     row = following_row(db, "12")
     assert (row["unfollow_decision"], row["unfollow_decision_at"]) == (None, None)
     assert json.loads(row["profile_json"])["username"] == "runner"
+
+
+from types import SimpleNamespace
+
+from modules.analytics import PerformanceAnalyzer
+from modules.telegram_controller import TelegramController
+from tests.fakes import FakeTelegramApi
+
+
+EMPTY_SYNC = {
+    "following_total": 0,
+    "new_following": 0,
+    "unfollowed": 0,
+    "gyms_following": 0,
+    "still_followed_after_unfollow": [],
+}
+
+
+class FollowingX:
+    def __init__(self, following, complete=True):
+        self.following = list(following)
+        self.complete = complete
+        self.reads = 0
+        self.write_calls = []
+
+    def read_following_profiles(self):
+        self.reads += 1
+        return SimpleNamespace(profiles=tuple(self.following), complete=self.complete)
+
+
+class NoopNotifier:
+    def notify_error(self, operation, error):
+        del operation, error
+
+
+def test_analytics_sync_following_persists_complete_reads_only(tmp_path):
+    db = Database(str(tmp_path / "analytics-following.db"))
+    complete = FollowingX([profile("11", "gym_a")])
+
+    assert PerformanceAnalyzer(complete, db).sync_following(NOW)["following_total"] == 1
+    assert complete.reads == 1
+
+    other = Database(str(tmp_path / "analytics-partial.db"))
+    partial = FollowingX([profile("11", "gym_a")], complete=False)
+    assert PerformanceAnalyzer(partial, other).sync_following(NOW) == EMPTY_SYNC
+    assert other.get_following_state() == {}
+
+    legacy_client = SimpleNamespace()
+    assert PerformanceAnalyzer(legacy_client, other).sync_following(NOW) == EMPTY_SYNC
+
+
+def test_following_notices_list_only_safe_usernames(tmp_path):
+    db = Database(str(tmp_path / "notices.db"))
+    telegram = FakeTelegramApi(tmp_path / "media")
+    controller = TelegramController(
+        telegram, db, NoopNotifier(), "42", now_fn=lambda: NOW,
+    )
+
+    assert controller.push_following_notices(["runner", "bad name!"]) == (
+        "following_notices"
+    )
+    assert "@runner" in telegram.messages[-1][1]
+    assert "bad name" not in telegram.messages[-1][1]
+    assert controller.push_following_notices([]) == "following_notices_empty"
+    assert len(telegram.messages) == 1
+
+
+def test_follower_cycle_syncs_following_and_pushes_notices(tmp_path):
+    from main import FlexDropinGrowthAgent
+    from tests.test_end_to_end_dry_run import NOW as AGENT_NOW, dependency_bundle
+
+    class Analytics:
+        def __init__(self):
+            self.calls = []
+
+        def capture_follower_snapshot(self, current):
+            self.calls.append(("followers", current))
+            return {"followers_total": 1}
+
+        def timing_samples(self, current):
+            del current
+            return []
+
+        def sync_following(self, current):
+            self.calls.append(("following", current))
+            return {**EMPTY_SYNC, "still_followed_after_unfollow": ["runner"]}
+
+    class Controller:
+        def __init__(self):
+            self.notices = []
+
+        def push_following_notices(self, usernames):
+            self.notices.append(list(usernames))
+            return "following_notices"
+
+    analytics, controller = Analytics(), Controller()
+    agent = FlexDropinGrowthAgent(dependency_bundle(
+        tmp_path, analytics=analytics, telegram_controller=controller,
+    ))
+
+    assert agent.follower_snapshot_cycle(now=AGENT_NOW) == {"followers_total": 1}
+    assert analytics.calls == [("followers", AGENT_NOW), ("following", AGENT_NOW)]
+    assert controller.notices == [["runner"]]

@@ -120,6 +120,36 @@ class PerformanceAnalyzer:
         )
         return result if isinstance(result, dict) else empty_summary
 
+    def sync_following(self, observed_at: datetime) -> Dict:
+        """Read the real following list once and diff it into SQLite."""
+        current_time = self._aware_datetime(observed_at, "observed_at")
+        empty_summary = {
+            "following_total": 0,
+            "new_following": 0,
+            "unfollowed": 0,
+            "gyms_following": 0,
+            "still_followed_after_unfollow": [],
+        }
+        try:
+            read_following = getattr(self.client, "read_following_profiles", None)
+            if not callable(read_following):
+                return empty_summary
+            fetched = read_following()
+            profiles = getattr(fetched, "profiles", None)
+            complete = getattr(fetched, "complete", None) is True
+        except Exception as error:
+            logger.warning(
+                "following_sync_read_failed error_type=%s",
+                type(error).__name__,
+            )
+            return empty_summary
+        if not complete or not isinstance(profiles, (list, tuple)):
+            return empty_summary
+        result = self.db.sync_following_snapshot(
+            current_time, list(profiles), complete=True,
+        )
+        return result if isinstance(result, dict) else empty_summary
+
     def build_weekly_report(self, end_date) -> Dict:
         """Build one deterministic seven-operating-day factual report."""
         operating_end = self._operating_date(end_date, "end_date")

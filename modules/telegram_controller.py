@@ -885,6 +885,27 @@ class TelegramController:
         )
         return "growth_digest"
 
+    def push_following_notices(self, usernames) -> str:
+        """Warn when a locally recorded unfollow is still listed on X."""
+        if not isinstance(usernames, (list, tuple)):
+            return "following_notices_empty"
+        safe = [
+            username for username in usernames
+            if type(username) is str
+            and re.fullmatch(r"[A-Za-z0-9_]{1,15}", username) is not None
+        ][:10]
+        if not safe:
+            return "following_notices_empty"
+        self._send(
+            self.authorized_chat_id,
+            "\n".join([
+                "Unfollow segnati ma ancora seguiti su X:",
+                *(f"@{username}" for username in safe),
+                "Controlla su X: la decisione locale è stata azzerata.",
+            ]),
+        )
+        return "following_notices"
+
     def _growth(self, chat_id: str):
         del chat_id
         if self.growth_digest is None:

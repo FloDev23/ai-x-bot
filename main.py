@@ -703,12 +703,25 @@ class FlexDropinGrowthAgent:
 
     def follower_snapshot_cycle(self, now=None):
         try:
-            return self.analytics.capture_follower_snapshot(
-                self._now() if now is None else now
-            )
+            current = self._now() if now is None else now
+            summary = self.analytics.capture_follower_snapshot(current)
         except Exception as error:
             self._notify_error("cycle", error)
             return {}
+        sync_following = getattr(self.analytics, "sync_following", None)
+        if callable(sync_following):
+            try:
+                following = sync_following(current)
+                notices = (
+                    following.get("still_followed_after_unfollow")
+                    if isinstance(following, dict)
+                    else None
+                )
+                if notices:
+                    self.telegram_controller.push_following_notices(notices)
+            except Exception as error:
+                self._notify_error("following_sync_cycle", error)
+        return summary
 
     def performance_metrics_cycle(self, now=None):
         try:
