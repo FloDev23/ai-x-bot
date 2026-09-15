@@ -31,6 +31,7 @@ from config import (
     GROWTH_POST_QUERY_BUDGET,
     GROWTH_POST_SUGGESTION_LIMIT,
     GROWTH_SUGGESTION_COOLDOWN_DAYS,
+    GROWTH_UNFOLLOW_REVIEW_DAYS,
     LEAD_NOTIFY_MIN_SCORE,
     MEDIA_LIBRARY_DIR,
     MEDIA_MATCH_THRESHOLD,
@@ -408,6 +409,7 @@ class FlexDropinGrowthAgent:
                 post_limit=GROWTH_POST_SUGGESTION_LIMIT,
                 post_query_budget=GROWTH_POST_QUERY_BUDGET,
                 cooldown_days=GROWTH_SUGGESTION_COOLDOWN_DAYS,
+                unfollow_review_days=GROWTH_UNFOLLOW_REVIEW_DAYS,
             ),
         )
         self.reply_copilot = (

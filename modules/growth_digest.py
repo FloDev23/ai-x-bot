@@ -14,19 +14,8 @@ from modules.growth_discovery import GrowthDiscovery
 logger = logging.getLogger(__name__)
 
 ROME = ZoneInfo("Europe/Rome")
-GROWTH_POST_QUERY_BUDGET = 2
+GROWTH_POST_QUERY_BUDGET = 1
 POST_QUERY_PORTFOLIO: Tuple[Tuple[str, str], ...] = (
-    (
-        "fitness_intent_model",
-        '("drop-in" OR "day pass" OR "gym without membership" OR "pay per class" OR '
-        '"pay per visit" OR "no contract gym" OR "trial class" OR "first class" OR '
-        '"want to try" OR "looking for a gym" OR "gym recommendations") '
-        '(gym OR "fitness studio" OR "fitness center" OR CrossFit OR HYROX OR '
-        'Pilates OR yoga OR boxing OR BJJ OR "martial arts" OR barre OR '
-        'calisthenics OR weightlifting OR climbing) '
-        'lang:en -is:retweet -is:reply '
-        '-"home gym" -"garage gym" -airdrop -dropshipping -crypto',
-    ),
     (
         "gym_operator_pain",
         '("gym owner" OR "studio owner" OR "box owner" OR "fitness studio" OR '
@@ -37,6 +26,15 @@ POST_QUERY_PORTFOLIO: Tuple[Tuple[str, str], ...] = (
         'lang:en -is:retweet -is:reply',
     ),
 )
+LIKE_SOURCE_QUOTAS: Tuple[Tuple[str, int], ...] = (
+    ("followed_gym", 4),
+    ("suggested_gym", 3),
+    ("operator_pain", 3),
+)
+LIKE_FILL_ORDER: Tuple[str, ...] = ("followed_gym", "operator_pain", "suggested_gym")
+FOLLOWED_GYM_MAX_AGE = timedelta(hours=72)
+SUGGESTED_GYM_MAX_AGE = timedelta(days=7)
+LIKE_AUTHOR_COOLDOWN = timedelta(days=3)
 _ACCOUNT_REASON_CODES = frozenset({
     "primary_operator_role", "amplifier_role", "relevant_end_user",
     "multiple_operating_topics", "one_operating_topic",
@@ -260,6 +258,46 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
     }
 
 
+def score_gym_post(
+    post: Dict,
+    now: datetime,
+    *,
+    source: str,
+    max_age: timedelta,
+) -> Optional[Dict]:
+    """Score one original gym post without requiring operator keywords."""
+    if (
+        type(post) is not dict
+        or type(now) is not datetime
+        or source not in {"followed_gym", "suggested_gym"}
+    ):
+        return None
+    text = post.get("text")
+    created_at = parse_growth_datetime(post.get("created_at"))
+    if (
+        not _canonical_id(post.get("id"))
+        or not _canonical_id(post.get("author_id"))
+        or not _username(post.get("author_username"))
+        or type(text) is not str
+        or not text.strip()
+        or len(text) > 1000
+        or post.get("lang") != "en"
+        or created_at is None
+        or not _closed_metrics(post.get("public_metrics"), _POST_METRIC_KEYS)
+        or _NOISE_PATTERN.search(text.lower())
+    ):
+        return None
+    age = now.astimezone(timezone.utc) - created_at
+    if age < timedelta(0) or age > max_age:
+        return None
+    recent = age <= timedelta(days=1)
+    return {
+        "score": 80 if recent else 65,
+        "created_at": created_at,
+        "reason_codes": [source, "recent"] if recent else [source],
+    }
+
+
 class GrowthDigestService:
     """Build one Rome-day digest using only bounded X read interfaces."""
 
@@ -274,6 +312,7 @@ class GrowthDigestService:
         reevaluate_limit: int = 5,
         post_query_budget: int = GROWTH_POST_QUERY_BUDGET,
         cooldown_days: int = 30,
+        unfollow_review_days: int = 30,
         claim_ttl: timedelta = timedelta(minutes=5),
         wait_attempts: int = 200,
     ):
@@ -281,12 +320,14 @@ class GrowthDigestService:
             ("account_limit", account_limit, 5),
             ("post_limit", post_limit, 10),
             ("reevaluate_limit", reevaluate_limit, 5),
-            ("post_query_budget", post_query_budget, 2),
+            ("post_query_budget", post_query_budget, 1),
         ):
             if type(value) is not int or not 1 <= value <= maximum:
                 raise ValueError(f"{name} must be between 1 and {maximum}")
         if cooldown_days != 30:
             raise ValueError("cooldown_days must be exactly 30")
+        if type(unfollow_review_days) is not int or unfollow_review_days < 30:
+            raise ValueError("unfollow_review_days must be at least 30")
         if (
             type(claim_ttl) is not timedelta
             or claim_ttl <= timedelta(0)
@@ -303,6 +344,7 @@ class GrowthDigestService:
         self.reevaluate_limit = reevaluate_limit
         self.post_query_budget = post_query_budget
         self.cooldown_days = cooldown_days
+        self.unfollow_review_days = unfollow_review_days
         self.claim_ttl = claim_ttl
         self.wait_attempts = wait_attempts
 
@@ -334,7 +376,9 @@ class GrowthDigestService:
             time.sleep(0.01)
         return self.db.get_growth_digest(observed_on)
 
-    def _account_rows(self, candidates: object, now: datetime) -> List[Dict]:
+    def _account_rows(
+        self, candidates: object, now: datetime, followed_ids: frozenset
+    ) -> List[Dict]:
         if not isinstance(candidates, (list, tuple)):
             return []
         rows = []
@@ -366,7 +410,8 @@ class GrowthDigestService:
                 or now.astimezone(timezone.utc) - activity_at > timedelta(days=30)
                 or type(score) is not int
                 or not 0 <= score <= 100
-                or segment not in {"primary", "amplifier", "end_user"}
+                or segment != "primary"
+                or user_id in followed_ids
                 or type(reasons) is not list
                 or not reasons
                 or len(set(reasons)) != len(reasons)
@@ -402,97 +447,164 @@ class GrowthDigestService:
                 break
         return rows
 
-    def _post_rows(self, posts: Sequence[Dict], now: datetime) -> List[Dict]:
-        best = {}
-        for post in posts:
-            scored = score_growth_post(post, now)
-            if scored is None or self.db.growth_object_in_cooldown(
-                "post", post.get("id"), now
+    def _like_rows(
+        self,
+        scored_posts: Sequence[Tuple[str, Dict, Dict]],
+        now: datetime,
+    ) -> List[Dict]:
+        current = now.astimezone(timezone.utc)
+        recent_authors = self.db.get_recent_growth_post_authors(
+            current - LIKE_AUTHOR_COOLDOWN
+        )
+        buckets: Dict[str, List[Tuple[Dict, Dict]]] = {
+            source: [] for source, _quota in LIKE_SOURCE_QUOTAS
+        }
+        seen_posts = set()
+        for source, post, scored in scored_posts:
+            if (
+                source not in buckets
+                or post["id"] in seen_posts
+                or post["author_id"] in recent_authors
+                or self.db.growth_object_in_cooldown("post", post["id"], current)
             ):
                 continue
-            prior = best.get(post["id"])
-            rank = (
-                scored["score"],
-                int("followed_account" in scored["reason_codes"]),
-                scored["created_at"],
-                post["id"],
-            )
-            if prior is not None and prior[0] >= rank:
-                continue
-            best[post["id"]] = (rank, post, scored)
-        ordered = sorted(
-            best.values(),
-            key=lambda item: (-item[2]["score"], -item[2]["created_at"].timestamp(), item[1]["id"]),
-        )
+            seen_posts.add(post["id"])
+            buckets[source].append((post, scored))
+        for items in buckets.values():
+            items.sort(key=lambda item: (
+                -item[1]["score"],
+                -item[1]["created_at"].timestamp(),
+                item[0]["id"],
+            ))
+        selected: List[Tuple[Dict, Dict]] = []
+        authors = set()
+
+        def take(source: str, count: int) -> None:
+            taken = 0
+            while buckets[source] and taken < count and len(selected) < self.post_limit:
+                post, scored = buckets[source].pop(0)
+                if post["author_id"] in authors:
+                    continue
+                authors.add(post["author_id"])
+                selected.append((post, scored))
+                taken += 1
+
+        for source, quota in LIKE_SOURCE_QUOTAS:
+            take(source, quota)
+        for source in LIKE_FILL_ORDER:
+            take(source, self.post_limit)
         rows = []
-        for _rank, post, scored in ordered[: self.post_limit]:
-            reasons = scored["reason_codes"]
-            excerpt = " ".join(post["text"].split())[:280]
+        for post, scored in selected:
+            reasons = list(scored["reason_codes"])[:10]
             payload = {
                 "id": post["id"],
                 "author_id": post["author_id"],
                 "author_username": post["author_username"],
-                "excerpt": excerpt,
+                "excerpt": " ".join(post["text"].split())[:280],
                 "created_at": scored["created_at"].isoformat(),
                 "public_metrics": dict(post["public_metrics"]),
-                "reason_codes": list(reasons),
+                "reason_codes": reasons,
             }
             rows.append({
                 "object_id": post["id"],
                 "username": post["author_username"],
                 "payload": payload,
                 "score": scored["score"],
-                "reason_codes": list(reasons),
+                "reason_codes": reasons,
                 "cooldown_until": (
-                    now.astimezone(timezone.utc) + timedelta(days=self.cooldown_days)
+                    current + timedelta(days=self.cooldown_days)
                 ).isoformat(),
             })
         return rows
 
-    def _reevaluation_rows(self, candidates: object, now: datetime) -> List[Dict]:
-        if not isinstance(candidates, (list, tuple)):
-            return []
+    def _scored_like_candidates(
+        self,
+        posts: Sequence[Dict],
+        candidates: object,
+        suggested_ids: set,
+        followed_gym_ids: frozenset,
+        now: datetime,
+    ) -> List[Tuple[str, Dict, Dict]]:
+        scored_posts = []
+        for post in posts:
+            if type(post) is not dict or post.get("source_kind") != "following":
+                continue
+            if post.get("author_id") not in followed_gym_ids:
+                continue
+            scored = score_gym_post(
+                post, now, source="followed_gym", max_age=FOLLOWED_GYM_MAX_AGE,
+            )
+            if scored is not None:
+                scored_posts.append(("followed_gym", post, scored))
+        for post in posts:
+            if type(post) is not dict or post.get("source_kind") == "following":
+                continue
+            scored = score_growth_post(post, now)
+            if scored is not None:
+                scored_posts.append(("operator_pain", post, {
+                    **scored,
+                    "reason_codes": ["operator_pain", *scored["reason_codes"]],
+                }))
+        for candidate in candidates if isinstance(candidates, (list, tuple)) else []:
+            if type(candidate) is not dict or candidate.get("user_id") not in suggested_ids:
+                continue
+            latest = candidate.get("latest_post")
+            if type(latest) is not dict:
+                continue
+            post = {
+                "id": latest.get("id"),
+                "text": latest.get("text"),
+                "author_id": candidate.get("user_id"),
+                "author_username": candidate.get("username"),
+                "created_at": latest.get("created_at"),
+                "lang": latest.get("lang"),
+                "public_metrics": latest.get("public_metrics"),
+            }
+            scored = score_gym_post(
+                post, now, source="suggested_gym", max_age=SUGGESTED_GYM_MAX_AGE,
+            )
+            if scored is not None:
+                scored_posts.append(("suggested_gym", post, scored))
+        return scored_posts
+
+    def _unfollow_rows(self, now: datetime) -> List[Dict]:
+        current = now.astimezone(timezone.utc)
         rows = []
-        for candidate in candidates:
+        for candidate in self.db.get_unfollow_proposals(
+            current,
+            limit=self.reevaluate_limit,
+            review_days=self.unfollow_review_days,
+        ):
             if type(candidate) is not dict:
                 continue
             user_id = candidate.get("user_id")
             username = candidate.get("username")
-            reasons = candidate.get("reason_codes")
             metrics = candidate.get("public_metrics")
+            followed_since = parse_growth_datetime(candidate.get("followed_since"))
+            days = candidate.get("days_following")
             if (
                 not _canonical_id(user_id)
                 or not _username(username)
-                or not _canonical_id(candidate.get("latest_activity_id"))
-                or parse_growth_datetime(candidate.get("latest_activity_at")) is None
-                or candidate.get("segment") not in {
-                    "primary", "amplifier", "end_user",
-                }
-                or type(candidate.get("score")) is not int
-                or reasons != ["no_follow_back_after_14_days"]
                 or not _closed_metrics(metrics, _AUTHOR_METRIC_KEYS)
-                or self.db.growth_object_in_cooldown("reevaluate", user_id, now)
+                or followed_since is None
+                or self.db.growth_object_in_cooldown("reevaluate", user_id, current)
             ):
                 continue
-            payload = {
-                "user_id": user_id,
-                "username": username,
-                "public_metrics": dict(metrics),
-                "latest_activity_id": candidate["latest_activity_id"],
-                "latest_activity_at": parse_growth_datetime(
-                    candidate["latest_activity_at"]
-                ).isoformat(),
-                "segment": candidate["segment"],
-                "reason_codes": list(reasons),
-            }
+            reasons = ["no_follow_back_after_30_days"]
             rows.append({
                 "object_id": user_id,
                 "username": username,
-                "payload": payload,
-                "score": candidate["score"],
+                "payload": {
+                    "user_id": user_id,
+                    "username": username,
+                    "public_metrics": dict(metrics),
+                    "followed_since": followed_since.isoformat(),
+                    "reason_codes": list(reasons),
+                },
+                "score": min(days, 100) if type(days) is int and days >= 0 else 0,
                 "reason_codes": list(reasons),
                 "cooldown_until": (
-                    now.astimezone(timezone.utc) + timedelta(days=self.cooldown_days)
+                    current + timedelta(days=self.cooldown_days)
                 ).isoformat(),
             })
             if len(rows) >= self.reevaluate_limit:
@@ -563,15 +675,14 @@ class GrowthDigestService:
                 page_rows = getattr(result, "posts", None)
                 complete = getattr(result, "complete", None)
                 if complete is not True or not isinstance(page_rows, (list, tuple)):
-                    self._fail_claims(observed_on, claim_tokens)
-                    return None
+                    logger.warning("growth_digest_following_read_incomplete")
+                    page_rows = ()
             except Exception as error:
                 logger.warning(
                     "growth_digest_following_read_failed error_type=%s",
                     type(error).__name__,
                 )
-                self._fail_claims(observed_on, claim_tokens)
-                return None
+                page_rows = ()
             rows.extend({**post, "source_kind": "following"} for post in page_rows)
         return rows, claim_tokens
 
@@ -622,14 +733,23 @@ class GrowthDigestService:
             )
             return self._empty(observed_on, "incomplete")
         post_candidates, query_claim_tokens = post_read
-        account_rows = self._account_rows(candidates, current)
-        post_rows = self._post_rows(post_candidates, current)
-        reevaluate_rows = self._reevaluation_rows(
-            self.db.get_growth_reevaluation_candidates(
-                current, limit=self.reevaluate_limit
+        following = self.db.get_following_state()
+        followed_ids = frozenset(following)
+        followed_gym_ids = frozenset(
+            user_id for user_id, state in following.items() if state["is_gym"]
+        )
+        account_rows = self._account_rows(candidates, current, followed_ids)
+        post_rows = self._like_rows(
+            self._scored_like_candidates(
+                post_candidates,
+                candidates,
+                {row["object_id"] for row in account_rows},
+                followed_gym_ids,
+                current,
             ),
             current,
         )
+        reevaluate_rows = self._unfollow_rows(current)
         try:
             persisted, outcome = self.db.persist_growth_digest_atomic(
                 observed_on=observed_on,

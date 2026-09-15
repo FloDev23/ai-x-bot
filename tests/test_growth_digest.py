@@ -4,6 +4,7 @@ import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 
 import pytest
@@ -812,110 +813,6 @@ def test_read_claim_budget_completion_and_stale_recovery_survive_restart(tmp_pat
     assert first_stale_token != second_stale_token
 
 
-def test_reevaluation_requires_complete_absent_snapshot_after_fourteen_days(tmp_path):
-    database = Database(str(tmp_path / "reevaluate.db"))
-    candidate_id = database.upsert_growth_candidate({
-        "user_id": "301",
-        "username": "oldowner",
-        "profile": {
-            "id": "301", "user_id": "301", "username": "oldowner",
-            "description": "gym owner", "protected": False, "location": None,
-            "created_at": "2020-01-01T00:00:00+00:00",
-            "followers_count": 500, "following_count": 100,
-            "tweet_count": 100, "listed_count": 2, "spam_signals": [],
-        },
-        "latest_post": {
-            "id": "7001", "text": "gym class booking occupancy",
-            "created_at": (NOW - timedelta(days=1)).isoformat(),
-            "lang": "en", "is_original": True,
-        },
-        "score": 90,
-        "score_data": {
-            "relevance_policy": "managed_fitness_facility_us_priority_v3",
-            "market_priority": 0,
-            "total": 90, "audience_segment": "primary",
-            "reasons": ["primary_operator_role"],
-            "activity_at": (NOW - timedelta(days=1)).isoformat(),
-            "hard_filter_passed": True, "filter_reason": "accepted",
-        },
-        "discovery_source": "topic_search",
-        "last_evaluated_at": NOW.isoformat(),
-        "profile_expires_at": (NOW + timedelta(days=7)).isoformat(),
-    })
-    assert database.mark_candidate_decision(
-        candidate_id, "followed_manually", decided_at=NOW - timedelta(days=15)
-    )
-    assert database.get_growth_reevaluation_candidates(NOW, limit=5) == []
-
-    with database._conn() as connection:
-        connection.execute(
-            "INSERT INTO follower_snapshot_runs "
-            "(observed_on, followers_total, captured_at, completed, summary_json) "
-            "VALUES (?, ?, ?, 0, '{}')",
-            ("2026-08-26", 0, NOW.isoformat()),
-        )
-    assert database.get_growth_reevaluation_candidates(NOW, limit=5) == []
-    with database._conn() as connection:
-        connection.execute(
-            "UPDATE follower_snapshot_runs SET completed = 1 WHERE observed_on = ?",
-            ("2026-08-26",),
-        )
-    rows = database.get_growth_reevaluation_candidates(NOW, limit=5)
-    assert [row["user_id"] for row in rows] == ["301"]
-    assert "description" not in json.dumps(rows)
-
-
-def test_reevaluation_accepts_older_complete_snapshot_after_accounts_own_boundary(
-    tmp_path,
-):
-    database = Database(str(tmp_path / "old-complete.db"))
-    candidate_id = database.upsert_growth_candidate({
-        "user_id": "401",
-        "username": "longpending",
-        "profile": {
-            "id": "401", "user_id": "401", "username": "longpending",
-            "description": "gym owner", "protected": False, "location": None,
-            "created_at": "2020-01-01T00:00:00+00:00",
-            "followers_count": 500, "following_count": 100,
-            "tweet_count": 100, "listed_count": 2, "spam_signals": [],
-        },
-        "latest_post": {
-            "id": "7401", "text": "gym class booking occupancy",
-            "created_at": (NOW - timedelta(days=1)).isoformat(),
-            "lang": "en", "is_original": True,
-        },
-        "score": 90,
-        "score_data": {
-            "relevance_policy": "managed_fitness_facility_us_priority_v3",
-            "market_priority": 0,
-            "total": 90, "audience_segment": "primary",
-            "reasons": ["primary_operator_role"],
-            "activity_at": (NOW - timedelta(days=1)).isoformat(),
-            "hard_filter_passed": True, "filter_reason": "accepted",
-        },
-        "discovery_source": "topic_search",
-        "last_evaluated_at": NOW.isoformat(),
-        "profile_expires_at": (NOW + timedelta(days=7)).isoformat(),
-    })
-    followed_at = NOW - timedelta(days=40)
-    assert database.mark_candidate_decision(
-        candidate_id, "followed_manually", decided_at=followed_at
-    )
-    snapshot_at = NOW - timedelta(days=20)
-    with database._conn() as connection:
-        connection.execute(
-            "INSERT INTO follower_snapshot_runs "
-            "(observed_on, followers_total, captured_at, completed, summary_json) "
-            "VALUES (?, 0, ?, 1, '{}')",
-            (snapshot_at.date().isoformat(), snapshot_at.isoformat()),
-        )
-
-    assert [
-        row["user_id"]
-        for row in database.get_growth_reevaluation_candidates(NOW, limit=5)
-    ] == ["401"]
-
-
 def _candidate(user_id="101", username="gymowner", score=90):
     reasons = ["primary_operator_role", "active_within_7_days"]
     return {
@@ -982,9 +879,13 @@ class DigestDiscovery:
 
 
 class DigestX:
-    def __init__(self, pages=None, complete=True, following_rows=None):
+    def __init__(self, pages=None, complete=True, following_rows=None,
+                 following_complete=None):
         self.pages = pages or {}
         self.complete = complete
+        self.following_complete = (
+            complete if following_complete is None else following_complete
+        )
         self.following_rows = list(following_rows or [])
         self.queries = []
         self.following_reads = 0
@@ -998,34 +899,54 @@ class DigestX:
     def read_following_timeline(self, limit=25):
         assert limit == 25
         self.following_reads += 1
-        return RelevantPostsRead(tuple(self.following_rows), self.complete)
+        return RelevantPostsRead(
+            tuple(self.following_rows), self.following_complete,
+        )
 
 
-def test_service_builds_closed_ranked_daily_digest_with_fixed_read_budget(tmp_path):
+GYM_BIO = "Independent gym in Austin, TX. Classes daily."
+
+
+def _gym_profile(user_id, username, description=GYM_BIO):
+    return {
+        "id": user_id, "user_id": user_id, "username": username,
+        "description": description, "protected": False,
+        "location": "Austin, TX", "created_at": None,
+        "followers_count": 100, "following_count": 50,
+        "tweet_count": 20, "listed_count": 1, "spam_signals": [],
+    }
+
+
+def _follow(database, profiles, when=None):
+    assert database.sync_following_snapshot(
+        when or NOW - timedelta(days=1), profiles, complete=True,
+    ) is not None
+
+
+def test_service_builds_closed_ranked_daily_digest_with_one_search(tmp_path):
     database = Database(str(tmp_path / "service.db"))
     x_client = DigestX({
         0: [
-            _normalized_post("9002", "Pilates studios can fill empty class spots."),
-            _normalized_post("9001"),
-        ],
-        1: [
+            _normalized_post(
+                "9002", "Pilates studios can fill empty class spots.",
+                author_id="102", author_username="pilatesowner",
+            ),
             _normalized_post("9001"),
             _normalized_post("9003", "A generic fitness motivation quote."),
         ],
     })
     discovery = DigestDiscovery()
 
-    digest = GrowthDigestService(
-        x_client, database, discovery=discovery, post_query_budget=2
-    ).build(NOW)
+    digest = GrowthDigestService(x_client, database, discovery=discovery).build(NOW)
 
     assert digest["observed_on"] == "2026-08-26"
     assert digest["outcome"] == "created"
     assert [row["object_id"] for row in digest["accounts"]] == ["101"]
     assert [row["object_id"] for row in digest["posts"]] == ["9001", "9002"]
+    assert digest["posts"][0]["reason_codes"][0] == "operator_pain"
     assert digest["posts"][0]["score"] == 84
-    assert len(x_client.queries) == 2
-    assert all(limit == 25 for _query, limit in x_client.queries)
+    assert len(x_client.queries) == 1
+    assert x_client.queries[0][1] == 25
     assert discovery.calls == 1
     serialized = json.dumps(digest, allow_nan=False)
     assert "private body" not in serialized
@@ -1034,41 +955,180 @@ def test_service_builds_closed_ranked_daily_digest_with_fixed_read_budget(tmp_pa
     assert x_client.engagement_writes == []
 
 
-def test_service_includes_relevant_posts_from_accounts_followed_on_x(tmp_path):
-    followed = _normalized_post(
-        "9090",
-        "Our gym has spare class spots available for drop-in bookings.",
-        author_username="followedgym",
-    )
-    x_client = DigestX({0: [], 1: []}, following_rows=[followed])
+def test_followed_gym_posts_skip_keywords_but_respect_age_and_gym_status(tmp_path):
+    database = Database(str(tmp_path / "followed-gym.db"))
+    _follow(database, [
+        _gym_profile("301", "gym_one"),
+        _gym_profile("302", "runner", "Fitness podcast host and runner."),
+    ])
+    x_client = DigestX({0: []}, following_rows=[
+        _normalized_post(
+            "9101", "Saturday open session at 9am, see you there!",
+            author_id="301", author_username="gym_one",
+            created_at=(NOW - timedelta(hours=10)).isoformat(),
+        ),
+        _normalized_post(
+            "9102", "Old news from the gym floor.",
+            author_id="301", author_username="gym_one",
+            created_at=(NOW - timedelta(hours=80)).isoformat(),
+        ),
+        _normalized_post(
+            "9103", "Gym owners can fill empty class capacity.",
+            author_id="302", author_username="runner",
+        ),
+    ])
 
     digest = GrowthDigestService(
-        x_client,
-        Database(str(tmp_path / "following-posts.db")),
-        discovery=DigestDiscovery([]),
+        x_client, database, discovery=DigestDiscovery([]),
     ).build(NOW)
 
     assert x_client.following_reads == 1
-    assert [row["object_id"] for row in digest["posts"]] == ["9090"]
-    assert "followed_account" in digest["posts"][0]["reason_codes"]
+    assert [row["object_id"] for row in digest["posts"]] == ["9101"]
+    assert digest["posts"][0]["reason_codes"] == ["followed_gym", "recent"]
 
 
-def test_duplicate_search_post_keeps_followed_account_provenance(tmp_path):
-    shared = _normalized_post(
-        "9091",
-        "Our gym has spare class spots available for drop-in bookings.",
-        author_username="followedgym",
-    )
-    x_client = DigestX({0: [shared], 1: []}, following_rows=[shared])
+def test_like_quotas_fill_order_and_one_post_per_author(tmp_path):
+    database = Database(str(tmp_path / "quotas.db"))
+    _follow(database, [
+        _gym_profile(str(301 + index), f"gym_{index}") for index in range(5)
+    ])
+    timeline = [
+        _normalized_post(
+            str(9200 + index), "Open gym tonight at 6pm.",
+            author_id=str(301 + index), author_username=f"gym_{index}",
+        )
+        for index in range(5)
+    ]
+    search = [
+        _normalized_post(
+            str(9300 + index),
+            author_id=str(401 + index), author_username=f"owner_{index}",
+        )
+        for index in range(6)
+    ] + [
+        _normalized_post("9399", author_id="401", author_username="owner_0"),
+    ]
 
     digest = GrowthDigestService(
-        x_client,
-        Database(str(tmp_path / "duplicate-following-post.db")),
+        DigestX({0: search}, following_rows=timeline),
+        database,
         discovery=DigestDiscovery([]),
     ).build(NOW)
 
-    assert [row["object_id"] for row in digest["posts"]] == ["9091"]
-    assert "followed_account" in digest["posts"][0]["reason_codes"]
+    sources = [row["reason_codes"][0] for row in digest["posts"]]
+    assert sources == (
+        ["followed_gym"] * 4 + ["operator_pain"] * 3
+        + ["followed_gym"] + ["operator_pain"] * 2
+    )
+    authors = [row["payload"]["author_id"] for row in digest["posts"]]
+    assert len(authors) == len(set(authors)) == 10
+
+
+def test_suggested_gym_latest_post_becomes_a_like(tmp_path):
+    candidate = _candidate()
+    candidate["latest_post"].update({
+        "text": "Open gym Saturday at 9am.",
+        "lang": "en",
+        "public_metrics": {
+            "like_count": 2, "retweet_count": 0, "reply_count": 0,
+            "quote_count": 0, "impression_count": 40,
+        },
+    })
+
+    digest = GrowthDigestService(
+        DigestX({0: []}),
+        Database(str(tmp_path / "suggested.db")),
+        discovery=DigestDiscovery([candidate]),
+    ).build(NOW)
+
+    assert [row["object_id"] for row in digest["accounts"]] == ["101"]
+    assert [row["object_id"] for row in digest["posts"]] == ["8001"]
+    assert digest["posts"][0]["reason_codes"] == ["suggested_gym", "recent"]
+
+
+def test_like_author_cooldown_lasts_three_days(tmp_path):
+    path = str(tmp_path / "author-cooldown.db")
+
+    def build(post_id, when):
+        return GrowthDigestService(
+            DigestX({0: [_normalized_post(
+                post_id, author_id="401", author_username="owner_one",
+                created_at=(when - timedelta(hours=2)).isoformat(),
+            )]}),
+            Database(path),
+            discovery=DigestDiscovery([]),
+        ).build(when)
+
+    assert [row["object_id"] for row in build("9001", NOW)["posts"]] == ["9001"]
+    assert build("9002", NOW + timedelta(days=1))["posts"] == []
+    later = NOW + timedelta(days=3, hours=1)
+    assert [row["object_id"] for row in build("9003", later)["posts"]] == ["9003"]
+
+
+def test_account_suggestions_are_only_unfollowed_primary_gyms(tmp_path):
+    database = Database(str(tmp_path / "accounts.db"))
+    _follow(database, [_gym_profile("101", "gymowner")])
+    amplifier = _candidate("102", "amplifier")
+    amplifier["audience_segment"] = "amplifier"
+    amplifier["reasons"] = ["amplifier_role"]
+
+    digest = GrowthDigestService(
+        DigestX({0: []}),
+        database,
+        discovery=DigestDiscovery([
+            _candidate("101", "gymowner"), amplifier, _candidate("103", "newgym"),
+        ]),
+    ).build(NOW)
+
+    assert [row["object_id"] for row in digest["accounts"]] == ["103"]
+
+
+def test_timeline_failure_keeps_digest_complete(tmp_path):
+    digest = GrowthDigestService(
+        DigestX({0: [_normalized_post()]}, following_complete=False),
+        Database(str(tmp_path / "timeline-failure.db")),
+        discovery=DigestDiscovery([]),
+    ).build(NOW)
+
+    assert digest["outcome"] == "created"
+    assert [row["object_id"] for row in digest["posts"]] == ["9001"]
+
+
+def test_unfollow_rows_come_from_following_tracking(tmp_path):
+    database = Database(str(tmp_path / "unfollow-rows.db"))
+    runner = _gym_profile("12", "runner", "Fitness podcast host and runner.")
+    _follow(database, [runner], when=NOW - timedelta(days=31))
+    observed_on = (NOW - timedelta(hours=1)).astimezone(
+        ZoneInfo("Europe/Rome")
+    ).date().isoformat()
+    assert database.capture_follower_snapshot_batch(
+        observed_on, NOW - timedelta(hours=1), [], 0,
+    ) is not None
+    _follow(database, [runner], when=NOW - timedelta(minutes=30))
+
+    digest = GrowthDigestService(
+        DigestX({0: []}), database, discovery=DigestDiscovery([]),
+    ).build(NOW)
+
+    assert [row["object_id"] for row in digest["reevaluate"]] == ["12"]
+    assert digest["reevaluate"][0]["payload"]["followed_since"] == (
+        (NOW - timedelta(days=31)).isoformat()
+    )
+    assert digest["reevaluate"][0]["reason_codes"] == [
+        "no_follow_back_after_30_days",
+    ]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"post_query_budget": 2}, {"unfollow_review_days": 29}],
+)
+def test_service_rejects_out_of_policy_limits(tmp_path, overrides):
+    with pytest.raises(ValueError):
+        GrowthDigestService(
+            DigestX(), Database(str(tmp_path / "limits.db")),
+            discovery=DigestDiscovery([]), **overrides,
+        )
 
 
 def test_fitness_business_operations_are_relevant_without_a_second_topic():
@@ -1213,7 +1273,7 @@ def test_service_two_threads_return_one_exact_committed_digest(tmp_path):
     assert results[0]["accounts"] == results[1]["accounts"]
     assert results[0]["posts"] == results[1]["posts"]
     assert sorted(result["outcome"] for result in results) == ["created", "existing"]
-    assert len(x_client.queries) == 2
+    assert len(x_client.queries) == 1
     with Database(path)._conn() as connection:
         assert connection.execute("SELECT COUNT(*) FROM growth_digest_runs").fetchone()[0] == 1
 
@@ -1339,7 +1399,7 @@ def test_two_processes_share_one_completed_digest_and_exact_rows(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM growth_read_claims "
             "WHERE substr(query_key, 1, 2) != '__' AND state = 'completed'"
-        ).fetchone()[0] == 3
+        ).fetchone()[0] == 2
 
 
 def test_hard_crash_before_commit_recovers_only_after_lease_expiry(tmp_path):
@@ -1362,7 +1422,7 @@ def test_hard_crash_before_commit_recovers_only_after_lease_expiry(tmp_path):
     with Database(path)._conn() as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM growth_read_claims WHERE state = 'completed'"
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 3
 
 
 def test_hard_crash_after_commit_replays_without_any_read(tmp_path):

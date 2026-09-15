@@ -796,7 +796,7 @@ def test_daily_growth_digest_restart_and_all_callbacks_never_write_x(tmp_path):
     assert len(first_jobs) == len(second_jobs) == 9
     growth_job = next(job for job in second_jobs if job.id == "growth_digest")
     assert growth_job.func(now=digest_now) == "growth_digest_silent"
-    assert agent.db.get_growth_reevaluation_candidates(digest_now, limit=5) == []
+    assert agent.db.get_unfollow_proposals(digest_now, limit=5) == []
 
     assert agent.telegram_controller.process_update({
         "update_id": 760,
