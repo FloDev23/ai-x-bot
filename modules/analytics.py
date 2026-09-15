@@ -213,6 +213,18 @@ class PerformanceAnalyzer:
                 else 0.0
             )
 
+        following = raw.get("following")
+        following_summary = {
+            "following_total": 0,
+            "gyms_following": 0,
+            "gym_follow_back_rate": 0.0,
+            "other_follow_back_rate": 0.0,
+            "unfollows": 0,
+            "likes_by_source": {},
+        }
+        if isinstance(following, dict) and set(following) == set(following_summary):
+            following_summary = following
+
         return {
             "followers_total": raw["followers_total"],
             "new_followers": new_followers,
@@ -235,6 +247,7 @@ class PerformanceAnalyzer:
                 "manual_follows_by_source": manual_by_source,
                 "follow_backs_by_source": followed_by_source,
             },
+            "following_summary": following_summary,
             "attribution_label": "correlation",
         }
 

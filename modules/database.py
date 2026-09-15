@@ -10115,6 +10115,17 @@ class Database:
                 WHERE key LIKE 'growth_queries:%'
                    OR key LIKE 'growth_profile_evaluations:%'
             """).fetchall()
+            following_rows = conn.execute("""
+                SELECT is_gym, gym_override, follows_back,
+                       follows_back_checked_at, unfollowed_at
+                FROM x_following
+            """).fetchall()
+            like_rows = conn.execute("""
+                SELECT reason_codes_json FROM growth_suggestions
+                WHERE kind = 'post' AND decision = 'liked_manually'
+                  AND julianday(decision_at) >= julianday(?)
+                  AND julianday(decision_at) < julianday(?)
+            """, (start_iso, end_iso)).fetchall()
 
         query_budget_used = 0
         profiles_evaluated = 0
@@ -10146,6 +10157,50 @@ class Database:
                 if day_key in valid_days:
                     profiles_evaluated += count
 
+        active = [row for row in following_rows if row["unfollowed_at"] is None]
+        gyms = [
+            row for row in active
+            if self._effective_gym(row["is_gym"], row["gym_override"])
+        ]
+        others = [
+            row for row in active
+            if not self._effective_gym(row["is_gym"], row["gym_override"])
+        ]
+
+        def follow_back_rate(rows):
+            checked = [row for row in rows if row["follows_back_checked_at"]]
+            if not checked:
+                return 0.0
+            return round(sum(row["follows_back"] == 1 for row in checked) / len(checked), 4)
+
+        unfollows = 0
+        for row in following_rows:
+            gone_at = parse_growth_datetime(row["unfollowed_at"])
+            if gone_at is not None and start_at <= gone_at < end_at:
+                unfollows += 1
+        likes_by_source: Dict[str, int] = {}
+        for row in like_rows:
+            try:
+                reasons = json.loads(row["reason_codes_json"])
+            except (TypeError, ValueError):
+                continue
+            source = next(
+                (
+                    code for code in reasons
+                    if code in {"followed_gym", "suggested_gym", "operator_pain"}
+                ),
+                None,
+            ) if type(reasons) is list else None
+            if source is not None:
+                likes_by_source[source] = likes_by_source.get(source, 0) + 1
+        following_summary = {
+            "following_total": len(active),
+            "gyms_following": len(gyms),
+            "gym_follow_back_rate": follow_back_rate(gyms),
+            "other_follow_back_rate": follow_back_rate(others),
+            "unfollows": unfollows,
+            "likes_by_source": dict(sorted(likes_by_source.items())),
+        }
         return {
             "followers_total": followers_total,
             "new_followers": new_followers,
@@ -10161,6 +10216,7 @@ class Database:
             "posts": [dict(row) for row in post_rows],
             "query_budget_used": query_budget_used,
             "profiles_evaluated": profiles_evaluated,
+            "following": following_summary,
         }
 
     # ---------- Telegram updates, state and safe errors ----------

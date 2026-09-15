@@ -1454,6 +1454,38 @@ class TelegramController:
             lines.append("Follow-back per fonte")
             for part in rate_parts:
                 lines.append(f"  {part}")
+        following = report.get("following_summary")
+        following = following if isinstance(following, dict) else {}
+
+        def following_int(key):
+            value = following.get(key)
+            return value if type(value) is int and value >= 0 else 0
+
+        def following_rate(key):
+            value = following.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return 0.0
+            return max(float(value), 0.0) * 100
+
+        lines += [
+            "",
+            "Following",
+            f"  totali: {following_int('following_total')}"
+            f"  |  palestre: {following_int('gyms_following')}",
+            f"  follow-back palestre: {following_rate('gym_follow_back_rate'):.0f}%"
+            f"  |  altri: {following_rate('other_follow_back_rate'):.0f}%",
+            f"  unfollow: {following_int('unfollows')}",
+        ]
+        likes = following.get("likes_by_source")
+        likes = likes if isinstance(likes, dict) else {}
+        like_parts = [
+            f"  {_LIKE_SOURCE_LABELS[source]}: {count}"
+            for source, count in sorted(likes.items())
+            if source in _LIKE_SOURCE_LABELS and type(count) is int and count >= 0
+        ]
+        if like_parts:
+            lines.append("Like segnati")
+            lines.extend(like_parts)
         return "\n".join(lines)
 
     def _stats(self, chat_id: str):

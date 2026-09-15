@@ -487,3 +487,33 @@ def test_recent_post_authors_respect_the_since_boundary(tmp_path):
 
     assert db.get_recent_growth_post_authors(NOW - timedelta(days=3)) == {"200"}
     assert db.get_recent_growth_post_authors(NOW - timedelta(days=1)) == set()
+
+
+def test_weekly_report_summarizes_following_and_likes(tmp_path):
+    db = Database(str(tmp_path / "weekly-following.db"))
+    gym = profile("11", "gym_a")
+    other = profile("12", "runner", OTHER_BIO)
+    gone = profile("13", "gone", OTHER_BIO)
+    db.sync_following_snapshot(NOW - timedelta(days=3), [gym, other, gone], complete=True)
+    capture_followers(db, NOW - timedelta(hours=2), [gym])
+    db.sync_following_snapshot(NOW - timedelta(hours=1), [gym, other], complete=True)
+    payload, reasons = post_payload()
+    suggestion = seed_suggestion(db, "post", "7001", "gym_a", payload, reasons)["posts"][0]
+    db.mark_growth_suggestion_decision(
+        suggestion["id"], suggestion["revision"], "liked_manually", decided_at=NOW,
+    )
+
+    report = PerformanceAnalyzer(SimpleNamespace(), db).build_weekly_report(NOW)
+
+    assert report["following_summary"] == {
+        "following_total": 2,
+        "gyms_following": 1,
+        "gym_follow_back_rate": 1.0,
+        "other_follow_back_rate": 0.0,
+        "unfollows": 1,
+        "likes_by_source": {"followed_gym": 1},
+    }
+    text = TelegramController.format_weekly_report(report)
+    assert "Following" in text
+    assert "palestre: 1" in text
+    assert "palestra seguita: 1" in text

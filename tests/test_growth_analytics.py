@@ -28,6 +28,7 @@ REPORT_KEYS = {
     "query_budget_used",
     "profiles_evaluated",
     "factual_blocks",
+    "following_summary",
     "attribution_label",
 }
 
@@ -1075,6 +1076,14 @@ def test_weekly_report_empty_has_exact_stable_schema(tmp_path):
             "new_follower_sources": {},
             "manual_follows_by_source": {},
             "follow_backs_by_source": {},
+        },
+        "following_summary": {
+            "following_total": 0,
+            "gyms_following": 0,
+            "gym_follow_back_rate": 0.0,
+            "other_follow_back_rate": 0.0,
+            "unfollows": 0,
+            "likes_by_source": {},
         },
         "attribution_label": "correlation",
     }
