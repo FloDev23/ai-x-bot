@@ -2,7 +2,7 @@
 
 Un servizio Python approval-only per preparare contenuti X, gestirli da Telegram e osservare la crescita follower. SQLite conserva fonti, bozze, approvazioni, media, candidati e metriche.
 
-Il processo non mette like, non segue/smette di seguire, non invia risposte e non invia DM. Può preparare risposte utili da copiare o aprire manualmente su X, ma non possiede un percorso API per pubblicarle. L'unica scrittura X automatizzata è la pubblicazione di una specifica bozza editoriale che:
+Il processo non mette like, non segue/smette di seguire, non invia risposte e non invia DM: le regole di automazione di X lo vietano. Suggerisce palestre da seguire, post dove mettere like e account non-palestra da non seguire più; ogni azione resta manuale su X. L'unica scrittura X automatizzata è la pubblicazione di una specifica bozza editoriale che:
 
 - deriva da fonti persistite e ammissibili;
 - supera fact-check, scoring e controllo duplicati;
@@ -25,7 +25,7 @@ python -c "from config import validate_config; validate_config()"
 python main.py
 ```
 
-Lasciare `APPROVAL_REQUIRED=true`, `DRY_RUN=true`, `ENABLE_LEAD_DISCOVERY=false` ed `ENABLE_REPLY_COPILOT=false` durante il rollout iniziale. `APPROVAL_REQUIRED=false` viene rifiutato all'avvio. Il feed ufficiale FlexDropin non richiede chiavi o variabili; NewsAPI è facoltativa finché `NEWS_TRUSTED_DOMAINS` resta vuota.
+Lasciare `APPROVAL_REQUIRED=true`, `DRY_RUN=true`, `ENABLE_LEAD_DISCOVERY=false` durante il rollout iniziale. `APPROVAL_REQUIRED=false` viene rifiutato all'avvio. Il feed ufficiale FlexDropin non richiede chiavi o variabili; NewsAPI è facoltativa finché `NEWS_TRUSTED_DOMAINS` resta vuota.
 
 La configurazione completa e la procedura VPS sono in [SETUP.md](SETUP.md).
 
@@ -40,11 +40,9 @@ automaticamente l'ora legale statunitense. Il processo registra soltanto:
 - retry delle traduzioni italiane ogni 30 minuti;
 - creazione/riconciliazione dei piani USA ogni 15 minuti;
 - controllo dei piani dovuti ogni 5 minuti;
-- digest growth read-only alle 09:00 `Europe/Rome`; se Reply Copilot è attivo,
-  le bozze di risposta vengono generate subito dopo dagli stessi risultati già
-  persistiti, senza un altro job; il digest include una lettura della timeline
-  degli account seguiti da `@FlexDropin`;
-- snapshot follower alle 23:15;
+- digest growth read-only alle 09:00 `Europe/Rome`: palestre da seguire, like
+  suggeriti e unfollow proposti;
+- snapshot follower e sincronizzazione della lista following reale alle 23:15;
 - metriche dei post propri e ricalcolo dei pesi editoriali alle 23:30;
 - report growth Telegram il lunedì alle 09:00.
 
@@ -77,8 +75,7 @@ normalizza il risultato; dati mancanti, non finiti o fuori dai limiti 0.3–3.0
 mantengono invariato il portafoglio statico.
 
 I comandi Telegram includono `/status`, `/posts`, `/media`, `/growth`, `/stats`,
-`/ideas`, `/newpost`, `/pause`, `/resume`, `/errors` e `/help`. Quando Reply
-Copilot è abilitato viene registrato anche `/replies`.
+`/ideas`, `/newpost`, `/pause`, `/resume`, `/errors` e `/help`.
 
 `/newpost` conserva il testo inglese esatto dell'operatore, fa scegliere
 categoria, zero o fino a tre fonti opzionali e un media opzionale sfogliabile da
@@ -102,59 +99,15 @@ restano disponibili per la riconciliazione manuale.
 definitivamente (doppia conferma, solo per media mai usato). Nessun percorso
 raw raggiunge mai Telegram.
 
-Il digest growth arriva alle 09:00 `Europe/Rome` con al massimo 5 account, 10
-post e 5 da rivalutare. Ogni azione di follow, unfollow o like resta manuale su
-X; il bot marca solo la decisione locale in SQLite. La discovery dà precedenza
-alle palestre con località USA dichiarata, ma conserva come fallback sia gli
-account senza località sia quelli di altri Paesi.
-
-## Reply Copilot manuale
-
-Reply Copilot usa esclusivamente i post già salvati dal Growth Digest. Il digest
-legge anche una pagina della timeline degli account seguiti da `@FlexDropin`;
-il servizio Reply Copilot non riceve `TwitterClient`, `Publisher` o credenziali
-X. Le opzioni sono disabilitate per default:
-
-```dotenv
-ENABLE_REPLY_COPILOT=false
-REPLY_COPILOT_DAILY_LIMIT=5
-REPLY_COPILOT_MAX_AGE_HOURS=48
-REPLY_COPILOT_MAX_REGENERATIONS=2
-```
-
-I limiti possono essere ridotti ma non aumentati. Per ogni giorno Roma vengono
-riservate al massimo cinque risposte in inglese: sui due batch pieni
-consecutivi la ripartizione alterna `4 operator + 1 end_user` e
-`3 operator + 2 end_user`, ottenendo il mix 70/30. Ogni fonte deve avere al
-massimo 48 ore. Il primo tentativo AI è automatico; l'operatore può richiedere
-al massimo due rigenerazioni. In un batch entrano al massimo due post provenienti
-da account seguiti, lasciando spazio anche alla discovery esterna.
-
-Le risposte normali restano value-first e il guard deterministico rifiuta brand,
-link, email, hashtag, menzioni, call to action, prompt injection e consigli ad
-alto rischio. Se il post dichiara esplicitamente capacità inutilizzata, problemi
-di prenotazione o la volontà di vendere lezioni singole, fino a tre risposte al
-giorno possono proporre FlexDropin. Questi testi sono deterministici e dichiarano
-sia l'attivazione partner gratuita sia la commissione del 15% sulle prenotazioni
-effettuate tramite l'app.
-
-Il flusso operatore è:
-
-1. aprire `/replies` e controllare post originale, segmento e risposta;
-2. usare `Copia risposta` oppure `Rispondi su X`, che apre un X Web Intent con
-   composer precompilato;
-3. controllare e pubblicare personalmente dall'interfaccia X;
-4. usare `Segna come pubblicata` soltanto dopo la pubblicazione manuale, oppure
-   `Ignora`.
-
-I pulsanti di copia e Web Intent non modificano lo stato e non consumano unità
-API X. Solo il callback locale `Segna come pubblicata` registra la decisione in
-SQLite; non verifica né invia nulla su X. Per disattivare la funzione basta
-ripristinare `ENABLE_REPLY_COPILOT=false`; la tabella additiva può rimanere nel
-database senza influire sul resto del bot.
-
-Il refresh riuscito o senza novità è silenzioso; `/errors` mostra solo codici di
-errore sistemici sanitizzati.
+Il digest growth arriva alle 09:00 `Europe/Rome` con al massimo 5 palestre da
+seguire (solo attività fitness, USA prima), 10 post dove mettere like (4 da
+palestre seguite, 3 da palestre suggerite, 3 da gestori che parlano di posti
+vuoti, no-show o prenotazioni) e 5 unfollow proposti a settimana. Ogni sera il
+bot legge la lista following reale di `@FlexDropin`: un account non-palestra
+seguito da almeno 30 giorni che non ricambia viene proposto per l'unfollow; le
+palestre non vengono mai proposte. I pulsanti `Like messo`, `Salta`,
+`Non pertinente`, `Unfollow fatto`, `Tieni` ed `È una palestra` registrano solo
+decisioni locali in SQLite.
 
 ## Budget e telemetria X API
 
@@ -191,10 +144,6 @@ coda bilingue → approvazione Telegram → riserva da 14 → due/tre piani ET �
 simulazioni, incluso un riavvio senza duplicati, `/newpost` e zero scritture
 X/engagement.
 
-Lo stesso test copre anche il flusso Reply Copilot completo e confronta prima e
-dopo sia le chiamate del boundary X sia il ledger dei costi: dopo il Growth
-Digest non devono comparire letture o scritture X aggiuntive.
-
 Prima di ogni riavvio sul VPS, `deploy.sh` esegue un preflight in sola lettura
 che richiede `APPROVAL_REQUIRED=true`, `DRY_RUN=true`, configurazione valida e
 `PRAGMA integrity_check=ok`. Il passaggio alla pubblicazione automatica reale è
@@ -211,8 +160,7 @@ una fase separata: richiede due giornate USA simulate, una riserva di 14 post,
 - `modules/growth_discovery.py`: discovery follower read-only.
 - `modules/analytics.py`: snapshot, metriche proprie e report settimanale.
 - `modules/x_api_usage.py`: prenotazioni atomiche, tetto e stima dei costi X API.
-- `modules/reply_copilot.py`: selezione da digest persistito, generazione
-  bounded, guard e transizioni manuali senza dipendenze X.
+- `modules/reply_copilot.py`: modulo dismesso, non collegato al runtime.
 - `modules/database.py`: persistenza SQLite concorrente e restart-safe.
 - `modules/editorial_feed.py`: client fixed-host e validazione del feed ufficiale.
 - `modules/source_refresh.py`: isolamento del refresh blog/NewsAPI.

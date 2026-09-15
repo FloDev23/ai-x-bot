@@ -94,9 +94,9 @@ TELEGRAM_MAX_VIDEO_BYTES=52428800
 GROWTH_DIGEST_TIME=09:00
 GROWTH_ACCOUNT_SUGGESTION_LIMIT=5
 GROWTH_POST_SUGGESTION_LIMIT=10
-GROWTH_POST_QUERY_BUDGET=2
+GROWTH_POST_QUERY_BUDGET=1
 GROWTH_SUGGESTION_COOLDOWN_DAYS=30
-GROWTH_UNFOLLOW_REVIEW_DAYS=14
+GROWTH_UNFOLLOW_REVIEW_DAYS=30
 GROWTH_SCORE_THRESHOLD=75
 GROWTH_QUERY_BUDGET=3
 GROWTH_NEW_PROFILE_BUDGET=25
@@ -105,7 +105,7 @@ GROWTH_SEED_ACCOUNTS=
 NEWS_TRUSTED_DOMAINS=
 ```
 
-`validate_config()` rifiuta token/chat Telegram mancanti, `APPROVAL_REQUIRED=false` e valori Reply Copilot non canonici o superiori ai tetti 5/48/2. Richiede `NEWSAPI_KEY` solo quando è configurato almeno un dominio fidato. Il query budget growth è comunque limitato a tre.
+`validate_config()` rifiuta token/chat Telegram mancanti, `APPROVAL_REQUIRED=false`, valori Reply Copilot non canonici o superiori ai tetti 5/48/2, `GROWTH_POST_QUERY_BUDGET` diverso da 1 e `GROWTH_UNFOLLOW_REVIEW_DAYS` sotto 30. Richiede `NEWSAPI_KEY` solo quando è configurato almeno un dominio fidato. Il query budget growth è comunque limitato a tre.
 
 ## 5. Test locale senza rete
 
@@ -127,28 +127,21 @@ Alle 10:30 `Europe/Rome` il job `source_refresh` aggiorna separatamente:
 
 Un guasto di un canale non annulla l'altro. Successo e assenza di novità non generano messaggi Telegram; gli errori sistemici vengono sanitizzati e sono consultabili con `/errors`. Un articolo blog non viene trattato come product fact. I suoi link rispettano `MAX_LINKS_PER_WEEK=1` e un cooldown di 30 giorni sullo stesso articolo.
 
-### Reply Copilot opzionale
+### Like, palestre e following (settembre 2026)
 
-Con `ENABLE_REPLY_COPILOT=true`, il job Growth Digest genera anche fino a cinque
-bozze di risposta dai soli post già persistiti. Non viene aggiunto un job di
-discovery; il Growth Digest include una lettura della timeline degli account
-seguiti da `@FlexDropin` e il bot non pubblica mai la risposta. `/replies`
-mostra testo, fonte, tipo, conteggio caratteri e controlli manuali:
+Reply Copilot è dismesso: `ENABLE_REPLY_COPILOT` viene ignorato e `/replies`
+non compare più nel menu. Il digest delle 09:00 propone palestre da seguire,
+post dove mettere like e account non-palestra da non seguire più. Il job delle
+23:15 legge anche la lista following reale e la salva nella tabella additiva
+`x_following`; gli unfollow proposti compaiono solo dopo 30 giorni di
+osservazione e un controllo follower completo.
 
-- `Copia risposta` copia soltanto il testo validato;
-- `Rispondi su X` apre il composer standard X tramite Web Intent;
-- `Rigenera` consuma uno dei due tentativi manuali disponibili;
-- `Ignora` e `Segna come pubblicata` aggiornano soltanto SQLite.
+Prima del deploy aggiornare `.env` sul VPS, altrimenti `validate_config()` fallisce:
 
-Le risposte sono inglesi e pertinenti. Quelle normali non contengono riferimenti
-commerciali; fino a tre al giorno possono proporre FlexDropin soltanto quando il
-post esprime un bisogno compatibile esplicito. La copia promozionale dichiara
-attivazione partner gratuita e commissione del 15% sulle prenotazioni via app.
-Il limite di età è 48 ore, non più di due risposte per batch provengono dagli
-account seguiti e la ripartizione dei batch pieni alterna 4/1 e 3/2 tra
-operatori ed end user.
-Per tornare allo stato precedente impostare `ENABLE_REPLY_COPILOT=false`; non è
-necessaria né consentita una migrazione distruttiva del database.
+```dotenv
+GROWTH_POST_QUERY_BUDGET=1
+GROWTH_UNFOLLOW_REVIEW_DAYS=30
+```
 
 ## 7. Dry-run sul VPS
 
@@ -175,14 +168,12 @@ Completare e annotare tutta la checklist:
 - [ ] rimozione con conferma: il post diventa `discarded`; `Ripristina` lo riporta a `approved/advisory`;
 - [ ] `/media`: browser verifica stream, mostra `Archivia`/`Ripristina`/`Elimina definitivamente` secondo lo stato;
 - [ ] eliminazione definitiva: doppia conferma obbligatoria, solo per media mai usato; media riservato o usato non è eliminabile;
-- [ ] digest growth alle 09:00 Rome: al massimo 5 account, 10 post, 5 da rivalutare; ogni azione (follow, like) resta manuale su X;
-- [ ] `Segnala come seguito` aggiorna solo SQLite; zero chiamate di engagement X;
-- [ ] pulsanti post/account del digest aprono URL X per azione manuale; nessun callback di follow/like sui post;
-- [ ] con Reply Copilot attivo, `/replies` mostra al massimo cinque candidati già presenti nel digest, inclusi al massimo due account seguiti;
-- [ ] ogni risposta è pertinente e inglese; le eventuali promozioni sono al massimo tre, contestuali e riportano condizioni trasparenti;
-- [ ] `Copia risposta` e `Rispondi su X` non cambiano lo stato e la pubblicazione resta manuale;
-- [ ] dopo la pubblicazione manuale su X, solo `Segna come pubblicata` aggiorna SQLite; rigenerazione e scarto restano revision-bound;
-- [ ] il ledger X non cambia durante build, apertura, copia, Web Intent, rigenerazione, scarto e marcatura manuale;
+- [ ] digest growth alle 09:00 Rome: al massimo 5 palestre, 10 like, unfollow proposti ≤ 5 a settimana;
+- [ ] schede like: `Apri post su X`, `Like messo`, `Salta`; nessuna scrittura X;
+- [ ] schede palestra: `Apri profilo`, `Apri ultimo post`, `Non pertinente`;
+- [ ] schede unfollow: `Apri profilo`, `Unfollow fatto`, `Tieni`, `È una palestra`; mai palestre;
+- [ ] dopo le 23:15 la tabella `x_following` contiene la lista following reale;
+- [ ] il ledger X contiene solo letture; zero chiamate di engagement;
 - [ ] `/pause` impedisce la pubblicazione e `/resume` la riabilita;
 - [ ] reinvio dello stesso callback senza doppia mutazione;
 - [ ] snapshot follower e report `/stats` coerenti;
