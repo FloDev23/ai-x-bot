@@ -248,7 +248,7 @@ def _growth_digest_configuration():
         "GROWTH_POST_SUGGESTION_LIMIT", 10, 10,
     )
     post_query_budget = _bounded_positive_int_env(
-        "GROWTH_POST_QUERY_BUDGET", 2, 2,
+        "GROWTH_POST_QUERY_BUDGET", 1, 1,
     )
     cooldown_days = _strict_positive_int_env(
         "GROWTH_SUGGESTION_COOLDOWN_DAYS", 30,
@@ -257,11 +257,9 @@ def _growth_digest_configuration():
         raise ValueError(
             "GROWTH_SUGGESTION_COOLDOWN_DAYS must be exactly 30 for this release"
         )
-    review_days = _strict_positive_int_env("GROWTH_UNFOLLOW_REVIEW_DAYS", 14)
-    if review_days != 14:
-        raise ValueError(
-            "GROWTH_UNFOLLOW_REVIEW_DAYS must be exactly 14 for this release"
-        )
+    review_days = _strict_positive_int_env("GROWTH_UNFOLLOW_REVIEW_DAYS", 30)
+    if review_days < 30:
+        raise ValueError("GROWTH_UNFOLLOW_REVIEW_DAYS must be at least 30")
     return {
         "GROWTH_DIGEST_TIME": digest_time,
         "GROWTH_ACCOUNT_SUGGESTION_LIMIT": account_limit,

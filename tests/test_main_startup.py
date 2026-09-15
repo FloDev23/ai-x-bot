@@ -23,9 +23,9 @@ def test_main_module_imports_without_legacy_scheduler_helpers():
         ("GROWTH_ACCOUNT_SUGGESTION_LIMIT", "0"),
         ("GROWTH_ACCOUNT_SUGGESTION_LIMIT", "6"),
         ("GROWTH_POST_SUGGESTION_LIMIT", "11"),
-        ("GROWTH_POST_QUERY_BUDGET", "3"),
+        ("GROWTH_POST_QUERY_BUDGET", "2"),
         ("GROWTH_SUGGESTION_COOLDOWN_DAYS", "31"),
-        ("GROWTH_UNFOLLOW_REVIEW_DAYS", "13"),
+        ("GROWTH_UNFOLLOW_REVIEW_DAYS", "29"),
     ),
 )
 def test_growth_digest_configuration_fails_closed(name, value):
@@ -65,7 +65,7 @@ def test_growth_digest_configuration_has_bounded_release_defaults():
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "09:00 5 10 2 30 14"
+    assert result.stdout.strip() == "09:00 5 10 1 30 30"
 
 
 @pytest.mark.parametrize(
@@ -178,3 +178,22 @@ def test_x_api_usd_configuration_converts_exactly_to_microusd():
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "12345678"
+
+
+def test_unfollow_review_days_accepts_longer_windows():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; os.environ['GROWTH_UNFOLLOW_REVIEW_DAYS'] = '45'; "
+                "import config; print(config.GROWTH_UNFOLLOW_REVIEW_DAYS)"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "45"
