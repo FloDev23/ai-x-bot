@@ -608,7 +608,7 @@ def test_sqlite_digest_prioritizes_us_market_before_global_score(tmp_path):
     assert [row["user_id"] for row in rows] == ["1002", "1001"]
 
 
-def test_empty_seed_configuration_uses_a_real_us_search_instead_of_network(tmp_path):
+def test_empty_seed_configuration_uses_a_real_search_instead_of_network(tmp_path):
     fake_x = FakeX()
     growth = discovery(tmp_path, fake_x, seed_accounts=())
 
@@ -617,7 +617,22 @@ def test_empty_seed_configuration_uses_a_real_us_search_instead_of_network(tmp_p
     source_calls = [call for call in fake_x.calls if call[0] != "followers"]
     assert len(source_calls) == 3
     assert {call[0] for call in source_calls} == {"search"}
-    assert any("place_country:US" in call[1] for call in source_calls)
+    assert any('"our gym"' in call[1] for call in source_calls)
+
+
+def test_shipped_queries_search_what_a_gym_posts_not_what_a_bio_says():
+    """Roles belong in the bio filter: in post text they find gym-goers."""
+    from modules.growth_discovery import (
+        DEFAULT_TOPIC_QUERIES,
+        _NO_SEED_US_FACILITY_QUERY,
+    )
+
+    for query in (*DEFAULT_TOPIC_QUERIES, _NO_SEED_US_FACILITY_QUERY):
+        assert "place_country" not in query
+        assert "owner" not in query.lower()
+        assert "founder" not in query.lower()
+        assert "lang:en" in query
+        assert "-is:retweet" in query
 
 
 def test_source_order_rotates_between_daily_runs_in_sqlite(tmp_path):

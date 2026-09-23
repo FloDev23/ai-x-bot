@@ -29,27 +29,30 @@ from modules.growth_candidate_schema import (
 
 logger = logging.getLogger(__name__)
 
+# X search matches the text of posts, not bios. Asking for "owner" or "founder"
+# in the post text finds people talking *about* a gym, not the gyms themselves:
+# that is what filled the candidate table with random accounts. These queries
+# look for what a gym actually posts, and the bio filter decides who is an
+# operator. Geo operators are also avoided: place_country:US only matches
+# geotagged posts, which almost no gym uses.
 DEFAULT_TOPIC_QUERIES = (
-    '("gym owner" OR "fitness studio owner" OR "CrossFit box owner" OR "fitness center" OR '
-    '"CrossFit box" OR "boxing gym" OR "martial arts school" OR "pilates studio" OR '
-    '"yoga studio" OR "fitness studio" OR "spinning studio" OR "barre studio" OR '
-    '"climbing gym" OR "dojo") '
-    '(booking OR schedule OR "class management" OR "drop-in" OR "day pass" OR '
-    '"no-show" OR waitlist OR software OR app OR capacity) '
-    'lang:en place_country:US -is:retweet',
-    '(CrossFit OR HYROX OR ATHX OR Pilates OR Yoga OR Boxing OR BJJ OR '
-    '"Muay Thai" OR Karate OR MMA OR Spinning OR Barre OR Calisthenics OR '
-    '"Functional Training" OR HIIT OR Bootcamp OR Climbing OR Swimming OR '
-    '"Pole Dance" OR "Personal Training" OR Weightlifting) '
-    '(studio OR gym OR box OR "training center" OR "fitness center" OR dojo) '
-    '(owner OR founder OR manager OR operator OR "head coach") '
+    '("drop-in" OR "drop in class" OR "day pass" OR "open gym" OR '
+    '"class schedule" OR "book a class" OR "class times" OR "walk-ins welcome") '
+    '(gym OR studio OR box OR crossfit OR pilates OR yoga OR bjj OR '
+    '"martial arts" OR boxing OR climbing) '
+    'lang:en -is:retweet',
+    '("new members" OR "join us" OR "first class" OR "free trial class" OR '
+    '"class is full" OR "spots left" OR "no-show" OR waitlist) '
+    '(gym OR studio OR box OR crossfit OR pilates OR yoga OR "fitness center" OR '
+    '"training center" OR dojo) '
     'lang:en -is:retweet',
 )
 _NO_SEED_US_FACILITY_QUERY = (
-    '("our gym" OR "our fitness studio" OR "our CrossFit box" OR '
-    '"our pilates studio" OR "our yoga studio") '
-    '(classes OR members OR membership OR schedule OR "drop-in" OR "day pass") '
-    'lang:en place_country:US -is:retweet'
+    '("our gym" OR "our studio" OR "our box" OR "our members" OR '
+    '"at the gym today" OR "schedule for the week") '
+    '(class OR classes OR members OR membership OR schedule OR "drop-in" OR '
+    '"day pass" OR coach) '
+    'lang:en -is:retweet'
 )
 _OPERATING_TOPIC_TERMS = (
     "class",

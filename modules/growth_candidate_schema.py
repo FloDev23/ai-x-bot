@@ -69,6 +69,13 @@ _FITNESS_FACILITY_REFERENCE_PATTERN = re.compile(
     rf"crossfit affiliates?|{_QUALIFIED_FITNESS_FACILITY_FRAGMENT})\b",
     re.IGNORECASE,
 )
+# An affiliate rarely writes "CrossFit box": the bio is the box name itself,
+# "CrossFit Riverside". Requiring a capitalised word after the brand keeps
+# "I do crossfit" out.
+_BRANDED_AFFILIATE_PATTERN = re.compile(
+    r"\b(?:CrossFit|F45|OrangeTheory|9Round|Burn Boot Camp)\s+"
+    r"[A-Z][A-Za-z0-9'\u2019-]{2,}"
+)
 _FITNESS_FACILITY_IDENTITY_PATTERN = re.compile(
     rf"\b(?:dojos?|fitness (?:studios?|centers?|centres?|clubs?|facilit(?:y|ies))|"
     rf"crossfit affiliates?|{_QUALIFIED_FITNESS_FACILITY_FRAGMENT}|"
@@ -178,9 +185,11 @@ def has_managed_fitness_facility_context(profile: Any) -> bool:
                     ) is None
                 ):
                     return True
+    if _NON_MANAGEMENT_PERSON_PATTERN.search(description):
+        return False
     return bool(
         _FITNESS_FACILITY_IDENTITY_PATTERN.search(description)
-        and not _NON_MANAGEMENT_PERSON_PATTERN.search(description)
+        or _BRANDED_AFFILIATE_PATTERN.search(description)
     )
 
 
