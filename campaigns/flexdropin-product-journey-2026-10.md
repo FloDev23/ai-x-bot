@@ -115,7 +115,7 @@ Root asset: `media_library/product-journey-2026-09/08-discover-compare-book-v2.p
 
 7. And the widget keeps your next workout visible from the Home Screen. Less admin between you and training.
 
-   FlexDropin launched on Product Hunt on September 30.
+   FlexDropin launched on Product Hunt on October 7.
 
 ## Visual prompt set
 
