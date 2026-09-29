@@ -41,9 +41,9 @@ Human-first content represents 61.7% of the calendar. The feed therefore leads w
 | Sep 26 | Human thought | Human thought, 13:20 | Independent-gym research thread |
 | Sep 27 | Human thought | Human thought, 12:50 | Blog: pricing a drop-in |
 | Sep 28 | Human thought | Human thought, 13:35 | Product Hunt pre-launch thread |
-| Sep 29 | Human thought | Human thought, 12:25 | Product journey: class list |
+| Sep 29 | Human thought | Product Hunt date change, 12:25 | Product journey: class list |
 | Sep 30 | Human thought | Human thought, 13:05 | Research: 44,983 US locations |
-| Oct 1 | Human thought | — | Product journey: Explore |
+| Oct 1 | Human thought | Human thought, 12:50 | Product journey: Explore |
 | Oct 2 | Human thought | Human thought, 13:15 | US gym owner: empty spots |
 | Oct 3 | Human thought | — | Product journey: gym detail |
 | Oct 4 | Human thought | Human thought, 12:40 | US gym owner: manual DMs |
@@ -96,6 +96,8 @@ On September 29, 2026 the Product Hunt launch moved from September 30 to October
 - swapped the September 30 and October 7 morning thoughts, so the "excitement and nerves" post runs on launch day;
 - replaced the September 30 midday launch thought with a neutral human thought;
 - changed the October 30 product thread's closing line to "launched on Product Hunt on October 7".
+
+`scripts/announce_product_hunt_date_change.py` added a sixth Product Hunt post, a date-change announcement, in the September 29 12:25 slot. The human thought it displaced moved to a new October 1 midday slot at 12:50, so the calendar now holds 95 posts.
 
 ## Content ownership and verification
 

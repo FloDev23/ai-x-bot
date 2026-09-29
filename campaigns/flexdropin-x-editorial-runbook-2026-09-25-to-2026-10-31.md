@@ -20,6 +20,8 @@ La distribuzione finale è:
 | Contenuti per gym owner statunitensi | 10 | 10,6% |
 | **Totale** | **94** | **100%** |
 
+> Aggiornamento 29 settembre: con l'annuncio del cambio data Product Hunt i post programmati salgono a **95** (Product Hunt 6, 1 ottobre con tre post). Le percentuali sotto si riferiscono al piano originale da 94.
+
 I contenuti human-first sono **58 su 94**, cioè il **61,7%** del calendario. Sono quindi la voce dominante dell'account.
 
 La cadenza è:
@@ -112,6 +114,7 @@ Sono rimasti programmati cinque contenuti per rendere visibile il lancio. Il 29 
 - 25 settembre: thread sui dati del mercato fitness USA;
 - 26 settembre: thread sulle palestre indipendenti e sui piccoli team;
 - 28 settembre: thread pre-lancio e storia del prodotto;
+- 29 settembre, 12:25: annuncio del cambio data (`scripts/announce_product_hunt_date_change.py`);
 - 6 ottobre: promemoria “launch tomorrow” (era 29 settembre, scambiato con il post product journey “Class list”);
 - 7 ottobre: annuncio “live on Product Hunt” (era 30 settembre, scambiato con il post ricerca “44,983 US locations”).
 
@@ -171,8 +174,8 @@ Questi post non hanno immagini, link o CTA commerciali.
 | Sep 26, 13:20 | I think a good class description can remove more anxiety than a motivational quote ever will. |
 | Sep 27, 12:50 | A workout doesn't need to become a new routine to be worthwhile. Sometimes one class is exactly enough. |
 | Sep 28, 13:35 | Some people need routine to stay consistent. Others stay consistent because they can change the routine. |
-| Sep 29, 12:25 | I keep thinking about how many decisions disappear once a workout is already booked. |
 | Sep 30, 13:05 | Some days, putting one small workout on the calendar is enough to make the whole week feel less chaotic. |
+| Oct 1, 12:50 | I keep thinking about how many decisions disappear once a workout is already booked. |
 | Oct 2, 13:15 | There is always one class people rearrange their whole day to attend. I don't think it's only about the programming. |
 | Oct 4, 12:40 | I wonder how many workouts disappear between 'I should train today' and deciding where to go. |
 | Oct 6, 14:05 | A gym can feel welcoming before anyone says a word. Clear information is part of that feeling. |
@@ -294,6 +297,17 @@ Questi post non hanno immagini, link o CTA commerciali.
 
    Follow the Product Hunt launch:  
    https://www.producthunt.com/products/flexdropin?launch=flexdropin
+
+### 29 settembre, 12:25 ET — cambio data
+
+```text
+Quick update: FlexDropin's Product Hunt launch has moved to October 7.
+
+If you were planning to support us tomorrow, thank you—we'd love to see you there on the 7th instead.
+
+Follow the launch:
+https://www.producthunt.com/products/flexdropin?launch=flexdropin
+```
 
 ### 6 ottobre, 18:30 ET — lancio domani
 
