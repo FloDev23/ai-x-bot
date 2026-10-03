@@ -899,33 +899,6 @@ def test_growth_digest_cycle_reads_clock_once_and_reuses_controller_formatter(
     assert controller.calls == [(empty, False)]
 
 
-def test_reply_copilot_is_retired_even_when_flag_is_true(tmp_path):
-    dependencies = dependency_bundle(tmp_path, reply_copilot_enabled=True)
-    agent = FlexDropinGrowthAgent(dependencies)
-    agent._register_telegram_commands()
-
-    assert agent.reply_copilot is None
-    assert agent.telegram_controller.reply_copilot is None
-    assert "replies" not in {
-        item["command"] for item in dependencies["telegram_api"].commands
-    }
-    assert {job.id for job in agent.register_jobs()} == {
-        "source_refresh",
-        "queue_replenishment",
-        "translation_retry",
-        "publication_planning",
-        "adaptive_publish",
-        "growth_digest",
-        "follower_snapshot",
-        "performance_metrics",
-        "weekly_growth_report",
-    }
-    with pytest.raises(ValueError, match="reply_copilot_enabled"):
-        FlexDropinGrowthAgent(dependency_bundle(
-            tmp_path / "invalid", reply_copilot_enabled="true",
-        ))
-
-
 def test_adaptive_cycles_use_one_clock_read_and_stop_event(tmp_path):
     from modules.publication_queue import QueueReplenishResult
 

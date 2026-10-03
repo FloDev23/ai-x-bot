@@ -23,7 +23,6 @@ from config import (
 )
 from modules.growth_candidate_schema import parse_growth_datetime
 from modules.media_store import open_verified_media
-from modules.reply_copilot import build_reply_web_intent
 from modules.telegram_media_browser import MediaBrowser
 from modules.telegram_post_browser import PostBrowser
 from modules.content_planner import PORTFOLIO, SOURCE_TYPES as MANUAL_SOURCE_TYPES
@@ -65,9 +64,9 @@ _SOURCE_TYPES = {
 }
 _SOURCE_TRUST_LABELS = {"verified": "Verificata"}
 _LIKE_SOURCE_LABELS = {
-    "followed_gym": "palestra seguita",
-    "suggested_gym": "palestra suggerita",
-    "operator_pain": "gestore",
+    "followed_account": "account seguito",
+    "suggested_account": "account suggerito",
+    "founder_conversation": "conversazione founder",
 }
 _MANUAL_CATEGORY_LABELS = {
     "gym_strategy": "Strategia palestra",
@@ -101,7 +100,6 @@ class TelegramController:
         media_matcher=None,
         analytics=None,
         growth_digest=None,
-        reply_copilot=None,
         scheduler_status=None,
         queue_service=None,
         dry_run: Optional[bool] = None,
@@ -119,7 +117,6 @@ class TelegramController:
         self.media_matcher = media_matcher
         self.analytics = analytics
         self.growth_digest = growth_digest
-        self.reply_copilot = reply_copilot
         self.scheduler_status = scheduler_status
         self.queue_service = queue_service
         self.dry_run = DRY_RUN if dry_run is None else bool(dry_run)
@@ -134,7 +131,6 @@ class TelegramController:
             "/status": self._status,
             "/posts": self._posts,
             "/growth": self._growth,
-            "/replies": self._replies,
             "/stats": self._stats,
             "/ideas": self._ideas,
             "/newpost": self._newpost,
@@ -375,30 +371,6 @@ class TelegramController:
             f"  revisione:     {pending_count}/{PENDING_REVIEW_LIMIT}",
             f"  generati oggi: {generation_used}/{DRAFT_GENERATION_DAILY_CAP}",
         ]
-        if self.reply_copilot is not None:
-            try:
-                reply_date = current.astimezone(
-                    ZoneInfo("Europe/Rome")
-                ).date().isoformat()
-                reply_counts = self.reply_copilot.counts(reply_date)
-            except Exception:
-                reply_counts = {}
-            if all(
-                type(reply_counts.get(key)) is int
-                and reply_counts[key] >= 0
-                for key in (
-                    "ready", "generation_failed", "dismissed",
-                    "published_manually",
-                )
-            ):
-                lines.extend([
-                    "",
-                    "Reply Copilot — oggi",
-                    f"  pronte: {reply_counts['ready']}",
-                    f"  fallite: {reply_counts['generation_failed']}",
-                    f"  ignorate: {reply_counts['dismissed']}",
-                    f"  pubblicate manualmente: {reply_counts['published_manually']}",
-                ])
         period_key = current.astimezone(timezone.utc).strftime("%Y-%m")
         try:
             api_usage = self.db.get_x_api_usage_summary(period_key)
@@ -868,7 +840,7 @@ class TelegramController:
 
         lines = [
             "Growth giornaliero — azioni manuali su X",
-            f"Palestre da seguire: {len(collections['accounts'])}",
+            f"Founder da seguire: {len(collections['accounts'])}",
             f"Like: {len(collections['posts'])}",
             f"Unfollow proposti: {len(collections['reevaluate'])}",
         ]
@@ -919,259 +891,6 @@ class TelegramController:
             return "growth_digest_empty"
         digest = self.growth_digest.build(self._now())
         return self.push_growth_digest(digest, explicit=True)
-
-    def _replies(self, chat_id: str):
-        if self.reply_copilot is None:
-            self._send(chat_id, "Reply Copilot non attivo.")
-            return "reply_copilot_disabled"
-        current = self._now()
-        observed_on = current.astimezone(
-            ZoneInfo("Europe/Rome")
-        ).date().isoformat()
-        summary = self.reply_copilot.build(observed_on, now=current)
-        return self.push_reply_digest(summary, explicit=True)
-
-    @staticmethod
-    def _valid_reply_summary(summary: Any) -> bool:
-        if type(summary) is not dict:
-            return False
-        try:
-            observed_on = summary.get("observed_on")
-            valid_date = date.fromisoformat(observed_on).isoformat() == observed_on
-        except (TypeError, ValueError):
-            return False
-        return (
-            valid_date
-            and summary.get("outcome") in {
-                "created", "existing", "no_candidates", "no_digest", "invalid",
-            }
-            and type(summary.get("ready")) is int
-            and summary["ready"] >= 0
-            and type(summary.get("failed")) is int
-            and summary["failed"] >= 0
-        )
-
-    def push_reply_digest(self, summary: Dict[str, Any], *, explicit: bool = False):
-        """Present persisted reply suggestions without performing an X action."""
-        if self.reply_copilot is None or not self._valid_reply_summary(summary):
-            if explicit:
-                self._send(self.authorized_chat_id, "Nessuna risposta disponibile.")
-                return "reply_digest_empty"
-            return "reply_digest_silent"
-        if summary["outcome"] == "no_digest":
-            if explicit:
-                self._send(
-                    self.authorized_chat_id,
-                    "Nessun candidato disponibile: prima serve un Growth Digest persistito.",
-                )
-                return "reply_digest_empty"
-            return "reply_digest_silent"
-        if (
-            not explicit
-            and (summary["outcome"] != "created" or summary["ready"] == 0)
-        ):
-            return "reply_digest_silent"
-        rows = self.reply_copilot.list(summary["observed_on"])
-        rows = [
-            row for row in rows
-            if type(row) is dict
-            and type(row.get("id")) is int
-            and row["id"] > 0
-            and type(row.get("revision")) is int
-            and row["revision"] >= 0
-        ]
-        if not rows:
-            if explicit:
-                self._send(self.authorized_chat_id, "Nessuna risposta disponibile.")
-                return "reply_digest_empty"
-            return "reply_digest_silent"
-        self._send(
-            self.authorized_chat_id,
-            "\n".join([
-                "Reply Copilot — risposte manuali",
-                f"Pronte: {summary['ready']}",
-                f"Fallite: {summary['failed']}",
-            ]),
-        )
-        token = self.db.create_telegram_view(
-            self.authorized_chat_id,
-            "reply_copilot",
-            {
-                "target_ids": [row["id"] for row in rows],
-                "direction": "current",
-                "filters": {"observed_on": summary["observed_on"]},
-                "last_message_id": None,
-                "cursor": None,
-                "previous_cursor": None,
-            },
-        )
-        first = next(
-            (row for row in rows if row.get("status") == "ready"), rows[0]
-        )
-        self._send_reply_card(self.authorized_chat_id, token, first)
-        return "reply_digest"
-
-    def _reply_callback_identity(self, chat_id: str, parts, *, action=False):
-        expected_length = 5 if action else 4
-        token_index = 2 if action else 1
-        id_index = 3 if action else 2
-        revision_index = 4 if action else 3
-        if len(parts) != expected_length:
-            return None, None, None
-        token = parts[token_index]
-        reply_id = self._positive_id(parts[id_index])
-        revision = self._nonnegative_id(parts[revision_index])
-        if reply_id is None or revision is None:
-            return None, None, None
-        view = self.db.get_telegram_view(token, chat_id, "reply_copilot")
-        if view is None or reply_id not in view["state"]["target_ids"]:
-            return None, None, None
-        row = self.db.get_reply_suggestion(reply_id, revision)
-        if row is None:
-            return None, None, None
-        return token, view, row
-
-    def _send_reply_card(self, chat_id: str, token: str, row: Dict[str, Any]):
-        reply_id = row["id"]
-        revision = row["revision"]
-        status = self._clean_text(row.get("status"), 40) or "sconosciuto"
-        source_kind = row.get("source_kind", "discovery")
-        reply_kind = row.get("reply_kind", "value")
-        source_label = (
-            "account seguito da @FlexDropin"
-            if source_kind == "following"
-            else "scoperta Growth"
-        )
-        reply_label = (
-            "promozionale contestuale"
-            if reply_kind != "value"
-            else "di valore"
-        )
-        text_lines = [
-            f"Post di @{self._clean_text(row.get('author_username'), 15)}",
-            f"Estratto: {self._clean_text(row.get('source_excerpt'), 500)}",
-            f"Fonte: {source_label}",
-            f"Segmento: {self._clean_text(row.get('audience_segment'), 20)}",
-            f"Tipo: {reply_label}",
-            f"Rilevanza: {row.get('relevance_score')}",
-            f"Stato: {status}",
-        ]
-        reply = row.get("reply_text")
-        rows = []
-        if status == "ready" and isinstance(reply, str):
-            intent = build_reply_web_intent(
-                row.get("tweet_id"), reply, reply_kind=reply_kind,
-            )
-            text_lines.extend([
-                "",
-                "Risposta suggerita:",
-                reply,
-                f"Caratteri: {len(reply)}/256",
-            ])
-            if intent is not None:
-                rows.append([
-                    {
-                        "text": "Copia risposta",
-                        "copy_text": {"text": reply},
-                    },
-                    {"text": "Rispondi su X", "url": intent},
-                ])
-            actions = []
-            if reply_kind == "value" and row.get("generation_count", 3) < 3:
-                actions.append(self._callback_button(
-                    "Rigenera", f"rpa:g:{token}:{reply_id}:{revision}",
-                ))
-            actions.extend([
-                self._callback_button(
-                    "Ignora", f"rpa:d:{token}:{reply_id}:{revision}",
-                ),
-                self._callback_button(
-                    "Segna come pubblicata",
-                    f"rpa:p:{token}:{reply_id}:{revision}",
-                ),
-            ])
-            rows.append(actions)
-        elif status == "generation_failed":
-            text_lines.append("Generazione non riuscita: puoi riprovare manualmente.")
-            if reply_kind == "value" and row.get("generation_count", 3) < 3:
-                rows.append([self._callback_button(
-                    "Rigenera", f"rpa:g:{token}:{reply_id}:{revision}",
-                )])
-        text_lines.extend([
-            "",
-            "Pubblicazione manuale: il bot non risponde su X",
-        ])
-        view = self.db.get_telegram_view(token, chat_id, "reply_copilot")
-        target_ids = view["state"]["target_ids"] if view is not None else []
-        try:
-            position = target_ids.index(reply_id)
-        except ValueError:
-            position = None
-        navigation = []
-        if position is not None and position > 0:
-            previous = self.db.get_reply_suggestion(target_ids[position - 1])
-            if previous is not None:
-                navigation.append(self._callback_button(
-                    "Precedente",
-                    f"rp:{token}:{previous['id']}:{previous['revision']}",
-                ))
-        if position is not None and position + 1 < len(target_ids):
-            following = self.db.get_reply_suggestion(target_ids[position + 1])
-            if following is not None:
-                navigation.append(self._callback_button(
-                    "Successiva",
-                    f"rp:{token}:{following['id']}:{following['revision']}",
-                ))
-        navigation.append(self._callback_button(
-            "Aggiorna", f"rp:{token}:{reply_id}:{revision}",
-        ))
-        rows.append(navigation)
-        self._send(
-            chat_id,
-            "\n".join(text_lines),
-            reply_markup=self._callback_markup(rows),
-        )
-
-    def _reply_detail(self, chat_id: str, parts):
-        token, _view, row = self._reply_callback_identity(chat_id, parts)
-        if row is None:
-            self._send(chat_id, "Risposta non valida o scaduta. Usa /replies.")
-            return "reply_unavailable"
-        self._send_reply_card(chat_id, token, row)
-        return "reply_detail"
-
-    def _reply_action(self, chat_id: str, parts):
-        if len(parts) != 5 or parts[1] not in {"g", "d", "p"}:
-            self._send(chat_id, "Azione risposta non valida o scaduta.")
-            return "reply_action_invalid"
-        token, _view, row = self._reply_callback_identity(
-            chat_id, parts, action=True,
-        )
-        if row is None or self.reply_copilot is None:
-            self._send(chat_id, "Risposta non valida o scaduta. Usa /replies.")
-            return "reply_unavailable"
-        current = self._now()
-        if parts[1] == "g":
-            updated, outcome = self.reply_copilot.regenerate(
-                row["id"], row["revision"], now=current,
-            )
-        elif parts[1] == "d":
-            updated, outcome = self.reply_copilot.dismiss(
-                row["id"], row["revision"], now=current,
-            )
-        else:
-            updated, outcome = self.reply_copilot.mark_published(
-                row["id"], row["revision"], now=current,
-            )
-        if outcome not in {"updated", "duplicate", "failed"} or updated is None:
-            self._send(chat_id, "Risposta non valida o scaduta. Usa /replies.")
-            return "reply_action_rejected"
-        self._send_reply_card(chat_id, token, updated)
-        return {
-            "g": "reply_regenerated",
-            "d": "reply_dismissed",
-            "p": "reply_published_manually",
-        }[parts[1]]
 
     def _growth_digest_detail(self, chat_id: str, parts):
         if len(parts) != 4 or parts[1] not in {"a", "p", "r"}:
@@ -1227,7 +946,7 @@ class TelegramController:
         elif expected_kind == "account":
             metrics = payload["public_metrics"]
             text = "\n".join([
-                f"Palestra da seguire @{username}",
+                f"Founder da seguire @{username}",
                 f"follower: {metrics['followers_count']}",
                 f"following: {metrics['following_count']}",
                 f"post: {metrics['tweet_count']}",
@@ -1260,7 +979,7 @@ class TelegramController:
             if type(followed_since) is str:
                 text_lines.append(f"Seguito dal: {followed_since[:10]}")
             text_lines.extend([
-                "Non ti segue e non risulta una palestra.",
+                "Non ti segue dopo 30 giorni.",
                 "Se decidi, togli il segui manualmente su X.",
             ])
             text = "\n".join(text_lines)
@@ -1273,7 +992,7 @@ class TelegramController:
                     self._callback_button("Tieni", f"gda:k:{suggestion_id_text}"),
                 ],
                 [self._callback_button(
-                    "È una palestra", f"gda:g:{suggestion_id_text}",
+                    "Tieni sempre", f"gda:p:{suggestion_id_text}",
                 )],
             ]
         digest = self.db.get_growth_digest(suggestion["observed_on"])
@@ -1314,7 +1033,7 @@ class TelegramController:
             "s": "skipped",
             "u": "unfollowed_manually",
             "k": "keep",
-            "g": "marked_gym",
+            "p": "pinned",
         }
         confirmations = {
             "n": "Account segnato come non pertinente per 30 giorni.",
@@ -1322,7 +1041,7 @@ class TelegramController:
             "s": "Post saltato.",
             "u": "Unfollow registrato solo localmente; il controllo notturno lo verifica.",
             "k": "Account tenuto: non verrà riproposto per 90 giorni.",
-            "g": "Segnato come palestra: non verrà mai proposto per l'unfollow.",
+            "p": "Account tenuto per sempre: non verrà mai proposto per l'unfollow.",
         }
         if len(parts) != 4 or parts[1] not in decisions:
             self._send(chat_id, "Azione locale non valida.")
@@ -1471,9 +1190,7 @@ class TelegramController:
             "",
             "Following",
             f"  totali: {following_int('following_total')}"
-            f"  |  palestre: {following_int('gyms_following')}",
-            f"  follow-back palestre: {following_rate('gym_follow_back_rate'):.0f}%"
-            f"  |  altri: {following_rate('other_follow_back_rate'):.0f}%",
+            f"  |  follow-back: {following_rate('follow_back_rate'):.0f}%",
             f"  unfollow: {following_int('unfollows')}",
         ]
         likes = following.get("likes_by_source")
@@ -1935,7 +1652,7 @@ class TelegramController:
             "Comandi",
             "/status — stato e prossimi job",
             "/posts — bozze in coda (no pubblicati)",
-            "/growth — palestre da seguire, like e unfollow suggeriti",
+            "/growth — founder da seguire, like e unfollow suggeriti",
             "/stats — riepilogo performance",
             "/ideas — aggiungi una fonte",
             "/newpost — aggiungi un post manuale alla coda",
@@ -2609,10 +2326,6 @@ class TelegramController:
             return self._growth_digest_detail(chat_id, parts)
         if parts[0] == "gda":
             return self._growth_digest_action(chat_id, parts)
-        if parts[0] == "rp":
-            return self._reply_detail(chat_id, parts)
-        if parts[0] == "rpa":
-            return self._reply_action(chat_id, parts)
         if parts[0] == "input":
             return self._input_callback(chat_id, parts)
         if parts[0] == "manual":

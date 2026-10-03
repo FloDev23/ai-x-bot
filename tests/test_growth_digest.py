@@ -43,7 +43,7 @@ def _author(user_id="101", username="gymowner", **overrides):
 def _post(post_id="9001", author_id="101", **overrides):
     values = {
         "id": post_id,
-        "text": "Gym owners can fill empty class capacity with drop-in bookings.",
+        "text": "Building in public: launched our booking app and got the first paying customers.",
         "author_id": author_id,
         "created_at": datetime.now(timezone.utc) - timedelta(hours=2),
         "lang": "en",
@@ -87,7 +87,7 @@ def test_relevant_post_read_requests_exact_fields_and_returns_closed_projection(
     }]
     assert rows == [{
         "id": "9001",
-        "text": "Gym owners can fill empty class capacity with drop-in bookings.",
+        "text": "Building in public: launched our booking app and got the first paying customers.",
         "author_id": "101",
         "author_username": "gymowner",
         "created_at": rows[0]["created_at"],
@@ -383,7 +383,7 @@ def test_relevant_post_requires_entities_for_mixed_case_url_scheme():
 
 
 def _account_row(object_id="101", username="gymowner"):
-    reasons = ["primary_operator_role", "active_within_7_days"]
+    reasons = ["founder_bio", "active_within_7_days"]
     return {
         "object_id": object_id,
         "username": username,
@@ -398,7 +398,7 @@ def _account_row(object_id="101", username="gymowner"):
             },
             "latest_activity_id": "8001",
             "latest_activity_at": (NOW - timedelta(hours=2)).isoformat(),
-            "segment": "primary",
+            "segment": "peer",
             "reason_codes": reasons,
         },
         "score": 90,
@@ -408,7 +408,7 @@ def _account_row(object_id="101", username="gymowner"):
 
 
 def _post_row(object_id="9001", username="gymowner"):
-    reasons = ["gym_owner", "empty_capacity", "drop_in", "recent"]
+    reasons = ["build_in_public", "launch", "traction", "recent"]
     return {
         "object_id": object_id,
         "username": username,
@@ -416,7 +416,7 @@ def _post_row(object_id="9001", username="gymowner"):
             "id": object_id,
             "author_id": "101",
             "author_username": username,
-            "excerpt": "Gym owners can fill empty class capacity with drop-ins.",
+            "excerpt": "Building in public: launched our booking app and got the first paying customers.",
             "created_at": (NOW - timedelta(hours=2)).isoformat(),
             "public_metrics": {
                 "like_count": 20,
@@ -814,7 +814,7 @@ def test_read_claim_budget_completion_and_stale_recovery_survive_restart(tmp_pat
 
 
 def _candidate(user_id="101", username="gymowner", score=90):
-    reasons = ["primary_operator_role", "active_within_7_days"]
+    reasons = ["founder_bio", "active_within_7_days"]
     return {
         "user_id": user_id,
         "username": username,
@@ -834,7 +834,7 @@ def _candidate(user_id="101", username="gymowner", score=90):
             "created_at": (NOW - timedelta(hours=2)).isoformat(),
         },
         "score": score,
-        "audience_segment": "primary",
+        "audience_segment": "peer",
         "reasons": reasons,
         "activity_at": (NOW - timedelta(hours=2)).isoformat(),
     }
@@ -844,7 +844,7 @@ def _normalized_post(post_id="9001", text=None, **overrides):
     values = {
         "id": post_id,
         "text": text or (
-            "Gym owners can fill empty class capacity with drop-in bookings."
+            "Building in public: launched our booking app and got the first paying customers."
         ),
         "author_id": "101",
         "author_username": "gymowner",
@@ -904,10 +904,10 @@ class DigestX:
         )
 
 
-GYM_BIO = "Independent gym in Austin, TX. Classes daily."
+PEER_BIO = "Founder of a booking app. Building in public."
 
 
-def _gym_profile(user_id, username, description=GYM_BIO):
+def _peer_profile(user_id, username, description=PEER_BIO):
     return {
         "id": user_id, "user_id": user_id, "username": username,
         "description": description, "protected": False,
@@ -928,8 +928,8 @@ def test_service_builds_closed_ranked_daily_digest_with_one_search(tmp_path):
     x_client = DigestX({
         0: [
             _normalized_post(
-                "9002", "Pilates studios can fill empty class spots.",
-                author_id="102", author_username="pilatesowner",
+                "9002", "Indie hackers: what do you think of our new pricing page?",
+                author_id="102", author_username="indiemaker",
             ),
             _normalized_post("9001"),
             _normalized_post("9003", "A generic fitness motivation quote."),
@@ -943,8 +943,8 @@ def test_service_builds_closed_ranked_daily_digest_with_one_search(tmp_path):
     assert digest["outcome"] == "created"
     assert [row["object_id"] for row in digest["accounts"]] == ["101"]
     assert [row["object_id"] for row in digest["posts"]] == ["9001", "9002"]
-    assert digest["posts"][0]["reason_codes"][0] == "operator_pain"
-    assert digest["posts"][0]["score"] == 84
+    assert digest["posts"][0]["reason_codes"][0] == "founder_conversation"
+    assert digest["posts"][0]["score"] == 86
     assert len(x_client.queries) == 1
     assert x_client.queries[0][1] == 25
     assert discovery.calls == 1
@@ -955,11 +955,11 @@ def test_service_builds_closed_ranked_daily_digest_with_one_search(tmp_path):
     assert x_client.engagement_writes == []
 
 
-def test_followed_gym_posts_skip_keywords_but_respect_age_and_gym_status(tmp_path):
-    database = Database(str(tmp_path / "followed-gym.db"))
+def test_followed_account_posts_skip_keywords_but_respect_age_and_noise(tmp_path):
+    database = Database(str(tmp_path / "followed-account.db"))
     _follow(database, [
-        _gym_profile("301", "gym_one"),
-        _gym_profile("302", "runner", "Fitness podcast host and runner."),
+        _peer_profile("301", "gym_one"),
+        _peer_profile("302", "runner", "Fitness podcast host and runner."),
     ])
     x_client = DigestX({0: []}, following_rows=[
         _normalized_post(
@@ -968,12 +968,12 @@ def test_followed_gym_posts_skip_keywords_but_respect_age_and_gym_status(tmp_pat
             created_at=(NOW - timedelta(hours=10)).isoformat(),
         ),
         _normalized_post(
-            "9102", "Old news from the gym floor.",
+            "9102", "Old news from the product roadmap.",
             author_id="301", author_username="gym_one",
             created_at=(NOW - timedelta(hours=80)).isoformat(),
         ),
         _normalized_post(
-            "9103", "Gym owners can fill empty class capacity.",
+            "9103", "Airdrop is live, claim your tokens now.",
             author_id="302", author_username="runner",
         ),
     ])
@@ -984,13 +984,13 @@ def test_followed_gym_posts_skip_keywords_but_respect_age_and_gym_status(tmp_pat
 
     assert x_client.following_reads == 1
     assert [row["object_id"] for row in digest["posts"]] == ["9101"]
-    assert digest["posts"][0]["reason_codes"] == ["followed_gym", "recent"]
+    assert digest["posts"][0]["reason_codes"] == ["followed_account", "recent"]
 
 
 def test_like_quotas_fill_order_and_one_post_per_author(tmp_path):
     database = Database(str(tmp_path / "quotas.db"))
     _follow(database, [
-        _gym_profile(str(301 + index), f"gym_{index}") for index in range(5)
+        _peer_profile(str(301 + index), f"gym_{index}") for index in range(5)
     ])
     timeline = [
         _normalized_post(
@@ -1017,17 +1017,17 @@ def test_like_quotas_fill_order_and_one_post_per_author(tmp_path):
 
     sources = [row["reason_codes"][0] for row in digest["posts"]]
     assert sources == (
-        ["followed_gym"] * 4 + ["operator_pain"] * 3
-        + ["followed_gym"] + ["operator_pain"] * 2
+        ["followed_account"] * 4 + ["founder_conversation"] * 3
+        + ["followed_account"] + ["founder_conversation"] * 2
     )
     authors = [row["payload"]["author_id"] for row in digest["posts"]]
     assert len(authors) == len(set(authors)) == 10
 
 
-def test_suggested_gym_latest_post_becomes_a_like(tmp_path):
+def test_suggested_account_latest_post_becomes_a_like(tmp_path):
     candidate = _candidate()
     candidate["latest_post"].update({
-        "text": "Open gym Saturday at 9am.",
+        "text": "Spent the weekend fixing onboarding.",
         "lang": "en",
         "public_metrics": {
             "like_count": 2, "retweet_count": 0, "reply_count": 0,
@@ -1043,7 +1043,7 @@ def test_suggested_gym_latest_post_becomes_a_like(tmp_path):
 
     assert [row["object_id"] for row in digest["accounts"]] == ["101"]
     assert [row["object_id"] for row in digest["posts"]] == ["8001"]
-    assert digest["posts"][0]["reason_codes"] == ["suggested_gym", "recent"]
+    assert digest["posts"][0]["reason_codes"] == ["suggested_account", "recent"]
 
 
 def test_like_author_cooldown_lasts_three_days(tmp_path):
@@ -1065,18 +1065,18 @@ def test_like_author_cooldown_lasts_three_days(tmp_path):
     assert [row["object_id"] for row in build("9003", later)["posts"]] == ["9003"]
 
 
-def test_account_suggestions_are_only_unfollowed_primary_gyms(tmp_path):
+def test_account_suggestions_are_only_unfollowed_peers(tmp_path):
     database = Database(str(tmp_path / "accounts.db"))
-    _follow(database, [_gym_profile("101", "gymowner")])
-    amplifier = _candidate("102", "amplifier")
-    amplifier["audience_segment"] = "amplifier"
-    amplifier["reasons"] = ["amplifier_role"]
+    _follow(database, [_peer_profile("101", "gymowner")])
+    other = _candidate("102", "other")
+    other["audience_segment"] = "other"
+    other["reasons"] = ["english_market"]
 
     digest = GrowthDigestService(
         DigestX({0: []}),
         database,
         discovery=DigestDiscovery([
-            _candidate("101", "gymowner"), amplifier, _candidate("103", "newgym"),
+            _candidate("101", "gymowner"), other, _candidate("103", "newgym"),
         ]),
     ).build(NOW)
 
@@ -1096,7 +1096,7 @@ def test_timeline_failure_keeps_digest_complete(tmp_path):
 
 def test_unfollow_rows_come_from_following_tracking(tmp_path):
     database = Database(str(tmp_path / "unfollow-rows.db"))
-    runner = _gym_profile("12", "runner", "Fitness podcast host and runner.")
+    runner = _peer_profile("12", "runner", "Fitness podcast host and runner.")
     _follow(database, [runner], when=NOW - timedelta(days=31))
     observed_on = (NOW - timedelta(hours=1)).astimezone(
         ZoneInfo("Europe/Rome")
@@ -1131,40 +1131,38 @@ def test_service_rejects_out_of_policy_limits(tmp_path, overrides):
         )
 
 
-def test_fitness_business_operations_are_relevant_without_a_second_topic():
+def test_traction_post_is_relevant_without_a_second_signal():
     scored = score_growth_post(
-        _normalized_post(
-            "9050", "Fitness business revenue operations need better systems."
-        ),
-        NOW,
+        _normalized_post("9050", "We just crossed our first 1k MRR."), NOW,
     )
 
     assert scored is not None
-    assert "fitness_operations" in scored["reason_codes"]
+    assert "traction" in scored["reason_codes"]
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        "Our photography studio now offers a day pass for visiting creators.",
-        "The recording studio launches its first class for new producers today.",
-        "Our coworking studio welcomes drop-in day-pass members.",
+        "A generic fitness motivation quote.",
+        "Airdrop for early founders is live, claim now.",
+        "Giveaway: follow back to win our launch merch.",
+        "Building in public with $DOGE profits.",
     ],
 )
-def test_ambiguous_non_fitness_drop_in_posts_are_rejected(text):
+def test_off_topic_and_noise_posts_are_rejected(text):
     assert score_growth_post(_normalized_post(text=text), NOW) is None
 
 
-def test_fitness_access_request_remains_relevant():
+def test_fitness_tech_feedback_request_is_relevant():
     scored = score_growth_post(
         _normalized_post(
-            text="Looking for a CrossFit gym day pass while visiting Madrid."
+            text="Would you use an app to book a gym class without a membership?"
         ),
         NOW,
     )
 
     assert scored is not None
-    assert {"day_pass_model", "travel_context", "discipline_match"} <= set(
+    assert {"fitness_tech", "feedback_request", "question"} <= set(
         scored["reason_codes"]
     )
 

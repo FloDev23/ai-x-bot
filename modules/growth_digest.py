@@ -7,7 +7,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
-from modules.growth_candidate_schema import parse_growth_datetime
+from modules.growth_candidate_schema import (
+    has_noise_signals,
+    parse_growth_datetime,
+)
 from modules.growth_discovery import GrowthDiscovery
 
 
@@ -17,30 +20,28 @@ ROME = ZoneInfo("Europe/Rome")
 GROWTH_POST_QUERY_BUDGET = 1
 POST_QUERY_PORTFOLIO: Tuple[Tuple[str, str], ...] = (
     (
-        "gym_operator_pain",
-        '("gym owner" OR "studio owner" OR "box owner" OR "fitness studio" OR '
-        '"CrossFit box" OR "boxing gym" OR "pilates studio" OR "yoga studio") '
-        '("empty spots" OR "no-shows" OR "no show" OR "last-minute cancellation" OR '
-        '"WhatsApp booking" OR "manual booking" OR "day pass" OR "drop-in" OR '
-        'bookings OR revenue OR waitlist OR capacity) '
+        "founder_conversation",
+        '("build in public" OR #buildinpublic OR "indie hacker" OR '
+        '"solo founder" OR "Product Hunt" OR "first customers" OR MRR OR '
+        '"feedback on my") '
         'lang:en -is:retweet -is:reply',
     ),
 )
 LIKE_SOURCE_QUOTAS: Tuple[Tuple[str, int], ...] = (
-    ("followed_gym", 4),
-    ("suggested_gym", 3),
-    ("operator_pain", 3),
+    ("followed_account", 4),
+    ("suggested_account", 3),
+    ("founder_conversation", 3),
 )
-LIKE_FILL_ORDER: Tuple[str, ...] = ("followed_gym", "operator_pain", "suggested_gym")
-FOLLOWED_GYM_MAX_AGE = timedelta(hours=72)
-SUGGESTED_GYM_MAX_AGE = timedelta(days=7)
+LIKE_FILL_ORDER: Tuple[str, ...] = (
+    "followed_account", "founder_conversation", "suggested_account",
+)
+FOLLOWED_ACCOUNT_MAX_AGE = timedelta(hours=72)
+SUGGESTED_ACCOUNT_MAX_AGE = timedelta(days=7)
 LIKE_AUTHOR_COOLDOWN = timedelta(days=3)
 _ACCOUNT_REASON_CODES = frozenset({
-    "primary_operator_role", "amplifier_role", "relevant_end_user",
-    "multiple_operating_topics", "one_operating_topic",
+    "founder_bio", "multiple_startup_topics", "one_startup_topic",
     "active_within_7_days", "active_within_30_days", "english_market",
-    "plausible_public_metrics", "direct_drop_in_affinity",
-    "us_market",
+    "follow_back_range", "fitness_affinity",
 })
 _POST_METRIC_KEYS = frozenset({
     "like_count", "retweet_count", "reply_count", "quote_count",
@@ -49,6 +50,35 @@ _POST_METRIC_KEYS = frozenset({
 _AUTHOR_METRIC_KEYS = frozenset({
     "followers_count", "following_count", "tweet_count", "listed_count",
 })
+# Weighted signals that a post is a founder conversation worth joining.
+_POST_SIGNALS: Tuple[Tuple[str, int, str], ...] = (
+    ("build_in_public", 15, r"build(?:ing)? in public|#buildinpublic|indie ?hack"),
+    ("launch", 12, r"\blaunch(?:ed|ing)?\b|product hunt|\bshipped\b"),
+    (
+        "traction",
+        12,
+        r"\bmrr\b|\barr\b|\brevenue\b|paying customers?|"
+        r"first (?:\d+ )?(?:customers?|users?)|\bchurn\b",
+    ),
+    (
+        "feedback_request",
+        10,
+        r"\bfeedback\b|\broast\b|would you use|what do you think",
+    ),
+    (
+        "fitness_tech",
+        10,
+        r"\b(?:fitness|gym|workout|wellness)\b.*\b(?:app|startup|saas|booking)\b|"
+        r"\b(?:app|startup|saas|booking)\b.*\b(?:fitness|gym|workout|wellness)\b",
+    ),
+    (
+        "founder_struggle",
+        8,
+        r"\bdistribution\b|marketing is hard|no users|\bburnout\b|"
+        r"\bpivot(?:ed|ing)?\b",
+    ),
+    ("question", 6, r"\?"),
+)
 
 
 def _canonical_id(value: object) -> bool:
@@ -77,149 +107,42 @@ def _closed_metrics(value: object, keys: frozenset) -> bool:
     )
 
 
-def _contains(text: str, pattern: str) -> bool:
-    return re.search(pattern, text, flags=re.IGNORECASE) is not None
-
-
-_NOISE_PATTERN = re.compile(
-    r"\b(?:home gym|garage gym|home workout equipment|gym equipment|"
-    r"treadmill|dumbbells?|kettlebells?|protein powder|creatine|supplement|"
-    r"airdrop|dropshipping|crypto drop|album drop|sneaker drop|price drop|"
-    r"job offer|job opening|we.re hiring|giveaway|contest|sweepstakes|"
-    r"personal trainer certification|trainer certification|pt certification|"
-    r"workout (?:plan|program|routine) (?:pdf|free)|online personal trainer|"
-    r"photography studio|photo studio|recording studio|music studio|"
-    r"coworking(?: space| studio)?|childcare|daycare|retail (?:store|event|pop-up))\b",
-    re.IGNORECASE,
-)
-_FITNESS_FACILITY_PATTERN = re.compile(
-    r"\b(?:gyms?|fitness (?:business|studio|center|centre|club|facilit(?:y|ies))|"
-    r"health club|crossfit (?:box|gym|affiliate)|boxing gym|martial arts school|"
-    r"training (?:gym|facility))\b",
-    re.IGNORECASE,
-)
-_DISCIPLINE_PATTERN = re.compile(
-    r"\b(?:"
-    # Functional / strength
-    r"crossfit|hyrox|athx|functional (?:training|fitness)|calisthenics|"
-    r"weightlifting|bodybuilding|circuit training|bootcamp|hiit|trx|fitcamp|"
-    # Cardio
-    r"spinning|indoor cycling|rowing|cardio fitness|outdoor running|outdoor fitness|"
-    # Mind / body
-    r"yoga|pilates|barre|meditation|stretching|postural gymnastics|"
-    # Dance / rhythm
-    r"zumba|dance fitness|aqua zumba|"
-    # Combat
-    r"boxing|mma|muay thai|karate|bjj|jiu[ -]?jitsu|dojo|"
-    # Water
-    r"swimming|aqua fitness|hydrospinning|"
-    # Outdoor / alternative
-    r"climbing|bouldering|pole dance|parkour|skateboard|"
-    # Personal
-    r"personal training)\b",
-    re.IGNORECASE,
-)
+def _valid_post(post: Dict) -> bool:
+    text = post.get("text")
+    return (
+        _canonical_id(post.get("id"))
+        and _canonical_id(post.get("author_id"))
+        and _username(post.get("author_username"))
+        and type(text) is str
+        and bool(text.strip())
+        and len(text) <= 1000
+        and post.get("lang") == "en"
+        and _closed_metrics(post.get("public_metrics"), _POST_METRIC_KEYS)
+        and not has_noise_signals(text)
+    )
 
 
 def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
-    """Validate and score one closed normalized post with integer components."""
+    """Score one searched post as a founder conversation worth joining."""
     if type(post) is not dict or type(now) is not datetime:
         return None
-    post_id = post.get("id")
-    author_id = post.get("author_id")
-    username = post.get("author_username")
-    text = post.get("text")
     created_at = parse_growth_datetime(post.get("created_at"))
-    metrics = post.get("public_metrics")
     author_metrics = post.get("author_public_metrics")
-    source_kind = post.get("source_kind", "discovery")
     if (
-        not _canonical_id(post_id)
-        or not _canonical_id(author_id)
-        or not _username(username)
-        or type(text) is not str
-        or not text.strip()
-        or len(text) > 1000
-        or post.get("lang") != "en"
+        not _valid_post(post)
         or created_at is None
-        or not _closed_metrics(metrics, _POST_METRIC_KEYS)
         or not _closed_metrics(author_metrics, _AUTHOR_METRIC_KEYS)
-        or source_kind not in {"discovery", "following"}
     ):
         return None
-    current = now.astimezone(timezone.utc)
-    age = current - created_at
+    age = now.astimezone(timezone.utc) - created_at
     if age < timedelta(0) or age > timedelta(days=30):
         return None
-    lowered = text.lower()
-    # Hard noise exclusion before any scoring
-    if _NOISE_PATTERN.search(lowered):
-        return None
-    # Ambiguous words such as "studio", "class" and "drop-in" never establish
-    # fitness relevance on their own.
-    if not (
-        _FITNESS_FACILITY_PATTERN.search(lowered)
-        or _DISCIPLINE_PATTERN.search(lowered)
-    ):
-        return None
-    weighted_reasons: List[Tuple[str, int]] = []
-    # Operator identity signals
-    if _contains(lowered, r"\b(?:gym|studio|box) owners?\b"):
-        weighted_reasons.append(("gym_owner", 15))
-    if _contains(
-        lowered,
-        r"\b(?:empty (?:class |studio )?(?:spot|spots|capacity)|"
-        r"class capacity|unused capacity|fill (?:an? )?(?:class|spots?))\b",
-    ):
-        weighted_reasons.append(("empty_capacity", 12))
-    if _contains(
-        lowered,
-        r"\b(?:whatsapp (?:booking|bookings|reservation)|instagram (?:dm|booking)|"
-        r"manual (?:booking|bookings|reservation)|cash payment|booking via (?:whatsapp|instagram|dm))\b",
-    ):
-        weighted_reasons.append(("booking_problem", 12))
-    if _contains(
-        lowered,
-        r"\b(?:fitness business|gym business|studio operations|"
-        r"member retention|class schedule|no[ -]?show|revenue|waitlist)\b",
-    ):
-        weighted_reasons.append(("fitness_operations", 12))
-    # Drop-in / no-membership model signals
-    if _contains(lowered, r"\bdrop[ -]?ins?\b"):
-        weighted_reasons.append(("drop_in", 10))
-    if _contains(
-        lowered,
-        r"\b(?:day pass|pay per class|pay per visit|pay as you go|"
-        r"no contract gym|without (?:a )?membership|gym without membership)\b",
-    ):
-        weighted_reasons.append(("day_pass_model", 10))
-    # Explicit intent / request signals
-    if _contains(
-        lowered,
-        r"\b(?:looking for (?:a |an )?gym|gym recommendations?|"
-        r"recommend (?:a |an )?gym|anyone know (?:a |an )?gym|"
-        r"want to try|trying (?:crossfit|pilates|yoga|bjj|boxing|muay thai)|"
-        r"first class|trial class|where (?:can i|to) (?:find|go) (?:a |an )?gym)\b",
-    ):
-        weighted_reasons.append(("explicit_intent", 10))
-    # Travel context
-    if _contains(
-        lowered,
-        r"\b(?:visiting|traveling|travelling|business trip|"
-        r"digital nomad|expat|gym near (?:my )?hotel|workout while travel)\b",
-    ):
-        weighted_reasons.append(("travel_context", 8))
-    # Urgency / availability
-    if _contains(
-        lowered,
-        r"\b(?:class today|gym today|workout today|class tonight|"
-        r"last[ -]?minute (?:class|spot|cancellation)|"
-        r"available (?:spot|spots|class|session)|spots? available)\b",
-    ):
-        weighted_reasons.append(("urgency", 8))
-    # Discipline signals (context enrichers — any FlexDropin discipline)
-    if _DISCIPLINE_PATTERN.search(lowered):
-        weighted_reasons.append(("discipline_match", 6))
+    lowered = post["text"].lower()
+    weighted_reasons = [
+        (reason, points)
+        for reason, points, pattern in _POST_SIGNALS
+        if re.search(pattern, lowered) is not None
+    ]
     relevance = min(sum(points for _reason, points in weighted_reasons), 55)
     if relevance < 10:
         return None
@@ -233,6 +156,7 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
         recency = 5
     else:
         recency = 0
+    # A reply under a bigger author reaches more people.
     followers = author_metrics["followers_count"]
     listed = author_metrics["listed_count"]
     if followers >= 1000 and listed >= 1:
@@ -249,8 +173,6 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
         reasons.append("recent")
     if author_quality >= 10:
         reasons.append("credible_author")
-    if source_kind == "following":
-        reasons.append("followed_account")
     return {
         "score": relevance + recency + author_quality + specificity,
         "created_at": created_at,
@@ -258,34 +180,22 @@ def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
     }
 
 
-def score_gym_post(
+def score_recent_post(
     post: Dict,
     now: datetime,
     *,
     source: str,
     max_age: timedelta,
 ) -> Optional[Dict]:
-    """Score one original gym post without requiring operator keywords."""
+    """Score a recent post by a known peer: any topic is worth a like."""
     if (
         type(post) is not dict
         or type(now) is not datetime
-        or source not in {"followed_gym", "suggested_gym"}
+        or source not in {"followed_account", "suggested_account"}
     ):
         return None
-    text = post.get("text")
     created_at = parse_growth_datetime(post.get("created_at"))
-    if (
-        not _canonical_id(post.get("id"))
-        or not _canonical_id(post.get("author_id"))
-        or not _username(post.get("author_username"))
-        or type(text) is not str
-        or not text.strip()
-        or len(text) > 1000
-        or post.get("lang") != "en"
-        or created_at is None
-        or not _closed_metrics(post.get("public_metrics"), _POST_METRIC_KEYS)
-        or _NOISE_PATTERN.search(text.lower())
-    ):
+    if not _valid_post(post) or created_at is None:
         return None
     age = now.astimezone(timezone.utc) - created_at
     if age < timedelta(0) or age > max_age:
@@ -410,7 +320,7 @@ class GrowthDigestService:
                 or now.astimezone(timezone.utc) - activity_at > timedelta(days=30)
                 or type(score) is not int
                 or not 0 <= score <= 100
-                or segment != "primary"
+                or segment != "peer"
                 or user_id in followed_ids
                 or type(reasons) is not list
                 or not reasons
@@ -522,28 +432,25 @@ class GrowthDigestService:
         posts: Sequence[Dict],
         candidates: object,
         suggested_ids: set,
-        followed_gym_ids: frozenset,
         now: datetime,
     ) -> List[Tuple[str, Dict, Dict]]:
         scored_posts = []
         for post in posts:
-            if type(post) is not dict or post.get("source_kind") != "following":
+            if type(post) is not dict:
                 continue
-            if post.get("author_id") not in followed_gym_ids:
-                continue
-            scored = score_gym_post(
-                post, now, source="followed_gym", max_age=FOLLOWED_GYM_MAX_AGE,
-            )
-            if scored is not None:
-                scored_posts.append(("followed_gym", post, scored))
-        for post in posts:
-            if type(post) is not dict or post.get("source_kind") == "following":
+            if post.get("source_kind") == "following":
+                scored = score_recent_post(
+                    post, now,
+                    source="followed_account", max_age=FOLLOWED_ACCOUNT_MAX_AGE,
+                )
+                if scored is not None:
+                    scored_posts.append(("followed_account", post, scored))
                 continue
             scored = score_growth_post(post, now)
             if scored is not None:
-                scored_posts.append(("operator_pain", post, {
+                scored_posts.append(("founder_conversation", post, {
                     **scored,
-                    "reason_codes": ["operator_pain", *scored["reason_codes"]],
+                    "reason_codes": ["founder_conversation", *scored["reason_codes"]],
                 }))
         for candidate in candidates if isinstance(candidates, (list, tuple)) else []:
             if type(candidate) is not dict or candidate.get("user_id") not in suggested_ids:
@@ -560,11 +467,12 @@ class GrowthDigestService:
                 "lang": latest.get("lang"),
                 "public_metrics": latest.get("public_metrics"),
             }
-            scored = score_gym_post(
-                post, now, source="suggested_gym", max_age=SUGGESTED_GYM_MAX_AGE,
+            scored = score_recent_post(
+                post, now,
+                source="suggested_account", max_age=SUGGESTED_ACCOUNT_MAX_AGE,
             )
             if scored is not None:
-                scored_posts.append(("suggested_gym", post, scored))
+                scored_posts.append(("suggested_account", post, scored))
         return scored_posts
 
     def _unfollow_rows(self, now: datetime) -> List[Dict]:
@@ -733,18 +641,13 @@ class GrowthDigestService:
             )
             return self._empty(observed_on, "incomplete")
         post_candidates, query_claim_tokens = post_read
-        following = self.db.get_following_state()
-        followed_ids = frozenset(following)
-        followed_gym_ids = frozenset(
-            user_id for user_id, state in following.items() if state["is_gym"]
-        )
+        followed_ids = frozenset(self.db.get_following_state())
         account_rows = self._account_rows(candidates, current, followed_ids)
         post_rows = self._like_rows(
             self._scored_like_candidates(
                 post_candidates,
                 candidates,
                 {row["object_id"] for row in account_rows},
-                followed_gym_ids,
                 current,
             ),
             current,

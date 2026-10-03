@@ -161,7 +161,6 @@ una fase separata: richiede due giornate USA simulate, una riserva di 14 post,
 - `modules/growth_discovery.py`: discovery follower read-only.
 - `modules/analytics.py`: snapshot, metriche proprie e report settimanale.
 - `modules/x_api_usage.py`: prenotazioni atomiche, tetto e stima dei costi X API.
-- `modules/reply_copilot.py`: modulo dismesso, non collegato al runtime.
 - `modules/database.py`: persistenza SQLite concorrente e restart-safe.
 - `modules/editorial_feed.py`: client fixed-host e validazione del feed ufficiale.
 - `modules/source_refresh.py`: isolamento del refresh blog/NewsAPI.

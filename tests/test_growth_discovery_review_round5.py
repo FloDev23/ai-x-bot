@@ -105,7 +105,7 @@ def test_none_description_from_tweepy_is_audited_but_not_growth_eligible(tmp_pat
     user = _tweepy_user(101, "none_bio", None)
     tweet = _tweepy_tweet(
         901,
-        "Class schedule, member booking, occupancy, and drop-in update",
+        "Shipped a fitness app update, first users and feedback",
         "en",
     )
     backend = TweepyGrowthBackend(
@@ -128,11 +128,11 @@ def test_none_description_from_tweepy_is_audited_but_not_growth_eligible(tmp_pat
     assert audit["score"] == 70
     assert audit["score_data"]["hard_filter_passed"] is False
     assert audit["score_data"]["filter_reason"] == (
-        "no_managed_fitness_facility_context"
+        "no_founder_context"
     )
     assert passes_candidate_filters(audit["profile"], audit["latest_post"], NOW) == (
         False,
-        "no_managed_fitness_facility_context",
+        "no_founder_context",
     )
     assert database.get_cached_growth_candidate("101", NOW) is None
     assert database.get_digest_candidates(now=NOW, threshold=70) == []
@@ -142,11 +142,11 @@ def test_none_lang_from_tweepy_is_eligible_without_market_points(tmp_path):
     user = _tweepy_user(
         102,
         "none_lang",
-        "Owner of an independent FlexDropin gym",
+        "Founder of FlexDropin, a fitness startup",
     )
     tweet = _tweepy_tweet(
         902,
-        "Class schedule, member booking, and occupancy update",
+        "Shipped a new feature, first users and feedback",
         None,
     )
     backend = TweepyGrowthBackend(
@@ -183,8 +183,8 @@ def test_follower_pagination_normalizes_only_none_description_and_keeps_partial_
             ),
             "second-page": _response([
                 _tweepy_user(203, "int_desc", 7),
-                _tweepy_user(204, "list_desc", ["Gym owner"]),
-                _tweepy_user(205, "valid_desc", "Gym owner"),
+                _tweepy_user(204, "list_desc", ["Startup founder"]),
+                _tweepy_user(205, "valid_desc", "Startup founder"),
                 _tweepy_user(206, "empty_desc", ""),
             ]),
         },
@@ -195,7 +195,7 @@ def test_follower_pagination_normalizes_only_none_description_and_keeps_partial_
 
     assert backend.follower_tokens == [None, "second-page"]
     assert [row["id"] for row in rows] == ["201", "205", "206"]
-    assert [row["description"] for row in rows] == ["", "Gym owner", ""]
+    assert [row["description"] for row in rows] == ["", "Startup founder", ""]
     assert json.loads(json.dumps(rows)) == rows
 
 
@@ -221,7 +221,7 @@ def test_follower_snapshot_boundary_accepts_complete_empty_page():
 
 def test_follower_snapshot_boundary_isolates_malformed_record_without_partial_run():
     backend = TweepyGrowthBackend(
-        {None: _response([object(), _tweepy_user(207, "valid_owner", "Gym owner")])},
+        {None: _response([object(), _tweepy_user(207, "valid_owner", "Startup founder")])},
         {},
     )
 

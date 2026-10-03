@@ -17,7 +17,7 @@ def review_profile(user_id="100", username="owner", **overrides):
     value = {
         "id": user_id,
         "username": username,
-        "description": "Independent gym owner",
+        "description": "Indie hacker building a booking app",
         "followers_count": 1800,
         "following_count": 650,
         "protected": False,
@@ -30,7 +30,7 @@ def review_profile(user_id="100", username="owner", **overrides):
 def review_post(post_id="900", created_at=None, **overrides):
     value = {
         "id": post_id,
-        "text": "Class schedule and member booking update",
+        "text": "Launched a new feature for our users",
         "created_at": created_at or (NOW - timedelta(days=1)).isoformat(),
         "lang": "en",
         "is_original": True,
@@ -41,11 +41,10 @@ def review_post(post_id="900", created_at=None, **overrides):
 
 def accepted_score(total=95, activity_at=None):
     return {
-        "relevance_policy": "managed_fitness_facility_us_priority_v3",
-        "market_priority": 0,
+        "relevance_policy": "startup_founder_peer_v1",
         "total": total,
-        "audience_segment": "primary",
-        "reasons": ["primary_operator_role"],
+        "audience_segment": "peer",
+        "reasons": ["founder_bio"],
         "activity_at": activity_at or (NOW - timedelta(days=1)).isoformat(),
         "hard_filter_passed": True,
         "filter_reason": "accepted",
@@ -371,7 +370,7 @@ def complete_user(user_id, username, **overrides):
     value = {
         "id": user_id,
         "username": username,
-        "description": "Gym owner",
+        "description": "Startup founder",
         "protected": False,
         "location": "London",
         "created_at": NOW,

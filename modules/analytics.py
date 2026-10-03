@@ -127,7 +127,6 @@ class PerformanceAnalyzer:
             "following_total": 0,
             "new_following": 0,
             "unfollowed": 0,
-            "gyms_following": 0,
             "still_followed_after_unfollow": [],
         }
         try:
@@ -216,9 +215,7 @@ class PerformanceAnalyzer:
         following = raw.get("following")
         following_summary = {
             "following_total": 0,
-            "gyms_following": 0,
-            "gym_follow_back_rate": 0.0,
-            "other_follow_back_rate": 0.0,
+            "follow_back_rate": 0.0,
             "unfollows": 0,
             "likes_by_source": {},
         }

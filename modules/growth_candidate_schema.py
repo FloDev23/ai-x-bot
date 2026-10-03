@@ -7,89 +7,22 @@ from typing import Any, Dict, Optional, Tuple
 
 
 _USERNAME_PATTERN = re.compile(r"[A-Za-z0-9_]{1,15}")
-GROWTH_RELEVANCE_POLICY = "managed_fitness_facility_us_priority_v3"
+GROWTH_RELEVANCE_POLICY = "startup_founder_peer_v1"
 
-_US_STATE_NAMES = (
-    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
-    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
-    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
-    "maine", "maryland", "massachusetts", "michigan", "minnesota",
-    "mississippi", "missouri", "montana", "nebraska", "nevada",
-    "new hampshire", "new jersey", "new mexico", "new york",
-    "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
-    "pennsylvania", "rhode island", "south carolina", "south dakota",
-    "tennessee", "texas", "utah", "vermont", "virginia", "washington",
-    "west virginia", "wisconsin", "wyoming", "district of columbia",
-)
-_US_STATE_CODES = (
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI",
-    "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI",
-    "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC",
-    "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT",
-    "VT", "VA", "WA", "WV", "WI", "WY", "DC",
-)
-_US_LOCATION_PATTERN = re.compile(
-    r"\b(?:united states(?: of america)?|usa)\b|"
-    r"(?<!\w)u\.s(?:\.a)?\.?(?!\w)|"
-    + r"\b(?:" + "|".join(re.escape(name) for name in _US_STATE_NAMES) + r")\b|"
-    + r"(?:,\s*|^)(?:" + "|".join(_US_STATE_CODES) + r")(?:\s+\d{5}(?:-\d{4})?)?\s*$",
+# A peer is someone building a product: the people who follow back, reply and
+# show up on a launch day. The bio must say so; a post alone is not enough.
+_FOUNDER_IDENTITY_PATTERN = re.compile(
+    r"\b(?:co[- ]?founders?|founders?|ceo|cto|indie ?hackers?|indie (?:devs?|makers?)|"
+    r"solo(?:preneur| founder| dev)|bootstrapp(?:ed|ing|er)|"
+    r"build(?:ing)? in public|startups?|saas)\b|#buildinpublic|#indiehackers?",
     re.IGNORECASE,
 )
-
-_FACILITY_MANAGEMENT_ROLE_PATTERN = re.compile(
-    r"\b(?:co[- ]?(?:owners?|founders?)|owners?|founders?|managers?|operators?|directors?|"
-    r"head coaches?)\b",
-    re.IGNORECASE,
-)
-_UNRELATED_ROLE_MODIFIER_PATTERN = re.compile(
-    r"\b(?:product|project|account|content|marketing|social media) managers?$|"
-    r"\bcamera operators?$",
-    re.IGNORECASE,
-)
-_FITNESS_DISCIPLINE_FRAGMENT = (
-    r"(?:crossfit|hyrox|athx|functional (?:training|fitness)|calisthenics|"
-    r"weightlifting|powerlifting|bodybuilding|circuit training|bootcamp|hiit|"
-    r"trx|fitcamp|strength (?:and|&) conditioning|spinning|indoor cycling|"
-    r"rowing|cardio fitness|outdoor running|outdoor fitness|yoga|pilates|barre|"
-    r"meditation|stretching|postural gymnastics|zumba|dance fitness|aqua zumba|"
-    r"boxing|kickboxing|mma|muay thai|karate|bjj|jiu[ -]?jitsu|martial arts|"
-    r"swimming|aqua fitness|hydrospinning|aquatic|climbing|bouldering|"
-    r"pole dance|parkour|skateboard|personal training)"
-)
-_FITNESS_VENUE_FRAGMENT = (
-    r"(?:training )?(?:studios?|gyms?|boxes?|centers?|centres?|facilit(?:y|ies)|"
-    r"clubs?|schools?|academ(?:y|ies)|dojos?)"
-)
-_QUALIFIED_FITNESS_FACILITY_FRAGMENT = (
-    _FITNESS_DISCIPLINE_FRAGMENT + r"\s+" + _FITNESS_VENUE_FRAGMENT
-)
-_FITNESS_FACILITY_REFERENCE_PATTERN = re.compile(
-    rf"\b(?:gyms?|dojos?|health clubs?|"
-    rf"fitness (?:studios?|centers?|centres?|clubs?|facilit(?:y|ies))|"
-    rf"crossfit affiliates?|{_QUALIFIED_FITNESS_FACILITY_FRAGMENT})\b",
-    re.IGNORECASE,
-)
-# An affiliate rarely writes "CrossFit box": the bio is the box name itself,
-# "CrossFit Riverside". Requiring a capitalised word after the brand keeps
-# "I do crossfit" out.
-_BRANDED_AFFILIATE_PATTERN = re.compile(
-    r"\b(?:CrossFit|F45|OrangeTheory|9Round|Burn Boot Camp)\s+"
-    r"[A-Z][A-Za-z0-9'\u2019-]{2,}"
-)
-_FITNESS_FACILITY_IDENTITY_PATTERN = re.compile(
-    rf"\b(?:dojos?|fitness (?:studios?|centers?|centres?|clubs?|facilit(?:y|ies))|"
-    rf"crossfit affiliates?|{_QUALIFIED_FITNESS_FACILITY_FRAGMENT}|"
-    rf"(?:official|independent|community|boutique|local|24[ /-]?7) gyms?|"
-    rf"gyms? (?:in|based in|located in))\b",
-    re.IGNORECASE,
-)
-_NON_MANAGEMENT_PERSON_PATTERN = re.compile(
-    r"(?:^|[|,/·•]\s*)(?:(?:crossfit|hyrox|fitness|yoga|pilates|bjj|"
-    r"boxing|weightlifting)\s+)?\b(?:athlete|member|enthusiast|creator|"
-    r"influencer|personal trainer|coach|instructor|teacher)\b|"
-    r"\b(?:athlete|member|personal trainer|coach|instructor|teacher) "
-    r"(?:at|for|with)\b|\b(?:gyms?|boxes?|studios?) "
-    r"(?:members?|athletes?|enthusiasts?)\b",
+# Crypto promoters, follow-for-follow rings and promo sellers also call
+# themselves founders; they never become users or launch supporters.
+_NOISE_PATTERN = re.compile(
+    r"\b(?:crypto|nfts?|web3|defi|memecoins?|airdrops?|forex|"
+    r"trading signals|onlyfans|giveaways?|f4f|follow ?back|"
+    r"dm (?:for|me for) (?:promo|collab)s?)\b|\$[A-Z]{2,6}\b",
     re.IGNORECASE,
 )
 
@@ -125,72 +58,20 @@ def is_json_safe_mapping(value: Any) -> bool:
     return True
 
 
-def classify_growth_market(profile: Any) -> str:
-    """Classify a public profile location without excluding global accounts."""
-    if not isinstance(profile, dict):
-        return "unknown"
-    location = profile.get("location")
-    if location is None or (type(location) is str and not location.strip()):
-        return "unknown"
-    if type(location) is not str:
-        return "unknown"
-    return "usa" if _US_LOCATION_PATTERN.search(location.strip()) else "other"
-
-
-def has_managed_fitness_facility_context(profile: Any) -> bool:
-    """Require an explicit physical fitness facility or its management role."""
+def has_founder_context(profile: Any) -> bool:
+    """Return whether the bio presents someone who builds a product."""
     if not isinstance(profile, dict):
         return False
     description = profile.get("description")
-    if type(description) is not str or not description.strip():
-        return False
-    facility_matches = list(
-        _FITNESS_FACILITY_REFERENCE_PATTERN.finditer(description)
+    return (
+        type(description) is str
+        and _FOUNDER_IDENTITY_PATTERN.search(description) is not None
     )
-    role_matches = list(_FACILITY_MANAGEMENT_ROLE_PATTERN.finditer(description))
-    for role_match in role_matches:
-        role_prefix = description[max(0, role_match.start() - 24):role_match.end()]
-        if _UNRELATED_ROLE_MODIFIER_PATTERN.search(role_prefix):
-            continue
-        for facility_match in facility_matches:
-            if facility_match.end() <= role_match.start():
-                bridge = description[facility_match.end():role_match.start()]
-                if (
-                    len(re.findall(r"[A-Za-z0-9]+", bridge)) <= 3
-                    and re.search(r"[.!?;]", bridge) is None
-                    and re.search(
-                        r"\b(?:members?|athletes?|enthusiasts?|creators?)\b",
-                        bridge,
-                        re.IGNORECASE,
-                    ) is None
-                ):
-                    return True
-            elif role_match.end() <= facility_match.start():
-                bridge = description[role_match.end():facility_match.start()]
-                role_text = role_match.group(0).lower()
-                linked = re.search(
-                    r"\b(?:of|at|for)\b|[|/@,:\-–—]",
-                    bridge,
-                    re.IGNORECASE,
-                )
-                if (
-                    len(re.findall(r"[A-Za-z0-9]+", bridge)) <= 5
-                    and re.search(r"[.!?;]", bridge) is None
-                    and linked is not None
-                    and not ("operator" in role_text and "of" not in bridge.lower())
-                    and re.match(
-                        r"\s+(?:members?|athletes?|enthusiasts?)\b",
-                        description[facility_match.end():],
-                        re.IGNORECASE,
-                    ) is None
-                ):
-                    return True
-    if _NON_MANAGEMENT_PERSON_PATTERN.search(description):
-        return False
-    return bool(
-        _FITNESS_FACILITY_IDENTITY_PATTERN.search(description)
-        or _BRANDED_AFFILIATE_PATTERN.search(description)
-    )
+
+
+def has_noise_signals(text: Any) -> bool:
+    """Return whether text carries crypto, spam or promo-selling signals."""
+    return type(text) is str and _NOISE_PATTERN.search(text) is not None
 
 
 def is_canonical_growth_profile(
@@ -306,6 +187,8 @@ def evaluate_growth_candidate_filters(
         return False, "malformed_candidate_record"
     if suppressed_until is not None and suppressed_until > current_time:
         return False, "suppressed_within_30_days"
-    if not has_managed_fitness_facility_context(profile):
-        return False, "no_managed_fitness_facility_context"
+    if has_noise_signals(bio) or has_noise_signals(text):
+        return False, "noise_signals"
+    if not has_founder_context(profile):
+        return False, "no_founder_context"
     return True, "accepted"

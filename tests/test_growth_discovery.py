@@ -1,4 +1,5 @@
 import importlib
+import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -12,7 +13,6 @@ from modules.growth_discovery import (
     passes_candidate_filters,
     score_growth_candidate,
 )
-from modules import growth_candidate_schema
 from modules.twitter_client import TwitterClient
 
 
@@ -23,7 +23,7 @@ def profile(user_id="100", username="owner", **overrides):
     value = {
         "id": user_id,
         "username": username,
-        "description": "Owner of an independent strength and conditioning studio",
+        "description": "Founder of an independent booking app",
         "followers_count": 1800,
         "following_count": 650,
         "protected": False,
@@ -36,7 +36,7 @@ def profile(user_id="100", username="owner", **overrides):
 def post(post_id="900", created_at="2026-08-09T10:00:00+00:00", **overrides):
     value = {
         "id": post_id,
-        "text": "Testing a new class timetable for our members",
+        "text": "Shipped a new booking flow and got feedback from our first users",
         "created_at": created_at,
         "lang": "en",
         "is_original": True,
@@ -102,11 +102,10 @@ def discovery(tmp_path, fake_x, **overrides):
     return GrowthDiscovery(fake_x, Database(str(tmp_path / "growth.db")), **options)
 
 
-def test_relevant_gym_owner_has_exact_approved_score_components():
+def test_relevant_founder_has_exact_score_components():
     result = score_growth_candidate(profile(), post(), NOW)
     assert result == {
-        "relevance_policy": "managed_fitness_facility_us_priority_v3",
-        "market_priority": 0,
+        "relevance_policy": "startup_founder_peer_v1",
         "role_bio": 35,
         "recent_topic_fit": 25,
         "activity": 15,
@@ -114,75 +113,28 @@ def test_relevant_gym_owner_has_exact_approved_score_components():
         "account_quality": 10,
         "affinity": 0,
         "total": 100,
-        "audience_segment": "primary",
+        "audience_segment": "peer",
         "reasons": [
-            "primary_operator_role",
-            "multiple_operating_topics",
+            "founder_bio",
+            "multiple_startup_topics",
             "active_within_7_days",
             "english_market",
-            "plausible_public_metrics",
+            "follow_back_range",
         ],
         "activity_at": "2026-08-09T10:00:00+00:00",
     }
 
 
-@pytest.mark.parametrize(
-    ("location", "expected"),
-    [
-        ("Austin, TX", "usa"),
-        ("California, United States", "usa"),
-        ("New York, NY, USA", "usa"),
-        ("U.S.", "usa"),
-        (None, "unknown"),
-        ("", "unknown"),
-        ("London, UK", "other"),
-    ],
-)
-def test_growth_market_classifies_us_without_excluding_other_locations(
-    location,
-    expected,
-):
-    assert growth_candidate_schema.classify_growth_market(
-        profile(location=location)
-    ) == expected
+def test_founder_reaches_threshold_without_startup_topic_post():
+    latest = post(text="Great run this morning before work")
+
+    assert passes_candidate_filters(profile(), latest, NOW) == (True, "accepted")
+    assert score_growth_candidate(profile(), latest, NOW)["total"] == 75
 
 
-def test_managed_gym_account_reaches_threshold_without_operating_topic_post():
-    candidate_profile = profile(
-        description="Independent strength and conditioning gym",
-        location="London, UK",
-    )
-    latest = post(text="Great work from everyone who trained with us today")
-
-    assert passes_candidate_filters(candidate_profile, latest, NOW) == (
-        True,
-        "accepted",
-    )
-    assert score_growth_candidate(candidate_profile, latest, NOW)["total"] >= 75
-
-
-def test_us_market_is_recorded_for_digest_priority():
-    scored = score_growth_candidate(profile(location="Denver, CO"), post(), NOW)
-
-    assert scored["market_priority"] == 1
-    assert "us_market" in scored["reasons"]
-
-
-def test_score_caps_each_component_and_total_at_approved_maximums():
-    rich_profile = profile(
-        description=(
-            "Owner and founder of a CrossFit gym and Pilates studio. "
-            "Manager using FlexDropin for class booking and drop-in access"
-        ),
-        followers_count=5000,
-        following_count=700,
-    )
-    rich_post = post(
-        text=(
-            "Class schedule retention member no-show occupancy booking drop-in "
-            "class booking FlexDropin"
-        ),
-    )
+def test_score_components_reach_exact_maximum_with_fitness_affinity():
+    rich_profile = profile(description="Founder building a fitness booking SaaS")
+    rich_post = post(text="Launched on Product Hunt today, first users and feedback")
     result = score_growth_candidate(rich_profile, rich_post, NOW)
     assert {key: result[key] for key in (
         "role_bio", "recent_topic_fit", "activity", "market",
@@ -196,6 +148,14 @@ def test_score_caps_each_component_and_total_at_approved_maximums():
         "affinity": 5,
         "total": 100,
     }
+
+
+@pytest.mark.parametrize("followers", [10, 2_000_000])
+def test_tiny_and_celebrity_accounts_lose_follow_back_points(followers):
+    result = score_growth_candidate(profile(followers_count=followers), post(), NOW)
+
+    assert result["account_quality"] == 0
+    assert result["total"] < 100
 
 
 @pytest.mark.parametrize(
@@ -227,85 +187,68 @@ def test_hard_filters_reject_disallowed_profiles(candidate_profile, latest_post,
     )
 
 
-def test_hard_filter_rejects_account_without_managed_facility_identity():
+def test_hard_filter_rejects_account_without_founder_identity():
     accepted, reason = passes_candidate_filters(
         profile(description=""),
-        post(text="Pilates class booking and occupancy planning"),
+        post(text="Launched on Product Hunt today, feedback welcome"),
         NOW,
     )
-    assert (accepted, reason) == (
-        False,
-        "no_managed_fitness_facility_context",
-    )
-
-
-@pytest.mark.parametrize(
-    ("description", "latest_text"),
-    [
-        (
-            "Camera operator and filmmaker",
-            "Our members use the new class booking schedule in the app.",
-        ),
-        (
-            "Personal trainer and fitness creator",
-            "Class schedules and member bookings are changing this week.",
-        ),
-        (
-            "CrossFit athlete training at a CrossFit gym",
-            "Class schedules and member bookings are changing this week.",
-        ),
-        (
-            "Product manager, CrossFit gym member",
-            "Class schedules and member bookings are changing this week.",
-        ),
-        (
-            "Camera operator and filmmaker. Member at a CrossFit gym",
-            "Class schedules and member bookings are changing this week.",
-        ),
-        (
-            "Gym enthusiast and business owner",
-            "Class schedules and member bookings are changing this week.",
-        ),
-    ],
-)
-def test_generic_roles_do_not_qualify_without_facility_management_link(
-    description,
-    latest_text,
-):
-    candidate_profile = profile(description=description)
-    latest_post = post(text=latest_text)
-
-    assert passes_candidate_filters(candidate_profile, latest_post, NOW) == (
-        False,
-        "no_managed_fitness_facility_context",
-    )
-    assert score_growth_candidate(candidate_profile, latest_post, NOW)["total"] < 75
+    assert (accepted, reason) == (False, "no_founder_context")
 
 
 @pytest.mark.parametrize(
     "description",
     [
-        "CrossFit gym and weightlifting facility in Bristol",
-        "HYROX gym in Manchester offering daily classes",
-        "Parkour training facility in Berlin",
-        "Swimming centre with classes and memberships",
-        "Martial arts academy in Bristol",
-        "Boutique yoga studio in Rome",
+        "Personal trainer and fitness creator",
+        "Gym owner in Bristol",
+        "Product manager at a CrossFit gym",
+        "Decision maker, coffee lover",
     ],
 )
-def test_physical_fitness_facility_account_qualifies_without_personal_role(
-    description,
-):
-    candidate_profile = profile(
-        description=description,
-    )
-    latest_post = post(text="New class schedule and drop-in booking slots")
+def test_non_founder_bios_do_not_qualify(description):
+    candidate_profile = profile(description=description)
 
-    assert passes_candidate_filters(candidate_profile, latest_post, NOW) == (
+    assert passes_candidate_filters(candidate_profile, post(), NOW) == (
+        False,
+        "no_founder_context",
+    )
+    assert score_growth_candidate(candidate_profile, post(), NOW)["total"] < 75
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Co-founder @acme",
+        "Indie hacker. Building in public",
+        "Solo founder of a habit tracker",
+        "Bootstrapped SaaS, 2 kids",
+        "CEO at a fitness startup",
+        "Shipping small apps #buildinpublic",
+    ],
+)
+def test_founder_bios_qualify(description):
+    candidate_profile = profile(description=description)
+
+    assert passes_candidate_filters(candidate_profile, post(), NOW) == (
         True,
         "accepted",
     )
-    assert score_growth_candidate(candidate_profile, latest_post, NOW)["total"] >= 75
+    assert score_growth_candidate(candidate_profile, post(), NOW)["total"] >= 75
+
+
+@pytest.mark.parametrize(
+    ("description", "latest_text"),
+    [
+        ("Founder | crypto & NFT alpha", "Shipped a new feature for users"),
+        ("Startup founder. Follow back!", "Shipped a new feature for users"),
+        ("Founder of a SaaS", "Airdrop is live, claim now"),
+        ("Founder of a SaaS", "Buy $PEPE before launch"),
+    ],
+)
+def test_noise_signals_reject_self_declared_founders(description, latest_text):
+    assert passes_candidate_filters(
+        profile(description=description), post(text=latest_text), NOW,
+    ) == (False, "noise_signals")
 
 
 def test_cached_candidate_from_previous_relevance_policy_is_re_evaluated(tmp_path):
@@ -319,10 +262,9 @@ def test_cached_candidate_from_previous_relevance_policy_is_re_evaluated(tmp_pat
         "score": 95,
         "score_data": {
             "relevance_policy": "managed_fitness_facility_v2",
-            "market_priority": 0,
             "total": 95,
-            "audience_segment": "primary",
-            "reasons": ["primary_operator_role"],
+            "audience_segment": "peer",
+            "reasons": ["founder_bio"],
             "activity_at": activity_at,
             "hard_filter_passed": True,
             "filter_reason": "accepted",
@@ -354,7 +296,7 @@ def test_cached_candidate_from_previous_relevance_policy_is_re_evaluated(tmp_pat
     assert fake_x.latest_calls == ["old-policy"]
     refreshed = db.get_cached_growth_candidate("old-policy", NOW)
     assert refreshed["score_data"]["relevance_policy"] == (
-        "managed_fitness_facility_us_priority_v3"
+        "startup_founder_peer_v1"
     )
 
 
@@ -492,7 +434,7 @@ def test_low_score_and_hard_filtered_candidates_are_stored_only_for_audit(tmp_pa
         profile("inactive", "inactive_owner"),
     ]
     fake_x.latest_posts = {
-        "low": post("907", text="A class update"),
+        "low": post("907", text="A product update"),
         "inactive": post(
             "908", created_at="2026-06-01T10:00:00+00:00",
         ),
@@ -503,10 +445,10 @@ def test_low_score_and_hard_filtered_candidates_are_stored_only_for_audit(tmp_pa
 
     low = growth.db.get_growth_candidate("low")
     inactive = growth.db.get_growth_candidate("inactive")
-    assert low["score"] == 55
+    assert low["score"] == 45
     assert low["score_data"]["hard_filter_passed"] is False
     assert low["score_data"]["filter_reason"] == (
-        "no_managed_fitness_facility_context"
+        "no_founder_context"
     )
     assert inactive["score"] == 85
     assert inactive["score_data"]["hard_filter_passed"] is False
@@ -547,11 +489,10 @@ def test_sqlite_digest_sorts_by_score_then_latest_activity_and_limits_five(tmp_p
             "latest_post": post(str(910 + index), activity.isoformat()),
             "score": score,
             "score_data": {
-                "relevance_policy": "managed_fitness_facility_us_priority_v3",
-                "market_priority": 0,
+                "relevance_policy": "startup_founder_peer_v1",
                 "total": score,
-                "audience_segment": "primary",
-                "reasons": ["primary_operator_role"],
+                "audience_segment": "peer",
+                "reasons": ["founder_bio"],
                 "activity_at": activity.isoformat(),
                 "hard_filter_passed": True,
                 "filter_reason": "accepted",
@@ -566,73 +507,18 @@ def test_sqlite_digest_sorts_by_score_then_latest_activity_and_limits_five(tmp_p
     assert [row["user_id"] for row in rows] == ["0", "1", "2", "3", "4"]
     assert len(rows) == 5
     assert rows[0]["direct_url"] == "https://x.com/owner_0/status/910"
-    assert rows[0]["audience_segment"] == "primary"
+    assert rows[0]["audience_segment"] == "peer"
 
 
-def test_sqlite_digest_prioritizes_us_market_before_global_score(tmp_path):
-    db = Database(str(tmp_path / "us-priority.db"))
-    activity = NOW - timedelta(hours=1)
-    for user_id, username, location, score, market_priority in (
-        ("1001", "global_gym", "London, UK", 95, 0),
-        ("1002", "us_gym", "Austin, TX", 75, 1),
-    ):
-        candidate_profile = profile(
-            user_id,
-            username,
-            location=location,
-        )
-        latest = post(str(9900 + int(user_id)), activity.isoformat())
-        db.upsert_growth_candidate({
-            "user_id": user_id,
-            "username": username,
-            "profile": candidate_profile,
-            "latest_post": latest,
-            "score": score,
-            "score_data": {
-                "relevance_policy": "managed_fitness_facility_us_priority_v3",
-                "market_priority": market_priority,
-                "total": score,
-                "audience_segment": "primary",
-                "reasons": ["primary_operator_role"],
-                "activity_at": activity.isoformat(),
-                "hard_filter_passed": True,
-                "filter_reason": "accepted",
-            },
-            "discovery_source": "topic_search",
-            "profile_expires_at": (NOW + timedelta(days=7)).isoformat(),
-            "last_evaluated_at": NOW.isoformat(),
-        })
+def test_shipped_queries_target_founder_conversations_in_english():
+    from modules.growth_discovery import DEFAULT_TOPIC_QUERIES
 
-    rows = db.get_digest_candidates(limit=5, now=NOW, threshold=75)
-
-    assert [row["user_id"] for row in rows] == ["1002", "1001"]
-
-
-def test_empty_seed_configuration_uses_a_real_search_instead_of_network(tmp_path):
-    fake_x = FakeX()
-    growth = discovery(tmp_path, fake_x, seed_accounts=())
-
-    growth.run(NOW)
-
-    source_calls = [call for call in fake_x.calls if call[0] != "followers"]
-    assert len(source_calls) == 3
-    assert {call[0] for call in source_calls} == {"search"}
-    assert any('"our gym"' in call[1] for call in source_calls)
-
-
-def test_shipped_queries_search_what_a_gym_posts_not_what_a_bio_says():
-    """Roles belong in the bio filter: in post text they find gym-goers."""
-    from modules.growth_discovery import (
-        DEFAULT_TOPIC_QUERIES,
-        _NO_SEED_US_FACILITY_QUERY,
-    )
-
-    for query in (*DEFAULT_TOPIC_QUERIES, _NO_SEED_US_FACILITY_QUERY):
-        assert "place_country" not in query
-        assert "owner" not in query.lower()
-        assert "founder" not in query.lower()
+    for query in DEFAULT_TOPIC_QUERIES:
         assert "lang:en" in query
         assert "-is:retweet" in query
+        assert "-is:reply" in query
+    assert "build in public" in DEFAULT_TOPIC_QUERIES[0]
+    assert "Product Hunt" in DEFAULT_TOPIC_QUERIES[1]
 
 
 def test_source_order_rotates_between_daily_runs_in_sqlite(tmp_path):
@@ -693,15 +579,19 @@ def test_growth_numeric_config_fails_closed(monkeypatch, name, value):
     importlib.reload(config)
 
 
-def test_growth_query_budget_is_capped_and_seed_accounts_are_trimmed(monkeypatch):
+def test_growth_query_budget_is_capped_and_seed_accounts_are_valid_handles(
+    monkeypatch,
+):
     monkeypatch.setattr(dotenv, "load_dotenv", lambda: False)
     monkeypatch.setenv("GROWTH_QUERY_BUDGET", "99")
-    monkeypatch.setenv("GROWTH_SEED_ACCOUNTS", " @first,second, ,@third ")
     reloaded = importlib.reload(config)
     assert reloaded.GROWTH_QUERY_BUDGET == 3
-    assert reloaded.GROWTH_SEED_ACCOUNTS == ("first", "second", "third")
+    assert "ProductHunt" in reloaded.GROWTH_SEED_ACCOUNTS
+    assert all(
+        re.fullmatch(r"[A-Za-z0-9_]{1,15}", seed)
+        for seed in reloaded.GROWTH_SEED_ACCOUNTS
+    )
     monkeypatch.delenv("GROWTH_QUERY_BUDGET")
-    monkeypatch.delenv("GROWTH_SEED_ACCOUNTS")
     importlib.reload(config)
 
 
@@ -710,7 +600,7 @@ def test_twitter_read_methods_request_complete_profile_and_original_post_fields(
     user = SimpleNamespace(
         id=100,
         username="owner",
-        description="Gym owner",
+        description="Startup founder",
         protected=False,
         location="London",
         created_at=NOW,

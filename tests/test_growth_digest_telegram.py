@@ -40,9 +40,9 @@ def _message_update(update_id, text, chat_id=42):
 
 def _payload(kind, object_id, username):
     reasons = (
-        ["gym_owner", "recent"]
+        ["build_in_public", "recent"]
         if kind == "post"
-        else ["primary_operator_role", "active_within_7_days"]
+        else ["founder_bio", "active_within_7_days"]
     )
     if kind == "post":
         return {
@@ -71,7 +71,7 @@ def _payload(kind, object_id, username):
         },
         "latest_activity_id": "9001",
         "latest_activity_at": "2026-08-26T06:00:00+00:00",
-        "segment": "primary",
+        "segment": "peer",
         "reason_codes": reasons,
     }, reasons
 
@@ -142,7 +142,7 @@ def test_manual_command_and_scheduled_push_share_one_compact_formatter(tmp_path)
 
     assert service.calls == [NOW]
     assert len(telegram.messages) == 1
-    assert "Palestre da seguire: 1" in telegram.messages[0][1]
+    assert "Founder da seguire: 1" in telegram.messages[0][1]
     assert "Like: 1" in telegram.messages[0][1]
     assert "Unfollow proposti: 1" in telegram.messages[0][1]
     assert [button["text"] for button in _buttons(telegram.messages[0])] == [
@@ -244,7 +244,7 @@ def test_account_detail_offers_profile_links_and_local_not_relevant(tmp_path):
         callback_update(10, navigation["callback_data"])
     ) == "processed"
     detail = telegram.messages[-1]
-    assert "Palestra da seguire @studio_owner" in detail[1]
+    assert "Founder da seguire @studio_owner" in detail[1]
     assert "follower: 1200" in detail[1]
     buttons = _buttons(detail)
     assert buttons[0] == {"text": "Apri profilo", "url": "https://x.com/studio_owner"}
@@ -308,7 +308,7 @@ def test_like_and_unfollow_cards_only_record_local_decisions(tmp_path):
         "text": "Apri profilo", "url": "https://x.com/old_contact",
     }
     assert [button["text"] for button in unfollow_buttons[1:]] == [
-        "Unfollow fatto", "Tieni", "È una palestra",
+        "Unfollow fatto", "Tieni", "Tieni sempre",
     ]
     controller.process_update(callback_update(23, unfollow_buttons[2]["callback_data"]))
 

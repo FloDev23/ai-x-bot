@@ -38,7 +38,6 @@ from modules.media_store import (
 from modules.growth_candidate_schema import (
     GROWTH_RELEVANCE_POLICY,
     evaluate_growth_candidate_filters,
-    has_managed_fitness_facility_context,
     is_canonical_growth_latest_post,
     is_canonical_growth_profile,
     is_json_safe_mapping,
@@ -129,23 +128,18 @@ _OPERATOR_QUEUE_RESULTS = {
     "restore": "restored",
 }
 _GROWTH_ACCOUNT_REASONS = frozenset({
-    "primary_operator_role", "amplifier_role", "relevant_end_user",
-    "multiple_operating_topics", "one_operating_topic",
+    "founder_bio", "multiple_startup_topics", "one_startup_topic",
     "active_within_7_days", "active_within_30_days", "english_market",
-    "plausible_public_metrics", "direct_drop_in_affinity",
-    "us_market",
-    "no_follow_back_after_14_days",
+    "follow_back_range", "fitness_affinity",
     "no_follow_back_after_30_days",
 })
-_GROWTH_POST_REASONS = frozenset({
-    "gym_owner", "empty_capacity", "booking_problem", "fitness_operations",
-    "drop_in", "day_pass_model", "explicit_intent",
-    "travel_context", "urgency", "discipline_match",
-    # legacy codes kept for existing rows
-    "functional_fitness", "crossfit", "pilates", "martial_arts",
+_GROWTH_LIKE_SOURCES = frozenset({
+    "followed_account", "suggested_account", "founder_conversation",
+})
+_GROWTH_POST_REASONS = _GROWTH_LIKE_SOURCES | frozenset({
+    "build_in_public", "launch", "traction", "feedback_request",
+    "fitness_tech", "founder_struggle", "question",
     "recent", "credible_author",
-    "followed_account",
-    "followed_gym", "suggested_gym", "operator_pain",
 })
 _GROWTH_PUBLIC_METRIC_KEYS = frozenset({
     "followers_count", "following_count", "tweet_count", "listed_count",
@@ -811,10 +805,7 @@ class Database:
                     unfollowed_at TEXT,
                     follows_back INTEGER NOT NULL DEFAULT 0,
                     follows_back_checked_at TEXT,
-                    is_gym INTEGER NOT NULL DEFAULT 0,
-                    gym_override TEXT CHECK (
-                        gym_override IN ('gym', 'not_gym')
-                    ),
+                    pinned INTEGER NOT NULL DEFAULT 0,
                     unfollow_decision TEXT CHECK (
                         unfollow_decision IN ('keep', 'unfollowed_manually')
                     ),
@@ -822,6 +813,24 @@ class Database:
                     keep_until TEXT
                 )
             """)
+            following_columns = {
+                row["name"] for row in c.execute("PRAGMA table_info(x_following)")
+            }
+            if "pinned" not in following_columns:
+                # Growth no longer targets gyms: an account the operator marked
+                # as a gym stays exempt from unfollow as a pinned account.
+                c.execute(
+                    "ALTER TABLE x_following "
+                    "ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+                )
+                if "gym_override" in following_columns:
+                    c.execute(
+                        "UPDATE x_following SET pinned = 1 "
+                        "WHERE gym_override = 'gym'"
+                    )
+            for retired_column in ("gym_override", "is_gym"):
+                if retired_column in following_columns:
+                    c.execute(f"ALTER TABLE x_following DROP COLUMN {retired_column}")
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS growth_suggestions (
@@ -868,6 +877,10 @@ class Database:
                     "ALTER TABLE growth_suggestions "
                     "ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
                 )
+            c.execute(
+                "UPDATE growth_suggestions SET decision = 'pinned' "
+                "WHERE decision = 'marked_gym'"
+            )
             c.execute("""
                 CREATE TABLE IF NOT EXISTS growth_digest_runs (
                     observed_on TEXT PRIMARY KEY,
@@ -900,91 +913,6 @@ class Database:
             c.execute("""
                 CREATE INDEX IF NOT EXISTS idx_growth_suggestion_cooldown
                 ON growth_suggestions(kind, object_id, cooldown_until)
-            """)
-
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS reply_suggestions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    growth_suggestion_id INTEGER NOT NULL UNIQUE,
-                    observed_on TEXT NOT NULL,
-                    tweet_id TEXT NOT NULL UNIQUE,
-                    author_username TEXT NOT NULL,
-                    source_excerpt TEXT NOT NULL,
-                    audience_segment TEXT NOT NULL CHECK (
-                        audience_segment IN ('operator','end_user')
-                    ),
-                    source_kind TEXT NOT NULL DEFAULT 'discovery' CHECK (
-                        source_kind IN ('discovery','following')
-                    ),
-                    reply_kind TEXT NOT NULL DEFAULT 'value' CHECK (
-                        reply_kind IN (
-                            'value','promotion_capacity',
-                            'promotion_booking','promotion_single_class'
-                        )
-                    ),
-                    relevance_score INTEGER NOT NULL,
-                    reply_text TEXT,
-                    status TEXT NOT NULL DEFAULT 'reserved' CHECK (
-                        status IN (
-                            'reserved','ready','generation_failed',
-                            'dismissed','published_manually'
-                        )
-                    ),
-                    generation_count INTEGER NOT NULL DEFAULT 0 CHECK (
-                        generation_count BETWEEN 0 AND 3
-                    ),
-                    generation_claim_token TEXT,
-                    generation_claim_expires_at TEXT,
-                    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
-                    failure_code TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    decided_at TEXT,
-                    FOREIGN KEY(growth_suggestion_id)
-                        REFERENCES growth_suggestions(id),
-                    CHECK (
-                        (generation_claim_token IS NULL AND
-                         generation_claim_expires_at IS NULL) OR
-                        (generation_claim_token IS NOT NULL AND
-                         generation_claim_expires_at IS NOT NULL)
-                    ),
-                    CHECK (
-                        (status IN ('ready','dismissed','published_manually')
-                         AND reply_text IS NOT NULL) OR
-                        (status IN ('reserved','generation_failed')
-                         AND reply_text IS NULL)
-                    ),
-                    CHECK (
-                        (status = 'generation_failed' AND failure_code IS NOT NULL)
-                        OR (status != 'generation_failed' AND failure_code IS NULL)
-                    )
-                )
-            """)
-            reply_suggestion_columns = {
-                row["name"] for row in c.execute(
-                    "PRAGMA table_info(reply_suggestions)"
-                )
-            }
-            if "source_kind" not in reply_suggestion_columns:
-                c.execute(
-                    "ALTER TABLE reply_suggestions ADD COLUMN "
-                    "source_kind TEXT NOT NULL DEFAULT 'discovery'"
-                )
-            if "reply_kind" not in reply_suggestion_columns:
-                c.execute(
-                    "ALTER TABLE reply_suggestions ADD COLUMN "
-                    "reply_kind TEXT NOT NULL DEFAULT 'value'"
-                )
-            c.execute("""
-                CREATE INDEX IF NOT EXISTS idx_reply_suggestions_daily_status
-                ON reply_suggestions(
-                    observed_on, status, relevance_score DESC, id ASC
-                )
-            """)
-            c.execute("""
-                CREATE INDEX IF NOT EXISTS idx_reply_suggestions_generation_claim
-                ON reply_suggestions(generation_claim_expires_at)
-                WHERE generation_claim_token IS NOT NULL
             """)
 
             c.execute("""
@@ -7826,9 +7754,7 @@ class Database:
                 )
                 or activity_at is None
                 or activity_at > completed_at + timedelta(minutes=5)
-                or payload.get("segment") not in {
-                    "primary", "amplifier", "end_user",
-                }
+                or payload.get("segment") != "peer"
                 or payload.get("reason_codes") != reasons
             ):
                 return None
@@ -7909,7 +7835,7 @@ class Database:
                     or item["decision"] not in {
                         "new", "saved", "followed_manually", "dismissed",
                         "still_relevant", "not_relevant", "liked_manually",
-                        "skipped", "unfollowed_manually", "keep", "marked_gym",
+                        "skipped", "unfollowed_manually", "keep", "pinned",
                     }
                     or (item["decision_at"] is not None and decision_at is None)
                 ):
@@ -7991,500 +7917,6 @@ class Database:
                     }
         return None
 
-    # ---------- Telegram-only Reply Copilot ----------
-
-    @staticmethod
-    def _valid_reply_boundary_time(value: object) -> bool:
-        return (
-            type(value) is datetime
-            and value.tzinfo is not None
-            and value.utcoffset() is not None
-        )
-
-    @staticmethod
-    def _reply_row(row: Optional[sqlite3.Row]) -> Optional[Dict]:
-        if row is None:
-            return None
-        result = dict(row)
-        if (
-            type(result.get("id")) is not int
-            or result["id"] <= 0
-            or type(result.get("growth_suggestion_id")) is not int
-            or result["growth_suggestion_id"] <= 0
-            or result.get("audience_segment") not in {"operator", "end_user"}
-            or result.get("source_kind") not in {"discovery", "following"}
-            or result.get("reply_kind") not in {
-                "value", "promotion_capacity", "promotion_booking",
-                "promotion_single_class",
-            }
-            or result.get("status") not in {
-                "reserved", "ready", "generation_failed", "dismissed",
-                "published_manually",
-            }
-            or type(result.get("generation_count")) is not int
-            or not 0 <= result["generation_count"] <= 3
-            or type(result.get("revision")) is not int
-            or result["revision"] < 0
-        ):
-            return None
-        if result["status"] in {"ready", "dismissed", "published_manually"}:
-            from modules.reply_copilot import normalize_and_validate_reply
-
-            reply_text = result.get("reply_text")
-            if normalize_and_validate_reply(
-                reply_text, reply_kind=result["reply_kind"],
-            ) != reply_text:
-                return None
-        return result
-
-    def reserve_reply_suggestions(
-        self,
-        observed_on: str,
-        candidates: List[Dict],
-        daily_limit: int,
-        reserved_at: datetime,
-    ) -> List[Dict]:
-        """Atomically reserve validated persisted post snapshots for one day."""
-        try:
-            valid_date = date.fromisoformat(observed_on).isoformat() == observed_on
-        except (TypeError, ValueError):
-            valid_date = False
-        if (
-            not valid_date
-            or type(candidates) is not list
-            or not 0 <= len(candidates) <= 5
-            or type(daily_limit) is not int
-            or not 1 <= daily_limit <= 5
-            or not self._valid_reply_boundary_time(reserved_at)
-            or reserved_at.astimezone(ZoneInfo("Europe/Rome")).date().isoformat()
-            != observed_on
-        ):
-            return []
-        expected_keys = {
-            "growth_suggestion_id", "tweet_id", "author_username",
-            "source_excerpt", "audience_segment", "relevance_score",
-            "source_kind", "reply_kind",
-        }
-        normalized = []
-        seen_sources, seen_tweets = set(), set()
-        for candidate in candidates:
-            if type(candidate) is not dict or set(candidate) != expected_keys:
-                return []
-            source_id = candidate["growth_suggestion_id"]
-            tweet_id = candidate["tweet_id"]
-            username = candidate["author_username"]
-            excerpt = candidate["source_excerpt"]
-            segment = candidate["audience_segment"]
-            source_kind = candidate["source_kind"]
-            reply_kind = candidate["reply_kind"]
-            score = candidate["relevance_score"]
-            if (
-                type(source_id) is not int
-                or source_id <= 0
-                or source_id in seen_sources
-                or not isinstance(tweet_id, str)
-                or not self._canonical_growth_object_id(tweet_id)
-                or tweet_id in seen_tweets
-                or not isinstance(username, str)
-                or re.fullmatch(r"[A-Za-z0-9_]{1,15}", username) is None
-                or not isinstance(excerpt, str)
-                or excerpt != excerpt.strip()
-                or not 1 <= len(excerpt) <= 500
-                or segment not in {"operator", "end_user"}
-                or source_kind not in {"discovery", "following"}
-                or reply_kind not in {
-                    "value", "promotion_capacity", "promotion_booking",
-                    "promotion_single_class",
-                }
-                or type(score) is not int
-                or not 0 <= score <= 100
-            ):
-                return []
-            seen_sources.add(source_id)
-            seen_tweets.add(tweet_id)
-            normalized.append(dict(candidate))
-
-        reserved_iso = reserved_at.astimezone(timezone.utc).isoformat()
-        inserted_ids = []
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            verified = []
-            for candidate in normalized:
-                source = conn.execute("""
-                    SELECT id, observed_on, kind, object_id, username,
-                           payload_json, score, reason_codes_json
-                    FROM growth_suggestions WHERE id = ?
-                """, (candidate["growth_suggestion_id"],)).fetchone()
-                if source is None:
-                    return []
-                try:
-                    payload = json.loads(source["payload_json"])
-                    reason_codes = json.loads(source["reason_codes_json"])
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    return []
-                from modules.reply_copilot import (
-                    classify_reply_kind,
-                    classify_reply_segment,
-                )
-
-                supported_reply_kind = classify_reply_kind(
-                    reason_codes, candidate["source_excerpt"],
-                )
-                supported_source_kind = (
-                    "following"
-                    if "followed_account" in reason_codes
-                    else "discovery"
-                )
-
-                if (
-                    source["observed_on"] != observed_on
-                    or source["kind"] != "post"
-                    or source["object_id"] != candidate["tweet_id"]
-                    or source["username"] != candidate["author_username"]
-                    or source["score"] != candidate["relevance_score"]
-                    or type(payload) is not dict
-                    or payload.get("id") != candidate["tweet_id"]
-                    or payload.get("author_username")
-                    != candidate["author_username"]
-                    or payload.get("excerpt") != candidate["source_excerpt"]
-                    or payload.get("reason_codes") != reason_codes
-                    or classify_reply_segment(reason_codes)
-                    != candidate["audience_segment"]
-                    or supported_source_kind != candidate["source_kind"]
-                    or candidate["reply_kind"]
-                    not in {"value", supported_reply_kind}
-                ):
-                    return []
-                verified.append(candidate)
-
-            current_count = conn.execute(
-                "SELECT COUNT(*) FROM reply_suggestions WHERE observed_on = ?",
-                (observed_on,),
-            ).fetchone()[0]
-            remaining = max(0, daily_limit - current_count)
-            for candidate in verified:
-                if remaining <= 0:
-                    break
-                cursor = conn.execute("""
-                    INSERT OR IGNORE INTO reply_suggestions (
-                        growth_suggestion_id, observed_on, tweet_id,
-                        author_username, source_excerpt, audience_segment,
-                        source_kind, reply_kind, relevance_score, status,
-                        generation_count, revision, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', 0, 0, ?, ?)
-                """, (
-                    candidate["growth_suggestion_id"],
-                    observed_on,
-                    candidate["tweet_id"],
-                    candidate["author_username"],
-                    candidate["source_excerpt"],
-                    candidate["audience_segment"],
-                    candidate["source_kind"],
-                    candidate["reply_kind"],
-                    candidate["relevance_score"],
-                    reserved_iso,
-                    reserved_iso,
-                ))
-                if cursor.rowcount == 1:
-                    inserted_ids.append(cursor.lastrowid)
-                    remaining -= 1
-            if not inserted_ids:
-                return []
-            placeholders = ",".join("?" for _value in inserted_ids)
-            rows = conn.execute(
-                f"SELECT * FROM reply_suggestions WHERE id IN ({placeholders}) "
-                "ORDER BY id ASC",
-                inserted_ids,
-            ).fetchall()
-        return [row for item in rows if (row := self._reply_row(item)) is not None]
-
-    def get_reply_suggestion(
-        self,
-        reply_id: int,
-        expected_revision: Optional[int] = None,
-    ) -> Optional[Dict]:
-        if (
-            type(reply_id) is not int
-            or reply_id <= 0
-            or (
-                expected_revision is not None
-                and (type(expected_revision) is not int or expected_revision < 0)
-            )
-        ):
-            return None
-        query = "SELECT * FROM reply_suggestions WHERE id = ?"
-        values = [reply_id]
-        if expected_revision is not None:
-            query += " AND revision = ?"
-            values.append(expected_revision)
-        with self._conn() as conn:
-            row = conn.execute(query, values).fetchone()
-        return self._reply_row(row)
-
-    def list_reply_suggestions(
-        self,
-        observed_on: str,
-        statuses: Optional[List[str]] = None,
-    ) -> List[Dict]:
-        try:
-            if date.fromisoformat(observed_on).isoformat() != observed_on:
-                return []
-        except (TypeError, ValueError):
-            return []
-        allowed = {
-            "reserved", "ready", "generation_failed", "dismissed",
-            "published_manually",
-        }
-        if statuses is not None and (
-            type(statuses) is not list
-            or not statuses
-            or len(statuses) != len(set(statuses))
-            or any(status not in allowed for status in statuses)
-        ):
-            return []
-        query = "SELECT * FROM reply_suggestions WHERE observed_on = ?"
-        values = [observed_on]
-        if statuses is not None:
-            placeholders = ",".join("?" for _status in statuses)
-            query += f" AND status IN ({placeholders})"
-            values.extend(statuses)
-        query += " ORDER BY relevance_score DESC, id ASC"
-        with self._conn() as conn:
-            rows = conn.execute(query, values).fetchall()
-        return [row for item in rows if (row := self._reply_row(item)) is not None]
-
-    def get_existing_reply_tweet_ids(self, tweet_ids: List[str]) -> Set[str]:
-        if (
-            type(tweet_ids) is not list
-            or len(tweet_ids) > 10
-            or len(tweet_ids) != len(set(tweet_ids))
-            or any(
-                not isinstance(tweet_id, str)
-                or not self._canonical_growth_object_id(tweet_id)
-                for tweet_id in tweet_ids
-            )
-        ):
-            return set()
-        if not tweet_ids:
-            return set()
-        placeholders = ",".join("?" for _tweet_id in tweet_ids)
-        with self._conn() as conn:
-            rows = conn.execute(
-                f"SELECT tweet_id FROM reply_suggestions "
-                f"WHERE tweet_id IN ({placeholders})",
-                tweet_ids,
-            ).fetchall()
-        return {row["tweet_id"] for row in rows}
-
-    def claim_reply_generation(
-        self,
-        reply_id: int,
-        expected_revision: int,
-        claim_token: str,
-        claimed_at: datetime,
-        claim_ttl: timedelta,
-        max_attempts: int,
-    ) -> Optional[ReplyGenerationClaim]:
-        if (
-            type(reply_id) is not int
-            or reply_id <= 0
-            or type(expected_revision) is not int
-            or expected_revision < 0
-            or not isinstance(claim_token, str)
-            or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", claim_token) is None
-            or not self._valid_reply_boundary_time(claimed_at)
-            or type(claim_ttl) is not timedelta
-            or not 0 < claim_ttl.total_seconds() <= 900
-            or type(max_attempts) is not int
-            or not 1 <= max_attempts <= 3
-        ):
-            return None
-        claimed = claimed_at.astimezone(timezone.utc)
-        expires = claimed + claim_ttl
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT * FROM reply_suggestions WHERE id = ?",
-                (reply_id,),
-            ).fetchone()
-            if (
-                row is None
-                or row["revision"] != expected_revision
-                or row["status"] not in {"reserved", "ready", "generation_failed"}
-                or row["generation_count"] >= max_attempts
-            ):
-                return None
-            if row["generation_claim_token"] is not None:
-                prior_expiry = parse_growth_datetime(
-                    row["generation_claim_expires_at"]
-                )
-                if prior_expiry is None or prior_expiry > claimed:
-                    return None
-            cursor = conn.execute("""
-                UPDATE reply_suggestions
-                SET status = 'reserved', reply_text = NULL,
-                    failure_code = NULL, generation_claim_token = ?,
-                    generation_claim_expires_at = ?,
-                    generation_count = generation_count + 1,
-                    revision = revision + 1, updated_at = ?
-                WHERE id = ? AND revision = ?
-            """, (
-                claim_token,
-                expires.isoformat(),
-                claimed.isoformat(),
-                reply_id,
-                expected_revision,
-            ))
-            if cursor.rowcount != 1:
-                return None
-            return ReplyGenerationClaim(
-                reply_id=reply_id,
-                revision=expected_revision + 1,
-                claim_token=claim_token,
-                source_excerpt=row["source_excerpt"],
-                reply_kind=row["reply_kind"],
-            )
-
-    def complete_reply_generation(
-        self,
-        claim: ReplyGenerationClaim,
-        reply_text: str,
-        completed_at: datetime,
-    ) -> bool:
-        from modules.reply_copilot import normalize_and_validate_reply
-
-        if (
-            not isinstance(claim, ReplyGenerationClaim)
-            or not self._valid_reply_boundary_time(completed_at)
-        ):
-            return False
-        reply = normalize_and_validate_reply(
-            reply_text, reply_kind=claim.reply_kind,
-        )
-        if reply is None:
-            return False
-        completed_iso = completed_at.astimezone(timezone.utc).isoformat()
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute("""
-                UPDATE reply_suggestions
-                SET status = 'ready', reply_text = ?, failure_code = NULL,
-                    generation_claim_token = NULL,
-                    generation_claim_expires_at = NULL,
-                    revision = revision + 1, updated_at = ?, decided_at = NULL
-                WHERE id = ? AND revision = ? AND status = 'reserved'
-                  AND generation_claim_token = ?
-                  AND generation_claim_expires_at > ?
-            """, (
-                reply,
-                completed_iso,
-                claim.reply_id,
-                claim.revision,
-                claim.claim_token,
-                completed_iso,
-            ))
-            return cursor.rowcount == 1
-
-    def fail_reply_generation(
-        self,
-        claim: ReplyGenerationClaim,
-        failure_code: str,
-        failed_at: datetime,
-    ) -> bool:
-        if (
-            not isinstance(claim, ReplyGenerationClaim)
-            or not isinstance(failure_code, str)
-            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", failure_code) is None
-            or not self._valid_reply_boundary_time(failed_at)
-        ):
-            return False
-        failed_iso = failed_at.astimezone(timezone.utc).isoformat()
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute("""
-                UPDATE reply_suggestions
-                SET status = 'generation_failed', reply_text = NULL,
-                    failure_code = ?, generation_claim_token = NULL,
-                    generation_claim_expires_at = NULL,
-                    revision = revision + 1, updated_at = ?, decided_at = NULL
-                WHERE id = ? AND revision = ? AND status = 'reserved'
-                  AND generation_claim_token = ?
-                  AND generation_claim_expires_at > ?
-            """, (
-                failure_code,
-                failed_iso,
-                claim.reply_id,
-                claim.revision,
-                claim.claim_token,
-                failed_iso,
-            ))
-            return cursor.rowcount == 1
-
-    def transition_reply_suggestion(
-        self,
-        reply_id: int,
-        expected_revision: int,
-        target_status: str,
-        decided_at: datetime,
-    ) -> str:
-        if (
-            type(reply_id) is not int
-            or reply_id <= 0
-            or type(expected_revision) is not int
-            or expected_revision < 0
-            or target_status not in {"dismissed", "published_manually"}
-            or not self._valid_reply_boundary_time(decided_at)
-        ):
-            return "invalid"
-        decided_iso = decided_at.astimezone(timezone.utc).isoformat()
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT status, revision FROM reply_suggestions WHERE id = ?",
-                (reply_id,),
-            ).fetchone()
-            if row is None:
-                return "invalid"
-            if row["status"] == target_status:
-                return "duplicate"
-            if row["status"] != "ready" or row["revision"] != expected_revision:
-                return "rejected"
-            cursor = conn.execute("""
-                UPDATE reply_suggestions
-                SET status = ?, revision = revision + 1,
-                    updated_at = ?, decided_at = ?
-                WHERE id = ? AND status = 'ready' AND revision = ?
-            """, (
-                target_status,
-                decided_iso,
-                decided_iso,
-                reply_id,
-                expected_revision,
-            ))
-            return "updated" if cursor.rowcount == 1 else "rejected"
-
-    def get_reply_copilot_counts(self, observed_on: str) -> Dict[str, int]:
-        statuses = (
-            "reserved", "ready", "generation_failed", "dismissed",
-            "published_manually",
-        )
-        counts = {status: 0 for status in statuses}
-        try:
-            if date.fromisoformat(observed_on).isoformat() != observed_on:
-                return counts
-        except (TypeError, ValueError):
-            return counts
-        with self._conn() as conn:
-            rows = conn.execute("""
-                SELECT status, COUNT(*) AS total
-                FROM reply_suggestions WHERE observed_on = ?
-                GROUP BY status
-            """, (observed_on,)).fetchall()
-        for row in rows:
-            if row["status"] in counts and type(row["total"]) is int:
-                counts[row["status"]] = row["total"]
-        return counts
-
     def mark_growth_suggestion_decision(
         self,
         suggestion_id: int,
@@ -8496,7 +7928,7 @@ class Database:
         allowed = {
             "account": {"not_relevant"},
             "post": {"liked_manually", "skipped"},
-            "reevaluate": {"unfollowed_manually", "keep", "marked_gym"},
+            "reevaluate": {"unfollowed_manually", "keep", "pinned"},
         }
         if (
             type(suggestion_id) is not int
@@ -8578,9 +8010,9 @@ class Database:
                         row["object_id"],
                     ),
                 )
-            elif decision == "marked_gym":
+            elif decision == "pinned":
                 conn.execute(
-                    "UPDATE x_following SET gym_override = 'gym' WHERE user_id = ?",
+                    "UPDATE x_following SET pinned = 1 WHERE user_id = ?",
                     (row["object_id"],),
                 )
             return "updated"
@@ -9052,7 +8484,6 @@ class Database:
                 or not is_json_safe_mapping(latest_post)
                 or not is_json_safe_mapping(score_data)
                 or score_data.get("relevance_policy") != GROWTH_RELEVANCE_POLICY
-                or score_data.get("market_priority") not in {0, 1}
             ):
                 return None
 
@@ -9102,9 +8533,7 @@ class Database:
             if (
                 type(score_data.get("total")) is not int
                 or score_data["total"] != score
-                or score_data.get("audience_segment") not in {
-                    "primary", "amplifier", "end_user",
-                }
+                or score_data.get("audience_segment") not in {"peer", "other"}
                 or type(reasons) is not list
                 or any(type(reason) is not str for reason in reasons)
                 or score_data.get("hard_filter_passed") is not True
@@ -9115,7 +8544,6 @@ class Database:
             result["audience_segment"] = score_data["audience_segment"]
             result["reasons"] = reasons
             result["activity_at"] = score_data["activity_at"]
-            result["market_priority"] = score_data["market_priority"]
             result["direct_url"] = (
                 f"https://x.com/{username}/status/{latest_id}"
             )
@@ -9243,7 +8671,6 @@ class Database:
         eligible.sort(key=lambda candidate: candidate["user_id"])
         eligible.sort(
             key=lambda candidate: (
-                candidate["market_priority"],
                 candidate["score"],
                 activity_timestamp(candidate),
             ),
@@ -9697,10 +9124,6 @@ class Database:
 
     # ---------- Real X following list ----------
 
-    @staticmethod
-    def _effective_gym(is_gym: Any, override: Any) -> bool:
-        return override == "gym" or (is_gym == 1 and override != "not_gym")
-
     def sync_following_snapshot(
         self,
         observed_at: datetime,
@@ -9731,7 +9154,6 @@ class Database:
             "following_total": len(valid),
             "new_following": 0,
             "unfollowed": 0,
-            "gyms_following": 0,
             "still_followed_after_unfollow": [],
         }
         with self._conn() as conn:
@@ -9760,18 +9182,15 @@ class Database:
                 for row in conn.execute("SELECT * FROM x_following").fetchall()
             }
             for user_id, item in valid.items():
-                is_gym = 1 if has_managed_fitness_facility_context(item) else 0
                 profile_json = json.dumps(item, allow_nan=False, sort_keys=True)
                 row = existing.get(user_id)
-                override = row["gym_override"] if row is not None else None
                 if row is None or row["unfollowed_at"] is not None:
                     summary["new_following"] += 1
                     conn.execute("""
                         INSERT INTO x_following (
                             user_id, username, profile_json,
-                            first_seen_following_at, last_seen_following_at,
-                            is_gym
-                        ) VALUES (?, ?, ?, ?, ?, ?)
+                            first_seen_following_at, last_seen_following_at
+                        ) VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(user_id) DO UPDATE SET
                             username = excluded.username,
                             profile_json = excluded.profile_json,
@@ -9782,11 +9201,10 @@ class Database:
                             unfollowed_at = NULL,
                             unfollow_decision = NULL,
                             unfollow_decision_at = NULL,
-                            keep_until = NULL,
-                            is_gym = excluded.is_gym
+                            keep_until = NULL
                     """, (
                         user_id, item["username"], profile_json,
-                        observed_iso, observed_iso, is_gym,
+                        observed_iso, observed_iso,
                     ))
                 else:
                     if row["unfollow_decision"] == "unfollowed_manually":
@@ -9796,7 +9214,7 @@ class Database:
                     conn.execute("""
                         UPDATE x_following
                         SET username = ?, profile_json = ?,
-                            last_seen_following_at = ?, is_gym = ?,
+                            last_seen_following_at = ?,
                             unfollow_decision = CASE
                                 WHEN unfollow_decision = 'unfollowed_manually'
                                 THEN NULL ELSE unfollow_decision END,
@@ -9805,8 +9223,7 @@ class Database:
                                 THEN NULL ELSE unfollow_decision_at END
                         WHERE user_id = ?
                     """, (
-                        item["username"], profile_json, observed_iso, is_gym,
-                        user_id,
+                        item["username"], profile_json, observed_iso, user_id,
                     ))
                 if follower_ids is not None:
                     conn.execute("""
@@ -9818,8 +9235,6 @@ class Database:
                         follower_checked_at,
                         user_id,
                     ))
-                if self._effective_gym(is_gym, override):
-                    summary["gyms_following"] += 1
                 conn.execute("""
                     UPDATE growth_candidates
                     SET decision = 'followed_manually',
@@ -9848,13 +9263,13 @@ class Database:
         """Return accounts currently followed, keyed by user id."""
         with self._conn() as conn:
             rows = conn.execute("""
-                SELECT user_id, username, is_gym, gym_override
+                SELECT user_id, username, pinned
                 FROM x_following WHERE unfollowed_at IS NULL
             """).fetchall()
         return {
             row["user_id"]: {
                 "username": row["username"],
-                "is_gym": self._effective_gym(row["is_gym"], row["gym_override"]),
+                "pinned": row["pinned"] == 1,
             }
             for row in rows
             if self._canonical_growth_object_id(row["user_id"])
@@ -9867,7 +9282,7 @@ class Database:
         limit: int = 5,
         review_days: int = 30,
     ) -> List[Dict]:
-        """Return non-gym followed accounts that never followed back."""
+        """Return unpinned followed accounts that never followed back."""
         if (
             type(now) is not datetime
             or now.tzinfo is None
@@ -9906,7 +9321,7 @@ class Database:
                 or first_seen > current - maturity
                 or checked < first_seen + maturity
                 or checked > current
-                or self._effective_gym(row["is_gym"], row["gym_override"])
+                or row["pinned"] == 1
                 or row["unfollow_decision"] == "unfollowed_manually"
                 or (
                     row["unfollow_decision"] == "keep"
@@ -10116,8 +9531,7 @@ class Database:
                    OR key LIKE 'growth_profile_evaluations:%'
             """).fetchall()
             following_rows = conn.execute("""
-                SELECT is_gym, gym_override, follows_back,
-                       follows_back_checked_at, unfollowed_at
+                SELECT follows_back, follows_back_checked_at, unfollowed_at
                 FROM x_following
             """).fetchall()
             like_rows = conn.execute("""
@@ -10158,20 +9572,12 @@ class Database:
                     profiles_evaluated += count
 
         active = [row for row in following_rows if row["unfollowed_at"] is None]
-        gyms = [
-            row for row in active
-            if self._effective_gym(row["is_gym"], row["gym_override"])
-        ]
-        others = [
-            row for row in active
-            if not self._effective_gym(row["is_gym"], row["gym_override"])
-        ]
-
-        def follow_back_rate(rows):
-            checked = [row for row in rows if row["follows_back_checked_at"]]
-            if not checked:
-                return 0.0
-            return round(sum(row["follows_back"] == 1 for row in checked) / len(checked), 4)
+        checked = [row for row in active if row["follows_back_checked_at"]]
+        follow_back_rate = (
+            round(sum(row["follows_back"] == 1 for row in checked) / len(checked), 4)
+            if checked
+            else 0.0
+        )
 
         unfollows = 0
         for row in following_rows:
@@ -10186,8 +9592,7 @@ class Database:
                 continue
             source = next(
                 (
-                    code for code in reasons
-                    if code in {"followed_gym", "suggested_gym", "operator_pain"}
+                    code for code in reasons if code in _GROWTH_LIKE_SOURCES
                 ),
                 None,
             ) if type(reasons) is list else None
@@ -10195,9 +9600,7 @@ class Database:
                 likes_by_source[source] = likes_by_source.get(source, 0) + 1
         following_summary = {
             "following_total": len(active),
-            "gyms_following": len(gyms),
-            "gym_follow_back_rate": follow_back_rate(gyms),
-            "other_follow_back_rate": follow_back_rate(others),
+            "follow_back_rate": follow_back_rate,
             "unfollows": unfollows,
             "likes_by_source": dict(sorted(likes_by_source.items())),
         }

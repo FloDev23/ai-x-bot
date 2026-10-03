@@ -131,8 +131,6 @@ class FlexDropinGrowthAgent:
         "publication_planner",
         "publication_cadence",
         "queue_replenisher",
-        "reply_copilot",
-        "reply_copilot_enabled",
         "review_translator",
         "scheduler",
         "scorer",
@@ -201,11 +199,6 @@ class FlexDropinGrowthAgent:
         self.lead_discovery_enabled = supplied.get(
             "lead_discovery_enabled", ENABLE_LEAD_DISCOVERY
         )
-        reply_copilot_enabled = supplied.get("reply_copilot_enabled", False)
-        if type(reply_copilot_enabled) is not bool:
-            raise ValueError("reply_copilot_enabled must be a boolean")
-        if reply_copilot_enabled:
-            logger.warning("reply_copilot_retired: ENABLE_REPLY_COPILOT is ignored")
         self.lead_cycle_times = tuple(supplied.get(
             "lead_cycle_times", OPPORTUNITY_CYCLE_TIMES
         ))
@@ -407,7 +400,6 @@ class FlexDropinGrowthAgent:
                 unfollow_review_days=GROWTH_UNFOLLOW_REVIEW_DAYS,
             ),
         )
-        self.reply_copilot = None
         self.lead_finder = resolve(
             "lead_finder",
             lambda: LeadFinder(
@@ -434,7 +426,6 @@ class FlexDropinGrowthAgent:
                 media_matcher=self.media_matcher,
                 analytics=self.analytics,
                 growth_digest=self.growth_digest,
-                reply_copilot=self.reply_copilot,
                 scheduler_status=self.scheduler_status,
                 queue_service=self.queue_replenisher,
                 dry_run=self.dry_run,

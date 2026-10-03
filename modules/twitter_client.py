@@ -1072,7 +1072,9 @@ class TwitterClient:
         if not seeds:
             return []
         mentions = " OR ".join(f"@{seed}" for seed in seeds)
-        return self._search_recent_profiles(f"({mentions}) -is:retweet", limit)
+        return self._search_recent_profiles(
+            f"({mentions}) lang:en -is:retweet", limit
+        )
 
     def get_latest_original_post(self, user_id: str) -> Optional[Dict]:
         """Read the latest original post, excluding replies and reposts."""

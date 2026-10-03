@@ -69,7 +69,7 @@ FILTER_CASES = [
         "post-context-only",
         {"description": " \t "},
         {},
-        (False, "no_managed_fitness_facility_context"),
+        (False, "no_founder_context"),
     ),
     (
         "bio-context-only",
@@ -242,11 +242,10 @@ def test_hard_filter_cache_and_digest_share_canonical_eligibility_matrix(
         "latest_post": latest_post,
         "score": 85,
         "score_data": {
-            "relevance_policy": "managed_fitness_facility_us_priority_v3",
-            "market_priority": 0,
+            "relevance_policy": "startup_founder_peer_v1",
             "total": 85,
-            "audience_segment": "primary",
-            "reasons": ["primary_operator_role"],
+            "audience_segment": "peer",
+            "reasons": ["founder_bio"],
             "activity_at": activity_at,
             "hard_filter_passed": True,
             "filter_reason": "accepted",
@@ -294,11 +293,10 @@ def test_whitespace_only_context_is_excluded_from_cache_digest_and_full_run(
         "latest_post": latest_post,
         "score": 85,
         "score_data": {
-            "relevance_policy": "managed_fitness_facility_us_priority_v3",
-            "market_priority": 0,
+            "relevance_policy": "startup_founder_peer_v1",
             "total": 85,
-            "audience_segment": "primary",
-            "reasons": ["primary_operator_role"],
+            "audience_segment": "peer",
+            "reasons": ["founder_bio"],
             "activity_at": activity_at.isoformat(),
             "hard_filter_passed": True,
             "filter_reason": "accepted",
@@ -323,12 +321,12 @@ def test_empty_language_from_collector_remains_eligible_end_to_end(tmp_path):
     candidate_profile = review_profile(
         "empty-lang-user",
         "empty_lang",
-        description="Owner of a FlexDropin gym",
+        description="Founder of a FlexDropin startup",
     )
     latest_post = review_post(
         "841",
         activity_at.isoformat(),
-        text="Class schedule, member booking, and drop-in occupancy",
+        text="Shipped a new feature, first users and feedback",
         lang="",
     )
     x_client = OneFollowerX(candidate_profile, latest_post)
@@ -341,7 +339,7 @@ def test_empty_language_from_collector_remains_eligible_end_to_end(tmp_path):
         "accepted",
     )
     assert [row["user_id"] for row in rows] == ["empty-lang-user"]
-    assert rows[0]["score"] == 90
+    assert rows[0]["score"] == 85
     assert database.get_cached_growth_candidate("empty-lang-user", NOW) is not None
     assert [
         row["user_id"] for row in database.get_digest_candidates(now=NOW)

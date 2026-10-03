@@ -18,9 +18,8 @@ from config import (
 from modules.growth_candidate_schema import (
     GROWTH_RELEVANCE_POLICY,
     as_utc,
-    classify_growth_market,
     evaluate_growth_candidate_filters,
-    has_managed_fitness_facility_context,
+    has_founder_context,
     is_canonical_growth_latest_post,
     is_canonical_growth_profile,
     parse_growth_datetime,
@@ -29,45 +28,39 @@ from modules.growth_candidate_schema import (
 
 logger = logging.getLogger(__name__)
 
-# X search matches the text of posts, not bios. Asking for "owner" or "founder"
-# in the post text finds people talking *about* a gym, not the gyms themselves:
-# that is what filled the candidate table with random accounts. These queries
-# look for what a gym actually posts, and the bio filter decides who is an
-# operator. Geo operators are also avoided: place_country:US only matches
-# geotagged posts, which almost no gym uses.
+# X search matches post text, so each query looks for what founders write
+# about while building; the bio filter then decides who is a founder.
 DEFAULT_TOPIC_QUERIES = (
-    '("drop-in" OR "drop in class" OR "day pass" OR "open gym" OR '
-    '"class schedule" OR "book a class" OR "class times" OR "walk-ins welcome") '
-    '(gym OR studio OR box OR crossfit OR pilates OR yoga OR bjj OR '
-    '"martial arts" OR boxing OR climbing) '
-    'lang:en -is:retweet',
-    '("new members" OR "join us" OR "first class" OR "free trial class" OR '
-    '"class is full" OR "spots left" OR "no-show" OR waitlist) '
-    '(gym OR studio OR box OR crossfit OR pilates OR yoga OR "fitness center" OR '
-    '"training center" OR dojo) '
-    'lang:en -is:retweet',
+    '("build in public" OR #buildinpublic OR "indie hacker" OR #indiehackers OR '
+    '"solo founder" OR bootstrapped) '
+    'lang:en -is:retweet -is:reply',
+    '("Product Hunt" OR "first paying customer" OR "first customers" OR MRR OR '
+    '"my SaaS" OR "my startup") '
+    '(launch OR launched OR shipped OR building) '
+    'lang:en -is:retweet -is:reply',
 )
-_NO_SEED_US_FACILITY_QUERY = (
-    '("our gym" OR "our studio" OR "our box" OR "our members" OR '
-    '"at the gym today" OR "schedule for the week") '
-    '(class OR classes OR members OR membership OR schedule OR "drop-in" OR '
-    '"day pass" OR coach) '
-    'lang:en -is:retweet'
-)
-_OPERATING_TOPIC_TERMS = (
-    "class",
-    "schedule",
-    "retention",
-    "member",
-    "no-show",
-    "occupancy",
-    "booking",
-    "drop-in",
-    "day pass",
-    "waitlist",
+_STARTUP_TOPIC_TERMS = (
+    "build in public",
+    "buildinpublic",
+    "launch",
+    "launched",
+    "shipped",
+    "product hunt",
+    "mrr",
     "revenue",
+    "customers",
+    "users",
+    "saas",
+    "startup",
+    "feedback",
+    "growth",
 )
-_AFFINITY_TERMS = ("drop-in", "drop in", "class booking", "day pass", "flexdropin")
+_FITNESS_AFFINITY_TERMS = (
+    "fitness", "gym", "workout", "health", "wellness", "sport", "yoga",
+    "pilates", "running",
+)
+# Mid-size accounts follow back; celebrities and empty accounts rarely do.
+_FOLLOW_BACK_FOLLOWERS = range(50, 50_001)
 
 
 def _utc(value: datetime) -> datetime:
@@ -80,8 +73,6 @@ def _parse_datetime(value) -> Optional[datetime]:
 
 def _contains(text: str, term: str) -> bool:
     pattern = r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])"
-    if term in {"class", "member"}:
-        pattern = r"(?<![a-z0-9])" + re.escape(term) + r"s?(?![a-z0-9])"
     return re.search(pattern, text) is not None
 
 
@@ -99,7 +90,7 @@ def score_growth_candidate(
     latest_post: Optional[Dict],
     now: datetime,
 ) -> Dict:
-    """Return the approved arithmetic 0-100 relevance score."""
+    """Return the arithmetic 0-100 founder relevance score."""
     profile = profile if isinstance(profile, dict) else {}
     latest_post = latest_post if isinstance(latest_post, dict) else {}
     bio = profile.get("description")
@@ -108,23 +99,23 @@ def score_growth_candidate(
     recent_text = post_text.lower() if type(post_text) is str else ""
     reasons = []
 
-    if has_managed_fitness_facility_context(profile):
-        segment = "primary"
+    if has_founder_context(profile):
+        segment = "peer"
         role_bio = 35
-        reasons.append("primary_operator_role")
+        reasons.append("founder_bio")
     else:
-        segment = "end_user"
+        segment = "other"
         role_bio = 0
 
     topic_matches = sum(
-        _contains(recent_text, term) for term in _OPERATING_TOPIC_TERMS
+        _contains(recent_text, term) for term in _STARTUP_TOPIC_TERMS
     )
     if topic_matches >= 2:
         recent_topic_fit = 25
-        reasons.append("multiple_operating_topics")
+        reasons.append("multiple_startup_topics")
     elif topic_matches == 1:
         recent_topic_fit = 15
-        reasons.append("one_operating_topic")
+        reasons.append("one_startup_topic")
     else:
         recent_topic_fit = 0
 
@@ -146,42 +137,36 @@ def score_growth_candidate(
 
     followers = profile.get("followers_count")
     following = profile.get("following_count")
-    plausible_metrics = (
+    follow_back_range = (
         type(followers) is int
         and type(following) is int
-        and 10 <= followers <= 100_000_000
+        and followers in _FOLLOW_BACK_FOLLOWERS
         and 0 <= following <= 1_000_000
         and not profile.get("spam_signals")
     )
-    account_quality = 10 if plausible_metrics else 0
+    account_quality = 10 if follow_back_range else 0
     if account_quality:
-        reasons.append("plausible_public_metrics")
+        reasons.append("follow_back_range")
 
     combined_text = f"{bio_text} {recent_text}"
     affinity = 5 if any(
-        _contains(combined_text, term) for term in _AFFINITY_TERMS
+        _contains(combined_text, term) for term in _FITNESS_AFFINITY_TERMS
     ) else 0
     if affinity:
-        reasons.append("direct_drop_in_affinity")
-
-    market_priority = int(classify_growth_market(profile) == "usa")
-    if market_priority:
-        reasons.append("us_market")
+        reasons.append("fitness_affinity")
 
     components = {
-        "role_bio": min(role_bio, 35),
-        "recent_topic_fit": min(recent_topic_fit, 25),
-        "activity": min(activity, 15),
-        "market": min(market, 15),
-        "account_quality": min(account_quality, 10),
-        "affinity": min(affinity, 5),
+        "role_bio": role_bio,
+        "recent_topic_fit": recent_topic_fit,
+        "activity": activity,
+        "market": market,
+        "account_quality": account_quality,
+        "affinity": affinity,
     }
-    total = min(sum(components.values()), 100)
     return {
         "relevance_policy": GROWTH_RELEVANCE_POLICY,
-        "market_priority": market_priority,
         **components,
-        "total": total,
+        "total": min(sum(components.values()), 100),
         "audience_segment": segment,
         "reasons": reasons,
         "activity_at": activity_at.isoformat() if activity_at else None,
@@ -260,18 +245,8 @@ class GrowthDiscovery:
                 lambda: self.x.search_recent_authors(self.topic_queries[1]),
             ),
             (
-                "network" if self.seed_accounts else (
-                    f"topic_search:{_NO_SEED_US_FACILITY_QUERY}"
-                ),
-                (
-                    (lambda: self.x.get_network_candidates(self.seed_accounts))
-                    if self.seed_accounts
-                    else (
-                        lambda: self.x.search_recent_authors(
-                            _NO_SEED_US_FACILITY_QUERY
-                        )
-                    )
-                ),
+                "network",
+                lambda: self.x.get_network_candidates(self.seed_accounts),
             ),
         ]
         results = []

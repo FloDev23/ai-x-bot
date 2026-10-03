@@ -1,17 +1,17 @@
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from modules.database import Database
-from modules.growth_candidate_schema import has_managed_fitness_facility_context
 
 
 NOW = datetime(2026, 9, 15, 21, 15, tzinfo=timezone.utc)
-GYM_BIO = "Independent gym in Austin, TX. Classes daily."
+PEER_BIO = "Founder of a booking app. Building in public."
 OTHER_BIO = "Fitness podcast host and marathon runner."
 
 
-def profile(user_id, username, description=GYM_BIO):
+def profile(user_id, username, description=PEER_BIO):
     return {
         "id": user_id,
         "user_id": user_id,
@@ -42,14 +42,7 @@ def following_row(db, user_id):
         ).fetchone()
 
 
-def test_fixture_bios_classify_as_expected():
-    assert has_managed_fitness_facility_context(profile("11", "gym_a")) is True
-    assert has_managed_fitness_facility_context(
-        profile("12", "runner", OTHER_BIO)
-    ) is False
-
-
-def test_complete_sync_inserts_rows_with_gym_flag_and_follow_back(tmp_path):
+def test_complete_sync_inserts_rows_with_follow_back(tmp_path):
     db = Database(str(tmp_path / "following.db"))
     capture_followers(db, NOW - timedelta(hours=1), [profile("11", "gym_a")])
 
@@ -63,19 +56,54 @@ def test_complete_sync_inserts_rows_with_gym_flag_and_follow_back(tmp_path):
         "following_total": 2,
         "new_following": 2,
         "unfollowed": 0,
-        "gyms_following": 1,
         "still_followed_after_unfollow": [],
     }
-    gym = following_row(db, "11")
+    peer = following_row(db, "11")
     runner = following_row(db, "12")
-    assert (gym["is_gym"], gym["follows_back"]) == (1, 1)
-    assert gym["first_seen_following_at"] == NOW.isoformat()
-    assert gym["follows_back_checked_at"] == (NOW - timedelta(hours=1)).isoformat()
-    assert (runner["is_gym"], runner["follows_back"]) == (0, 0)
+    assert (peer["pinned"], peer["follows_back"]) == (0, 1)
+    assert peer["first_seen_following_at"] == NOW.isoformat()
+    assert peer["follows_back_checked_at"] == (NOW - timedelta(hours=1)).isoformat()
+    assert (runner["pinned"], runner["follows_back"]) == (0, 0)
     assert db.get_following_state() == {
-        "11": {"username": "gym_a", "is_gym": True},
-        "12": {"username": "runner", "is_gym": False},
+        "11": {"username": "gym_a", "pinned": False},
+        "12": {"username": "runner", "pinned": False},
     }
+
+
+def test_legacy_gym_columns_migrate_to_pinned(tmp_path):
+    path = str(tmp_path / "legacy-following.db")
+    Database(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE x_following DROP COLUMN pinned")
+        conn.execute("ALTER TABLE x_following ADD COLUMN is_gym INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "ALTER TABLE x_following ADD COLUMN gym_override TEXT "
+            "CHECK (gym_override IN ('gym', 'not_gym'))"
+        )
+        for user_id, override in (("11", "gym"), ("12", "not_gym"), ("13", None)):
+            conn.execute(
+                "INSERT INTO x_following (user_id, username, profile_json, "
+                "first_seen_following_at, last_seen_following_at, is_gym, "
+                "gym_override) VALUES (?, ?, '{}', ?, ?, 1, ?)",
+                (user_id, f"user_{user_id}", NOW.isoformat(), NOW.isoformat(), override),
+            )
+        conn.execute(
+            "INSERT INTO growth_suggestions (observed_on, kind, object_id, "
+            "username, payload_json, score, reason_codes_json, suggested_at, "
+            "decision) VALUES ('2026-09-14', 'reevaluate', '11', 'user_11', "
+            "'{}', 0, '[]', ?, 'marked_gym')",
+            (NOW.isoformat(),),
+        )
+
+    db = Database(path)
+
+    with db._conn() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(x_following)")}
+        pinned = dict(conn.execute("SELECT user_id, pinned FROM x_following").fetchall())
+        decision = conn.execute("SELECT decision FROM growth_suggestions").fetchone()[0]
+    assert "is_gym" not in columns and "gym_override" not in columns
+    assert pinned == {"11": 1, "12": 0, "13": 0}
+    assert decision == "pinned"
 
 
 def test_incomplete_sync_writes_nothing(tmp_path):
@@ -180,7 +208,6 @@ EMPTY_SYNC = {
     "following_total": 0,
     "new_following": 0,
     "unfollowed": 0,
-    "gyms_following": 0,
     "still_followed_after_unfollow": [],
 }
 
@@ -321,13 +348,13 @@ def unfollow_payload(user_id="12", username="runner"):
 
 
 def post_payload(post_id="7001", author_id="200", username="gym_a",
-                 reasons=("followed_gym",), created_at=None):
+                 reasons=("followed_account",), created_at=None):
     reasons = list(reasons)
     return {
         "id": post_id,
         "author_id": author_id,
         "author_username": username,
-        "excerpt": "New class schedule at our gym.",
+        "excerpt": "Shipped onboarding v2 today.",
         "created_at": (created_at or NOW - timedelta(hours=3)).isoformat(),
         "public_metrics": {
             "like_count": 1, "retweet_count": 0, "reply_count": 0,
@@ -338,14 +365,14 @@ def post_payload(post_id="7001", author_id="200", username="gym_a",
 
 
 def account_payload(user_id="101", username="studio_owner"):
-    reasons = ["primary_operator_role", "active_within_7_days"]
+    reasons = ["founder_bio", "active_within_7_days"]
     return {
         "user_id": user_id,
         "username": username,
         "public_metrics": dict(METRICS),
         "latest_activity_id": "9001",
         "latest_activity_at": (NOW - timedelta(hours=3)).isoformat(),
-        "segment": "primary",
+        "segment": "peer",
         "reason_codes": reasons,
     }, reasons
 
@@ -357,7 +384,7 @@ def follow_for_maturity(db, profiles, followed_at=NOW - timedelta(days=31),
     db.sync_following_snapshot(NOW, profiles, complete=True)
 
 
-def test_unfollow_proposal_requires_maturity_non_gym_and_later_follower_run(tmp_path):
+def test_unfollow_proposal_requires_maturity_unpinned_and_later_follower_run(tmp_path):
     db = Database(str(tmp_path / "proposals.db"))
     gym = profile("11", "gym_a")
     runner = profile("12", "runner", OTHER_BIO)
@@ -368,6 +395,8 @@ def test_unfollow_proposal_requires_maturity_non_gym_and_later_follower_run(tmp_
     )
     capture_followers(db, NOW - timedelta(hours=1), [])
     db.sync_following_snapshot(NOW, [gym, runner, newbie], complete=True)
+    with db._conn() as conn:
+        conn.execute("UPDATE x_following SET pinned = 1 WHERE user_id = '11'")
 
     assert db.get_unfollow_proposals(NOW) == [{
         "user_id": "12",
@@ -411,7 +440,7 @@ def test_weekly_cap_counts_reevaluate_rows_since_rome_monday(tmp_path):
     [
         ("unfollowed_manually", "unfollow_decision", "unfollowed_manually"),
         ("keep", "unfollow_decision", "keep"),
-        ("marked_gym", "gym_override", "gym"),
+        ("pinned", "pinned", 1),
     ],
 )
 def test_unfollow_decisions_update_following_state(tmp_path, decision, column, expected):
@@ -432,8 +461,8 @@ def test_unfollow_decisions_update_following_state(tmp_path, decision, column, e
     if decision == "keep":
         assert row["keep_until"] == (NOW + timedelta(days=90)).isoformat()
         assert db.get_unfollow_proposals(NOW + timedelta(days=91))[0]["user_id"] == "12"
-    if decision == "marked_gym":
-        assert db.get_following_state()["12"]["is_gym"] is True
+    if decision == "pinned":
+        assert db.get_following_state()["12"]["pinned"] is True
 
 
 def test_account_not_relevant_rejects_candidate_for_30_days(tmp_path):
@@ -507,13 +536,11 @@ def test_weekly_report_summarizes_following_and_likes(tmp_path):
 
     assert report["following_summary"] == {
         "following_total": 2,
-        "gyms_following": 1,
-        "gym_follow_back_rate": 1.0,
-        "other_follow_back_rate": 0.0,
+        "follow_back_rate": 0.5,
         "unfollows": 1,
-        "likes_by_source": {"followed_gym": 1},
+        "likes_by_source": {"followed_account": 1},
     }
     text = TelegramController.format_weekly_report(report)
     assert "Following" in text
-    assert "palestre: 1" in text
-    assert "palestra seguita: 1" in text
+    assert "follow-back: 50%" in text
+    assert "account seguito: 1" in text

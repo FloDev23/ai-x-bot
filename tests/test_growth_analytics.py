@@ -37,7 +37,7 @@ def follower_profile(user_id="100", username="owner", **overrides):
     profile = {
         "id": user_id,
         "username": username,
-        "description": "Owner of an independent strength and conditioning studio",
+        "description": "Founder of an independent booking app",
         "followers_count": 1800,
         "following_count": 650,
         "protected": False,
@@ -50,7 +50,7 @@ def follower_profile(user_id="100", username="owner", **overrides):
 def latest_post(post_id="900", created_at=None, **overrides):
     post = {
         "id": post_id,
-        "text": "Testing a new class timetable for our members",
+        "text": "Shipped a new booking flow and got feedback from our first users",
         "created_at": created_at or (NOW - timedelta(days=1)).isoformat(),
         "lang": "en",
         "is_original": True,
@@ -61,8 +61,7 @@ def latest_post(post_id="900", created_at=None, **overrides):
 
 def accepted_score(total=95, activity_at=None):
     return {
-        "relevance_policy": "managed_fitness_facility_us_priority_v3",
-        "market_priority": 0,
+        "relevance_policy": "startup_founder_peer_v1",
         "role_bio": 35,
         "recent_topic_fit": 25,
         "activity": 15,
@@ -70,13 +69,13 @@ def accepted_score(total=95, activity_at=None):
         "account_quality": 10,
         "affinity": 0,
         "total": total,
-        "audience_segment": "primary",
+        "audience_segment": "peer",
         "reasons": [
-            "primary_operator_role",
-            "multiple_operating_topics",
+            "founder_bio",
+            "multiple_startup_topics",
             "active_within_7_days",
             "english_market",
-            "plausible_public_metrics",
+            "follow_back_range",
         ],
         "activity_at": activity_at or (NOW - timedelta(days=1)).isoformat(),
         "hard_filter_passed": True,
@@ -1079,9 +1078,7 @@ def test_weekly_report_empty_has_exact_stable_schema(tmp_path):
         },
         "following_summary": {
             "following_total": 0,
-            "gyms_following": 0,
-            "gym_follow_back_rate": 0.0,
-            "other_follow_back_rate": 0.0,
+            "follow_back_rate": 0.0,
             "unfollows": 0,
             "likes_by_source": {},
         },
