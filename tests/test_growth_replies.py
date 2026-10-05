@@ -86,6 +86,7 @@ def seed_posts(db, sources):
         {"reply_en": "Ask @levelsio, he covered exactly this in a thread."},
         {"reply_en": "FlexDropin had the same problem before our first users."},
         {"reply_en": "Nice!"},
+        {"reply_en": "The onboarding felt clear—what made you pause on pricing?"},
         {"reply_en": "x" * 241},
         {"reply_it": ""},
         {"post_it": None},

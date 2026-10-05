@@ -18,8 +18,9 @@ REPLY_MAX_GENERATIONS = 3
 # Founder conversations first: they invite answers. Suggested accounts' latest
 # posts fill the remaining slots.
 _REPLY_SOURCES = ("founder_conversation", "suggested_account")
+# Em dashes are the quickest tell of machine-written replies.
 _FORBIDDEN_IN_REPLY = re.compile(
-    r"https?://|www\.|(?<!\w)[#@]\w|flexdropin", re.IGNORECASE,
+    r"https?://|www\.|(?<!\w)[#@]\w|flexdropin|[—–]", re.IGNORECASE,
 )
 
 
