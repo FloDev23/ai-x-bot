@@ -224,6 +224,7 @@ def test_non_founder_bios_do_not_qualify(description):
         "Bootstrapped SaaS, 2 kids",
         "CEO at a fitness startup",
         "Shipping small apps #buildinpublic",
+        "22 year old solo founder building from $1000/month to $10K/month",
     ],
 )
 def test_founder_bios_qualify(description):
@@ -243,6 +244,9 @@ def test_founder_bios_qualify(description):
         ("Startup founder. Follow back!", "Shipped a new feature for users"),
         ("Founder of a SaaS", "Airdrop is live, claim now"),
         ("Founder of a SaaS", "Buy $PEPE before launch"),
+        ("Hey there! Here's a passionate programmer creating Web Dev. Building in public", "Shipped"),
+        ("SaaS founder | Backlinks and directory submissions", "Shipped"),
+        ("Startup founder", "You can do same thing and make $10k monthly."),
     ],
 )
 def test_noise_signals_reject_self_declared_founders(description, latest_text):

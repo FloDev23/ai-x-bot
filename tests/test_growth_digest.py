@@ -955,7 +955,7 @@ def test_service_builds_closed_ranked_daily_digest_with_one_search(tmp_path):
     assert x_client.engagement_writes == []
 
 
-def test_followed_account_posts_skip_keywords_but_respect_age_and_noise(tmp_path):
+def test_followed_peer_posts_skip_keywords_but_respect_age_and_peer_bio(tmp_path):
     database = Database(str(tmp_path / "followed-account.db"))
     _follow(database, [
         _peer_profile("301", "gym_one"),
@@ -973,7 +973,7 @@ def test_followed_account_posts_skip_keywords_but_respect_age_and_noise(tmp_path
             created_at=(NOW - timedelta(hours=80)).isoformat(),
         ),
         _normalized_post(
-            "9103", "Airdrop is live, claim your tokens now.",
+            "9103", "Ran 10k this morning before the podcast.",
             author_id="302", author_username="runner",
         ),
     ])

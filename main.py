@@ -63,6 +63,7 @@ from modules.draft_pipeline import DraftPipeline
 from modules.editorial_feed import FlexDropinEditorialFeedClient
 from modules.fact_guard import FactGuard
 from modules.growth_discovery import GrowthDiscovery
+from modules.growth_replies import GrowthReplyService
 from modules.growth_digest import GrowthDigestService
 from modules.lead_finder import LeadFinder
 from modules.media_matcher import MediaMatcher
@@ -117,6 +118,7 @@ class FlexDropinGrowthAgent:
         "generator",
         "growth_discovery",
         "growth_digest",
+        "growth_replies",
         "lead_discovery_enabled",
         "lead_cycle_times",
         "lead_finder",
@@ -400,6 +402,10 @@ class FlexDropinGrowthAgent:
                 unfollow_review_days=GROWTH_UNFOLLOW_REVIEW_DAYS,
             ),
         )
+        self.growth_replies = resolve(
+            "growth_replies",
+            lambda: GrowthReplyService(self.ai_generator, self.db),
+        )
         self.lead_finder = resolve(
             "lead_finder",
             lambda: LeadFinder(
@@ -426,6 +432,7 @@ class FlexDropinGrowthAgent:
                 media_matcher=self.media_matcher,
                 analytics=self.analytics,
                 growth_digest=self.growth_digest,
+                growth_replies=self.growth_replies,
                 scheduler_status=self.scheduler_status,
                 queue_service=self.queue_replenisher,
                 dry_run=self.dry_run,
@@ -649,6 +656,12 @@ class FlexDropinGrowthAgent:
         try:
             current = self._now() if now is None else now
             digest = self.growth_digest.build(current)
+            if digest.get("observed_on"):
+                try:
+                    self.growth_replies.build(digest["observed_on"], current)
+                except Exception as error:
+                    # Replies are optional: the digest still goes out.
+                    self._notify_error("growth_replies_cycle", error)
             return self.telegram_controller.push_growth_digest(
                 digest, explicit=False,
             )

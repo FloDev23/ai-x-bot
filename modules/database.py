@@ -38,6 +38,7 @@ from modules.media_store import (
 from modules.growth_candidate_schema import (
     GROWTH_RELEVANCE_POLICY,
     evaluate_growth_candidate_filters,
+    has_founder_context,
     is_canonical_growth_latest_post,
     is_canonical_growth_profile,
     is_json_safe_mapping,
@@ -913,6 +914,28 @@ class Database:
             c.execute("""
                 CREATE INDEX IF NOT EXISTS idx_growth_suggestion_cooldown
                 ON growth_suggestions(kind, object_id, cooldown_until)
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS growth_reply_drafts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    suggestion_id INTEGER NOT NULL UNIQUE
+                        REFERENCES growth_suggestions(id),
+                    observed_on TEXT NOT NULL,
+                    tweet_id TEXT NOT NULL,
+                    author_username TEXT NOT NULL,
+                    post_excerpt TEXT NOT NULL,
+                    post_it TEXT NOT NULL,
+                    reply_en TEXT NOT NULL,
+                    reply_it TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ready' CHECK (
+                        status IN ('ready', 'posted_manually', 'skipped')
+                    ),
+                    generation_count INTEGER NOT NULL DEFAULT 1,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
             """)
 
             c.execute("""
@@ -7917,6 +7940,105 @@ class Database:
                     }
         return None
 
+    # ---------- Manual reply drafts for growth posts ----------
+
+    def list_growth_reply_drafts(self, observed_on: str) -> List[Dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM growth_reply_drafts WHERE observed_on = ? "
+                "ORDER BY id",
+                (observed_on,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_growth_reply_draft(self, draft_id: int) -> Optional[Dict]:
+        if type(draft_id) is not int or draft_id <= 0:
+            return None
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM growth_reply_drafts WHERE id = ?", (draft_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def insert_growth_reply_draft(self, draft: Dict, now: datetime) -> bool:
+        """Store one generated draft; a second draft for a post is ignored."""
+        created = now.astimezone(timezone.utc).isoformat()
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO growth_reply_drafts (
+                    suggestion_id, observed_on, tweet_id, author_username,
+                    post_excerpt, post_it, reply_en, reply_it,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    draft["suggestion_id"], draft["observed_on"],
+                    draft["tweet_id"], draft["author_username"],
+                    draft["post_excerpt"], draft["post_it"],
+                    draft["reply_en"], draft["reply_it"], created, created,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def replace_growth_reply_text(
+        self,
+        draft_id: int,
+        expected_revision: int,
+        text: Dict,
+        now: datetime,
+        *,
+        max_generations: int,
+    ) -> str:
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE growth_reply_drafts
+                SET post_it = ?, reply_en = ?, reply_it = ?,
+                    generation_count = generation_count + 1,
+                    revision = revision + 1, updated_at = ?
+                WHERE id = ? AND revision = ? AND status = 'ready'
+                  AND generation_count < ?
+                """,
+                (
+                    text["post_it"], text["reply_en"], text["reply_it"],
+                    now.astimezone(timezone.utc).isoformat(),
+                    draft_id, expected_revision, max_generations,
+                ),
+            )
+        return "updated" if cursor.rowcount == 1 else "rejected"
+
+    def mark_growth_reply_draft(
+        self,
+        draft_id: int,
+        expected_revision: int,
+        status: str,
+        now: datetime,
+    ) -> str:
+        if status not in {"posted_manually", "skipped"}:
+            return "invalid"
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT status, revision FROM growth_reply_drafts WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            if row is None:
+                return "invalid"
+            if row["status"] == status:
+                return "duplicate"
+            cursor = conn.execute(
+                """
+                UPDATE growth_reply_drafts
+                SET status = ?, revision = revision + 1, updated_at = ?
+                WHERE id = ? AND revision = ? AND status = 'ready'
+                """,
+                (
+                    status, now.astimezone(timezone.utc).isoformat(),
+                    draft_id, expected_revision,
+                ),
+            )
+        return "updated" if cursor.rowcount == 1 else "rejected"
+
     def mark_growth_suggestion_decision(
         self,
         suggestion_id: int,
@@ -9263,13 +9385,20 @@ class Database:
         """Return accounts currently followed, keyed by user id."""
         with self._conn() as conn:
             rows = conn.execute("""
-                SELECT user_id, username, pinned
+                SELECT user_id, username, pinned, profile_json
                 FROM x_following WHERE unfollowed_at IS NULL
             """).fetchall()
+        def is_peer(profile_json):
+            try:
+                return has_founder_context(json.loads(profile_json))
+            except (TypeError, ValueError):
+                return False
+
         return {
             row["user_id"]: {
                 "username": row["username"],
                 "pinned": row["pinned"] == 1,
+                "peer": is_peer(row["profile_json"]),
             }
             for row in rows
             if self._canonical_growth_object_id(row["user_id"])

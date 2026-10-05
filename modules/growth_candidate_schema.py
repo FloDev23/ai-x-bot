@@ -17,12 +17,16 @@ _FOUNDER_IDENTITY_PATTERN = re.compile(
     r"build(?:ing)? in public|startups?|saas)\b|#buildinpublic|#indiehackers?",
     re.IGNORECASE,
 )
-# Crypto promoters, follow-for-follow rings and promo sellers also call
-# themselves founders; they never become users or launch supporters.
+# Crypto promoters, follow-for-follow rings, promo sellers and template bot
+# bios ("Here's a passionate programmer creating...") also call themselves
+# founders; they never become users or launch supporters.
 _NOISE_PATTERN = re.compile(
     r"\b(?:crypto|nfts?|web3|defi|memecoins?|airdrops?|forex|"
     r"trading signals|onlyfans|giveaways?|f4f|follow ?back|"
-    r"dm (?:for|me for) (?:promo|collab)s?)\b|\$[A-Z]{2,6}\b",
+    r"dm (?:for|me for) (?:promo|collab)s?|backlinks?|directory submissions?|"
+    r"here'?s an? (?:passionate|innovative|creative|enthusiastic)|"
+    r"make \$\d[\d,]*k? ?(?:monthly|a month|per month|/month))\b|"
+    r"\$[A-Z]{2,6}\b",
     re.IGNORECASE,
 )
 

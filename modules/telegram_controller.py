@@ -100,6 +100,7 @@ class TelegramController:
         media_matcher=None,
         analytics=None,
         growth_digest=None,
+        growth_replies=None,
         scheduler_status=None,
         queue_service=None,
         dry_run: Optional[bool] = None,
@@ -117,6 +118,7 @@ class TelegramController:
         self.media_matcher = media_matcher
         self.analytics = analytics
         self.growth_digest = growth_digest
+        self.growth_replies = growth_replies
         self.scheduler_status = scheduler_status
         self.queue_service = queue_service
         self.dry_run = DRY_RUN if dry_run is None else bool(dry_run)
@@ -838,10 +840,17 @@ class TelegramController:
             self._send(self.authorized_chat_id, "Nessun nuovo suggerimento.")
             return "growth_digest_empty"
 
+        replies = [
+            draft for draft in self.db.list_growth_reply_drafts(
+                digest.get("observed_on", "")
+            )
+            if draft["status"] == "ready"
+        ]
         lines = [
             "Growth giornaliero — azioni manuali su X",
             f"Founder da seguire: {len(collections['accounts'])}",
             f"Like: {len(collections['posts'])}",
+            f"Risposte da scrivere: {len(replies)}",
             f"Unfollow proposti: {len(collections['reevaluate'])}",
         ]
         rows = []
@@ -855,6 +864,10 @@ class TelegramController:
             first = collections[collection][0]
             rows.append([self._callback_button(
                 label, f"gd:{code}:{first['id']}:{first['revision']}",
+            )])
+        if replies:
+            rows.append([self._callback_button(
+                "Risposte", f"gr:{replies[0]['id']}:{replies[0]['revision']}",
             )])
         self._send(
             self.authorized_chat_id,
@@ -889,8 +902,112 @@ class TelegramController:
         if self.growth_digest is None:
             self._send(self.authorized_chat_id, "Nessun nuovo suggerimento.")
             return "growth_digest_empty"
-        digest = self.growth_digest.build(self._now())
+        current = self._now()
+        digest = self.growth_digest.build(current)
+        if self.growth_replies is not None and digest.get("observed_on"):
+            self.growth_replies.build(digest["observed_on"], current)
         return self.push_growth_digest(digest, explicit=True)
+
+    def _send_growth_reply_card(self, chat_id: str, draft: Dict[str, Any]):
+        draft_ref = f"{draft['id']}:{draft['revision']}"
+        username = draft["author_username"]
+        reply = draft["reply_en"]
+        text = "\n".join([
+            f"Risposta a @{username}",
+            "",
+            f"Post: {self._clean_text(draft['post_excerpt'], 500)}",
+            f"🇮🇹 {self._clean_text(draft['post_it'], 800)}",
+            "",
+            "Risposta suggerita:",
+            reply,
+            f"🇮🇹 {self._clean_text(draft['reply_it'], 400)}",
+            f"Caratteri: {len(reply)}/280",
+            "",
+            f"Stato: {self._GROWTH_REPLY_STATUS[draft['status']]}",
+            "Il bot non risponde su X: copia, apri il post e pubblica tu.",
+        ])
+        rows = [[
+            {"text": "Copia risposta", "copy_text": {"text": reply}},
+            {
+                "text": "Apri post",
+                "url": f"https://x.com/{username}/status/{draft['tweet_id']}",
+            },
+        ]]
+        if draft["status"] == "ready":
+            rows.append([
+                self._callback_button("Pubblicata", f"gra:p:{draft_ref}"),
+                self._callback_button("Salta", f"gra:s:{draft_ref}"),
+            ])
+            if draft["generation_count"] < 3:
+                rows.append([self._callback_button("Rigenera", f"gra:g:{draft_ref}")])
+        siblings = self.db.list_growth_reply_drafts(draft["observed_on"])
+        ids = [sibling["id"] for sibling in siblings]
+        position = ids.index(draft["id"]) if draft["id"] in ids else None
+        navigation = []
+        if position is not None and position > 0:
+            previous = siblings[position - 1]
+            navigation.append(self._callback_button(
+                "Precedente", f"gr:{previous['id']}:{previous['revision']}",
+            ))
+        if position is not None and position + 1 < len(siblings):
+            following = siblings[position + 1]
+            navigation.append(self._callback_button(
+                "Successiva", f"gr:{following['id']}:{following['revision']}",
+            ))
+        if navigation:
+            rows.append(navigation)
+        self._send(chat_id, text, reply_markup=self._callback_markup(rows))
+
+    _GROWTH_REPLY_STATUS = {
+        "ready": "da scrivere",
+        "posted_manually": "pubblicata",
+        "skipped": "saltata",
+    }
+
+    def _growth_reply_detail(self, chat_id: str, parts):
+        draft_id = self._positive_id(parts[1]) if len(parts) == 3 else None
+        draft = self.db.get_growth_reply_draft(draft_id) if draft_id else None
+        if draft is None:
+            self._send(chat_id, "Risposta non valida o scaduta.")
+            return "growth_reply_unavailable"
+        self._send_growth_reply_card(chat_id, draft)
+        return "growth_reply_detail"
+
+    def _growth_reply_action(self, chat_id: str, parts):
+        if len(parts) != 4 or parts[1] not in {"p", "s", "g"}:
+            self._send(chat_id, "Azione non valida.")
+            return "growth_reply_action_invalid"
+        draft_id = self._positive_id(parts[2])
+        revision = self._nonnegative_id(parts[3])
+        if draft_id is None or revision is None:
+            self._send(chat_id, "Azione non valida.")
+            return "growth_reply_action_invalid"
+        current = self._now()
+        if parts[1] == "g":
+            if self.growth_replies is None:
+                self._send(chat_id, "Rigenerazione non disponibile.")
+                return "growth_reply_action_invalid"
+            draft, outcome = self.growth_replies.regenerate(
+                draft_id, revision, current,
+            )
+            if outcome == "failed":
+                self._send(chat_id, "Generazione non riuscita: riprova tra poco.")
+        else:
+            outcome = self.db.mark_growth_reply_draft(
+                draft_id, revision,
+                "posted_manually" if parts[1] == "p" else "skipped",
+                current,
+            )
+            draft = self.db.get_growth_reply_draft(draft_id)
+        if draft is None or outcome in {"invalid", "rejected"}:
+            self._send(chat_id, "Risposta non valida o già aggiornata.")
+            return "growth_reply_action_rejected"
+        self._send_growth_reply_card(chat_id, draft)
+        return {
+            "p": "growth_reply_posted",
+            "s": "growth_reply_skipped",
+            "g": "growth_reply_regenerated",
+        }[parts[1]]
 
     def _growth_digest_detail(self, chat_id: str, parts):
         if len(parts) != 4 or parts[1] not in {"a", "p", "r"}:
@@ -2326,6 +2443,10 @@ class TelegramController:
             return self._growth_digest_detail(chat_id, parts)
         if parts[0] == "gda":
             return self._growth_digest_action(chat_id, parts)
+        if parts[0] == "gr":
+            return self._growth_reply_detail(chat_id, parts)
+        if parts[0] == "gra":
+            return self._growth_reply_action(chat_id, parts)
         if parts[0] == "input":
             return self._input_callback(chat_id, parts)
         if parts[0] == "manual":

@@ -432,6 +432,7 @@ class GrowthDigestService:
         posts: Sequence[Dict],
         candidates: object,
         suggested_ids: set,
+        followed_peer_ids: frozenset,
         now: datetime,
     ) -> List[Tuple[str, Dict, Dict]]:
         scored_posts = []
@@ -439,6 +440,10 @@ class GrowthDigestService:
             if type(post) is not dict:
                 continue
             if post.get("source_kind") == "following":
+                # The following list still holds off-topic accounts from the
+                # gym era: only peers' posts are worth a like.
+                if post.get("author_id") not in followed_peer_ids:
+                    continue
                 scored = score_recent_post(
                     post, now,
                     source="followed_account", max_age=FOLLOWED_ACCOUNT_MAX_AGE,
@@ -641,13 +646,18 @@ class GrowthDigestService:
             )
             return self._empty(observed_on, "incomplete")
         post_candidates, query_claim_tokens = post_read
-        followed_ids = frozenset(self.db.get_following_state())
+        following = self.db.get_following_state()
+        followed_ids = frozenset(following)
+        followed_peer_ids = frozenset(
+            user_id for user_id, state in following.items() if state["peer"]
+        )
         account_rows = self._account_rows(candidates, current, followed_ids)
         post_rows = self._like_rows(
             self._scored_like_candidates(
                 post_candidates,
                 candidates,
                 {row["object_id"] for row in account_rows},
+                followed_peer_ids,
                 current,
             ),
             current,

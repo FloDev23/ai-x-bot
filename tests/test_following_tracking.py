@@ -65,8 +65,8 @@ def test_complete_sync_inserts_rows_with_follow_back(tmp_path):
     assert peer["follows_back_checked_at"] == (NOW - timedelta(hours=1)).isoformat()
     assert (runner["pinned"], runner["follows_back"]) == (0, 0)
     assert db.get_following_state() == {
-        "11": {"username": "gym_a", "pinned": False},
-        "12": {"username": "runner", "pinned": False},
+        "11": {"username": "gym_a", "pinned": False, "peer": True},
+        "12": {"username": "runner", "pinned": False, "peer": False},
     }
 
 
