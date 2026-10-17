@@ -20,6 +20,13 @@ Operatore: Floriano (FloDev23, flexdropin@gmail.com), solo founder. Lingua opera
 
 **Unica scrittura X automatica**: `Publisher` → `TwitterClient.create_tweet` (+ `media_upload`) per una bozza approvata e assegnata a un piano dovuto. Il test `tests/test_x_write_safety.py` (AST scan) fa fallire la suite se compaiono chiamate vietate (`like_tweet`, `follow_user`, `reply_to_tweet`, `retweet`, `send_dm`, …) o se `create_tweet`/`post_tweet` appaiono fuori dai file ammessi.
 
+### Progetti collegati
+Tutti sotto `/Users/floriano/flo_mobile_app/`:
+- `../flexDropin` — app mobile (Expo/React Native + Supabase + Stripe Connect). Fatti di prodotto, fee, categorie: `../flexDropin/CLAUDE.md`.
+- `../flexDropin-website` — sito Next.js `flexdropin.com` (EN default, `/it` in euro), hub deeplink. Contesto: `../flexDropin-website/CLAUDE.md`.
+- `../flexdropin-growth` — materiali marketing (Product Hunt, outreach, stampa, LinkedIn, directory).
+- `../flexdropin-instagram` — contenuti Instagram `@flexdropin` (italiano, target gestori palestre e clienti drop-in a Verona; post programmati in Meta Business Suite, storie pubblicate a mano). Contesto: `../flexdropin-instagram/CLAUDE.md`. Canale separato da X: stesso prodotto, lingua e target diversi.
+
 ## 2. Stato e decisioni recenti (cronologia utile)
 
 | Data | Cosa |
