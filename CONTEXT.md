@@ -41,7 +41,7 @@ Tutti sotto `/Users/floriano/flo_mobile_app/`:
 | 2026-10-03 | **Pivot growth**: da gestori di palestre a **startup founder / indie hacker / build-in-public** (account 10 follower, ~9 impression/post; ricerca gym owner = 0 candidati; i founder ricambiano il follow e supportano PH). Reply Copilot rimosso, codice gym-classifier rimosso |
 | 2026-10-03 | `feat(growth)`: bozze di risposta manuali a founder con traduzione IT (`growth_replies`) |
 | 2026-10-03/05 | Fix: bozze reply con em dash scartate (ultimo commit `e7e0293`) |
-| 2026-10-19 | **Growth fitness-first** (commit `8f7130f`, **non pushato né deployato**: il push è stato negato dal classifier, va fatto a mano): target principale creator/coach/venue fitness, founder secondari (max 2 su 5 account); vedi §8 |
+| 2026-10-19 | **Growth fitness-first** (commit `8f7130f`, pushato e **deployato in produzione il 2026-10-19**): target principale creator/coach/venue fitness, founder secondari (max 2 su 5 account); vedi §8 |
 
 Preferenze utente (da memoria): **cancellare il codice morto** invece di tenerlo; **non reintrodurre logica gym-classifier** nel growth; i gym owner si raggiungono **anche fuori da X** (Instagram, LinkedIn, gruppi FB, outreach diretto); su X si passa dai creator/coach fitness, i cui follower sono il pubblico di FlexDropin.
 
@@ -182,7 +182,7 @@ Testo inviato sempre `parse_mode=None` (nessun Markdown/HTML da dati utente), li
 - **Test**: `venv/bin/python -m pytest -q` (nessuna rete; fake in `tests/fakes.py`, `tests/conftest.py`). Baseline storica nel ledger SDD: 1320 passed (4 set); la suite è cresciuta da allora. Risultato del run di oggi: vedi §14. Controlli extra: `python -m compileall -q main.py config.py modules dashboard`, `git diff --check`.
 - **Test chiave**: `test_end_to_end_dry_run.py` (fonte→approvazione→14 riserva→piani→simulazione→riavvio), `test_x_write_safety.py`, `test_publisher.py`, `test_adaptive_publication.py`, `test_telegram_workflows.py`, `test_production_preflight.py`.
 - **Deploy** (`deploy.sh`, da eseguire sul VPS come `ubuntu`, senza sudo): rifiuta se ci sono modifiche tracciate locali → backup DB (sqlite backup API) + `.env` in `backups/` (ultimi 10) → `git pull --ff-only` → pip bot+dashboard → `scripts/preflight_production.py --allow-live` → (re)installa unit dashboard → restart `flexdropin-bot` e `flexdropin-dashboard` → controlla assenza di `Traceback` nei log. Stampa il comando di rollback.
-- **Passaggio live** (`DRY_RUN=false`) è una fase separata che richiede autorizzazione esplicita (SETUP §9). Non sappiamo da questo repo se sia già stato attivato: l'outage crediti X e i reschedule implicano che **in produzione si pubblica davvero** (verificare, §13).
+- **Passaggio live** (`DRY_RUN=false`) è una fase separata che richiede autorizzazione esplicita (SETUP §9). **Confermato il 2026-10-19: in produzione `DRY_RUN=false`** (output del preflight in `deploy.sh`).
 - **Dashboard** (`dashboard/app.py`, Flask, 127.0.0.1:5050, solo via tunnel SSH `ssh -L 5050:127.0.0.1:5050 ubuntu@80.225.89.115`): pagine overview, leads, engagement, posts, logs (journalctl), media (upload/archivia/elimina/riutilizzabile). Unit systemd `flexdropin-dashboard.service`. Parte è legacy (leads/engagement).
 - **Produzione** (memoria `production-vps-access`): host `ubuntu@80.225.89.115`, chiave `ssh-key-2026-07-15.key` nella root del repo (gitignored, **non committare**), repo `/home/ubuntu/ai-x-bot`, unit `flexdropin-bot`, log `~/ai-x-bot/bot.log` (UTC), DB `~/ai-x-bot/bot_data.db`, backup in `~/ai-x-bot/backups/`. **Niente `sqlite3` CLI** sul VPS: usare `venv/bin/python3` + modulo `sqlite3` (`file:bot_data.db?mode=ro`). Leggere `.env` è bloccato dal classifier: chiedere i valori a Floriano.
 - Il DB locale `bot_data.db` è praticamente vuoto (solo 8 `target_accounts`): **non rappresenta la produzione**.
@@ -216,8 +216,9 @@ Checklist rapida:
 ## 14. Stato a fine sessione 2026-10-19
 
 - Test: `venv/bin/python -m pytest -q` → **1424 passed** (1 warning `imghdr`).
-- Locale: `main` è avanti di 2 commit rispetto a origin (`CONTEXT.md` + `8f7130f` growth fitness-first, più questo aggiornamento). **Nessun push, nessun deploy**: il push è stato bloccato dal classifier dei permessi.
-- Per portare il pivot in produzione: `git push origin main`, poi sul VPS `cd ~/ai-x-bot && ./deploy.sh`. Il deploy fa backup, preflight e restart; al primo digest i candidati in cache (policy `startup_founder_peer_v1`) vengono rivalutati come `fitness_first_v1`.
-- Cose da controllare dopo il deploy: `/growth` il giorno dopo alle 09:00 Rome (account fitness presenti, max 2 founder), `/errors` vuoto, handle dei seed (§8) che restituiscono risultati.
+- `origin/main` e VPS erano a `284a0d4` dopo il deploy (`./deploy.sh` eseguito da Floriano: pull ff-only, backup `backups/bot_data.db.bak-20261019-085552`, preflight ok, bot e dashboard attivi, nessun Traceback).
+- **Produzione è LIVE: `DRY_RUN=false`** (avviso del preflight), sempre con approvazione Telegram. Quindi i post pianificati vengono pubblicati davvero su X.
+- Al primo digest i candidati in cache (policy `startup_founder_peer_v1`) vengono rivalutati come `fitness_first_v1`.
+- Da controllare: `/growth` domani alle 09:00 Rome (account fitness presenti, max 2 founder), `/errors` vuoto, handle dei seed (§8) che restituiscono risultati.
 - Untracked, non committato: `scripts/reschedule_human_first_campaign.py`.
-- Produzione ancora non verificata (DRY_RUN, stato code/piani): vedi §13.
+- Restano non verificati: coda/piani in produzione e crediti X API (§13).
