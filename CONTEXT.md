@@ -1,7 +1,7 @@
 # CONTEXT — FlexDropin X Growth Agent
 
 Documento di contesto per ripartire senza rianalizzare tutto il repo.
-Generato il 2026-10-16 leggendo il codice a HEAD `e7e0293` (branch `main`).
+Generato il 2026-10-16 a HEAD `e7e0293`, aggiornato il 2026-10-19 dopo il pivot fitness-first (commit `8f7130f`).
 **Stato di produzione NON verificato in questa analisi** (l'accesso SSH al VPS è stato negato dal classifier): vedi §13 per i comandi di verifica.
 
 > Dove README/SETUP e codice divergono, **vince il codice**. README e SETUP sono in parte obsoleti (vedi §12).
@@ -41,7 +41,7 @@ Tutti sotto `/Users/floriano/flo_mobile_app/`:
 | 2026-10-03 | **Pivot growth**: da gestori di palestre a **startup founder / indie hacker / build-in-public** (account 10 follower, ~9 impression/post; ricerca gym owner = 0 candidati; i founder ricambiano il follow e supportano PH). Reply Copilot rimosso, codice gym-classifier rimosso |
 | 2026-10-03 | `feat(growth)`: bozze di risposta manuali a founder con traduzione IT (`growth_replies`) |
 | 2026-10-03/05 | Fix: bozze reply con em dash scartate (ultimo commit `e7e0293`) |
-| 2026-10-19 | **Growth fitness-first**: target principale creator/coach/venue fitness, founder secondari (max 2 su 5 account); vedi §8 |
+| 2026-10-19 | **Growth fitness-first** (commit `8f7130f`, **non pushato né deployato**: il push è stato negato dal classifier, va fatto a mano): target principale creator/coach/venue fitness, founder secondari (max 2 su 5 account); vedi §8 |
 
 Preferenze utente (da memoria): **cancellare il codice morto** invece di tenerlo; **non reintrodurre logica gym-classifier** nel growth; i gym owner si raggiungono **anche fuori da X** (Instagram, LinkedIn, gruppi FB, outreach diretto); su X si passa dai creator/coach fitness, i cui follower sono il pubblico di FlexDropin.
 
@@ -213,6 +213,11 @@ Checklist rapida:
 5. Per riprogrammare post dopo outage/cambi data: copiare il pattern di `scripts/reschedule_credit_outage_posts.py` e `announce_product_hunt_date_change.py` (backup → verifica → update idempotente).
 6. Per cambi alla strategia growth: restare fitness-first (§8), non reintrodurre il vecchio classificatore palestre.
 
-## 14. Esito test odierno
+## 14. Stato a fine sessione 2026-10-19
 
-`venv/bin/python -m pytest -q` su HEAD `e7e0293`: **1411 passed, 1 warning** (`imghdr` deprecato) in ~22 s. Nessun test fallito, inclusi quelli citati al punto 7 di §12.
+- Test: `venv/bin/python -m pytest -q` → **1424 passed** (1 warning `imghdr`).
+- Locale: `main` è avanti di 2 commit rispetto a origin (`CONTEXT.md` + `8f7130f` growth fitness-first, più questo aggiornamento). **Nessun push, nessun deploy**: il push è stato bloccato dal classifier dei permessi.
+- Per portare il pivot in produzione: `git push origin main`, poi sul VPS `cd ~/ai-x-bot && ./deploy.sh`. Il deploy fa backup, preflight e restart; al primo digest i candidati in cache (policy `startup_founder_peer_v1`) vengono rivalutati come `fitness_first_v1`.
+- Cose da controllare dopo il deploy: `/growth` il giorno dopo alle 09:00 Rome (account fitness presenti, max 2 founder), `/errors` vuoto, handle dei seed (§8) che restituiscono risultati.
+- Untracked, non committato: `scripts/reschedule_human_first_campaign.py`.
+- Produzione ancora non verificata (DRY_RUN, stato code/piani): vedi §13.
