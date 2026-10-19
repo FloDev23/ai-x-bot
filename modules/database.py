@@ -38,7 +38,7 @@ from modules.media_store import (
 from modules.growth_candidate_schema import (
     GROWTH_RELEVANCE_POLICY,
     evaluate_growth_candidate_filters,
-    has_founder_context,
+    audience_segment,
     is_canonical_growth_latest_post,
     is_canonical_growth_profile,
     is_json_safe_mapping,
@@ -129,15 +129,18 @@ _OPERATOR_QUEUE_RESULTS = {
     "restore": "restored",
 }
 _GROWTH_ACCOUNT_REASONS = frozenset({
+    "fitness_bio", "multiple_fitness_topics", "one_fitness_topic",
     "founder_bio", "multiple_startup_topics", "one_startup_topic",
     "active_within_7_days", "active_within_30_days", "english_market",
     "follow_back_range", "fitness_affinity",
     "no_follow_back_after_30_days",
 })
 _GROWTH_LIKE_SOURCES = frozenset({
-    "followed_account", "suggested_account", "founder_conversation",
+    "followed_account", "suggested_account", "fitness_conversation",
+    "founder_conversation",
 })
 _GROWTH_POST_REASONS = _GROWTH_LIKE_SOURCES | frozenset({
+    "training_content", "class_or_gym_talk", "access_pain",
     "build_in_public", "launch", "traction", "feedback_request",
     "fitness_tech", "founder_struggle", "question",
     "recent", "credible_author",
@@ -7777,7 +7780,7 @@ class Database:
                 )
                 or activity_at is None
                 or activity_at > completed_at + timedelta(minutes=5)
-                or payload.get("segment") != "peer"
+                or payload.get("segment") not in {"fitness", "peer"}
                 or payload.get("reason_codes") != reasons
             ):
                 return None
@@ -8655,7 +8658,7 @@ class Database:
             if (
                 type(score_data.get("total")) is not int
                 or score_data["total"] != score
-                or score_data.get("audience_segment") not in {"peer", "other"}
+                or score_data.get("audience_segment") not in {"fitness", "peer", "other"}
                 or type(reasons) is not list
                 or any(type(reason) is not str for reason in reasons)
                 or score_data.get("hard_filter_passed") is not True
@@ -9388,9 +9391,9 @@ class Database:
                 SELECT user_id, username, pinned, profile_json
                 FROM x_following WHERE unfollowed_at IS NULL
             """).fetchall()
-        def is_peer(profile_json):
+        def is_target(profile_json):
             try:
-                return has_founder_context(json.loads(profile_json))
+                return audience_segment(json.loads(profile_json)) is not None
             except (TypeError, ValueError):
                 return False
 
@@ -9398,7 +9401,7 @@ class Database:
             row["user_id"]: {
                 "username": row["username"],
                 "pinned": row["pinned"] == 1,
-                "peer": is_peer(row["profile_json"]),
+                "target": is_target(row["profile_json"]),
             }
             for row in rows
             if self._canonical_growth_object_id(row["user_id"])

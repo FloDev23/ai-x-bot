@@ -41,7 +41,7 @@ def review_post(post_id="900", created_at=None, **overrides):
 
 def accepted_score(total=95, activity_at=None):
     return {
-        "relevance_policy": "startup_founder_peer_v1",
+        "relevance_policy": "fitness_first_v1",
         "total": total,
         "audience_segment": "peer",
         "reasons": ["founder_bio"],

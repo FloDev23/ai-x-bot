@@ -20,25 +20,28 @@ ROME = ZoneInfo("Europe/Rome")
 GROWTH_POST_QUERY_BUDGET = 1
 POST_QUERY_PORTFOLIO: Tuple[Tuple[str, str], ...] = (
     (
-        "founder_conversation",
-        '("build in public" OR #buildinpublic OR "indie hacker" OR '
-        '"solo founder" OR "Product Hunt" OR "first customers" OR MRR OR '
-        '"feedback on my") '
+        "fitness_conversation",
+        '(workout OR "leg day" OR "my clients" OR "new gym" OR "day pass" OR '
+        '"drop-in" OR "group class" OR "fitness routine" OR "class today" OR '
+        '"training session") '
         'lang:en -is:retweet -is:reply',
     ),
 )
 LIKE_SOURCE_QUOTAS: Tuple[Tuple[str, int], ...] = (
     ("followed_account", 4),
     ("suggested_account", 3),
-    ("founder_conversation", 3),
+    ("fitness_conversation", 3),
 )
 LIKE_FILL_ORDER: Tuple[str, ...] = (
-    "followed_account", "founder_conversation", "suggested_account",
+    "followed_account", "fitness_conversation", "suggested_account",
 )
+# Fitness accounts lead the suggestions; founders fill at most this many slots.
+MAX_FOUNDER_ACCOUNTS = 2
 FOLLOWED_ACCOUNT_MAX_AGE = timedelta(hours=72)
 SUGGESTED_ACCOUNT_MAX_AGE = timedelta(days=7)
 LIKE_AUTHOR_COOLDOWN = timedelta(days=3)
 _ACCOUNT_REASON_CODES = frozenset({
+    "fitness_bio", "multiple_fitness_topics", "one_fitness_topic",
     "founder_bio", "multiple_startup_topics", "one_startup_topic",
     "active_within_7_days", "active_within_30_days", "english_market",
     "follow_back_range", "fitness_affinity",
@@ -50,8 +53,27 @@ _POST_METRIC_KEYS = frozenset({
 _AUTHOR_METRIC_KEYS = frozenset({
     "followers_count", "following_count", "tweet_count", "listed_count",
 })
-# Weighted signals that a post is a founder conversation worth joining.
+# Weighted signals that a post is a conversation worth joining. Fitness
+# signals lead; founder signals still count for the secondary audience.
 _POST_SIGNALS: Tuple[Tuple[str, int, str], ...] = (
+    (
+        "training_content",
+        12,
+        r"\b(?:workout|training|leg day|lifting|run|session|routine|"
+        r"strength|mobility|hiit|yoga|pilates|crossfit)\b",
+    ),
+    (
+        "class_or_gym_talk",
+        12,
+        r"\b(?:class|classes|studio|my gym|new gym|group fitness|coach|"
+        r"coaching|trainer)\b",
+    ),
+    (
+        "access_pain",
+        12,
+        r"drop-?in|day pass|\bmembership\b|travel(?:l?ing)? and|"
+        r"on the road|hotel gym|find a gym",
+    ),
     ("build_in_public", 15, r"build(?:ing)? in public|#buildinpublic|indie ?hack"),
     ("launch", 12, r"\blaunch(?:ed|ing)?\b|product hunt|\bshipped\b"),
     (
@@ -123,7 +145,7 @@ def _valid_post(post: Dict) -> bool:
 
 
 def score_growth_post(post: Dict, now: datetime) -> Optional[Dict]:
-    """Score one searched post as a founder conversation worth joining."""
+    """Score one searched post as a fitness conversation worth joining."""
     if type(post) is not dict or type(now) is not datetime:
         return None
     created_at = parse_growth_datetime(post.get("created_at"))
@@ -187,7 +209,7 @@ def score_recent_post(
     source: str,
     max_age: timedelta,
 ) -> Optional[Dict]:
-    """Score a recent post by a known peer: any topic is worth a like."""
+    """Score a recent post by a known target account: any topic is worth a like."""
     if (
         type(post) is not dict
         or type(now) is not datetime
@@ -293,6 +315,7 @@ class GrowthDigestService:
             return []
         rows = []
         seen = set()
+        founder_rows = 0
         for candidate in candidates:
             if type(candidate) is not dict:
                 continue
@@ -320,7 +343,7 @@ class GrowthDigestService:
                 or now.astimezone(timezone.utc) - activity_at > timedelta(days=30)
                 or type(score) is not int
                 or not 0 <= score <= 100
-                or segment != "peer"
+                or segment not in {"fitness", "peer"}
                 or user_id in followed_ids
                 or type(reasons) is not list
                 or not reasons
@@ -333,6 +356,10 @@ class GrowthDigestService:
                 continue
             if self.db.growth_object_in_cooldown("account", user_id, now):
                 continue
+            if segment == "peer":
+                if founder_rows >= MAX_FOUNDER_ACCOUNTS:
+                    continue
+                founder_rows += 1
             seen.add(user_id)
             payload = {
                 "user_id": user_id,
@@ -432,7 +459,7 @@ class GrowthDigestService:
         posts: Sequence[Dict],
         candidates: object,
         suggested_ids: set,
-        followed_peer_ids: frozenset,
+        followed_target_ids: frozenset,
         now: datetime,
     ) -> List[Tuple[str, Dict, Dict]]:
         scored_posts = []
@@ -440,9 +467,9 @@ class GrowthDigestService:
             if type(post) is not dict:
                 continue
             if post.get("source_kind") == "following":
-                # The following list still holds off-topic accounts from the
-                # gym era: only peers' posts are worth a like.
-                if post.get("author_id") not in followed_peer_ids:
+                # The following list still holds off-topic accounts from
+                # earlier eras: only target accounts' posts are worth a like.
+                if post.get("author_id") not in followed_target_ids:
                     continue
                 scored = score_recent_post(
                     post, now,
@@ -453,9 +480,9 @@ class GrowthDigestService:
                 continue
             scored = score_growth_post(post, now)
             if scored is not None:
-                scored_posts.append(("founder_conversation", post, {
+                scored_posts.append(("fitness_conversation", post, {
                     **scored,
-                    "reason_codes": ["founder_conversation", *scored["reason_codes"]],
+                    "reason_codes": ["fitness_conversation", *scored["reason_codes"]],
                 }))
         for candidate in candidates if isinstance(candidates, (list, tuple)) else []:
             if type(candidate) is not dict or candidate.get("user_id") not in suggested_ids:
@@ -648,8 +675,8 @@ class GrowthDigestService:
         post_candidates, query_claim_tokens = post_read
         following = self.db.get_following_state()
         followed_ids = frozenset(following)
-        followed_peer_ids = frozenset(
-            user_id for user_id, state in following.items() if state["peer"]
+        followed_target_ids = frozenset(
+            user_id for user_id, state in following.items() if state["target"]
         )
         account_rows = self._account_rows(candidates, current, followed_ids)
         post_rows = self._like_rows(
@@ -657,7 +684,7 @@ class GrowthDigestService:
                 post_candidates,
                 candidates,
                 {row["object_id"] for row in account_rows},
-                followed_peer_ids,
+                followed_target_ids,
                 current,
             ),
             current,

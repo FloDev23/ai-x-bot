@@ -23,7 +23,7 @@ class FakeGenerator:
         self.drafts = list(drafts or [])
         self.calls = []
 
-    def draft_founder_reply(self, post_text):
+    def draft_manual_reply(self, post_text):
         self.calls.append(post_text)
         return self.drafts.pop(0) if self.drafts else dict(GOOD)
 
@@ -102,11 +102,11 @@ def test_reply_validation_normalizes_whitespace_and_quotes():
     assert draft["reply_en"] == "Ship it, then ask."
 
 
-def test_build_prefers_founder_conversations_and_respects_daily_limit(tmp_path):
+def test_build_prefers_fitness_conversations_and_respects_daily_limit(tmp_path):
     db = Database(str(tmp_path / "replies.db"))
     seed_posts(db, [
-        "followed_account", "suggested_account", "founder_conversation",
-        "founder_conversation", "suggested_account", "founder_conversation",
+        "followed_account", "suggested_account", "fitness_conversation",
+        "fitness_conversation", "suggested_account", "fitness_conversation",
     ])
     generator = FakeGenerator()
 
@@ -125,7 +125,7 @@ def test_build_prefers_founder_conversations_and_respects_daily_limit(tmp_path):
 
 def test_build_skips_invalid_generation_and_tries_next_post(tmp_path):
     db = Database(str(tmp_path / "invalid.db"))
-    seed_posts(db, ["founder_conversation", "founder_conversation"])
+    seed_posts(db, ["fitness_conversation", "fitness_conversation"])
     generator = FakeGenerator([{**GOOD, "reply_en": "Great post!"}, None])
 
     assert GrowthReplyService(generator, db).build(OBSERVED_ON, NOW) == []
@@ -137,7 +137,7 @@ def test_build_skips_invalid_generation_and_tries_next_post(tmp_path):
 
 def test_regenerate_replaces_text_until_generation_limit(tmp_path):
     db = Database(str(tmp_path / "regenerate.db"))
-    seed_posts(db, ["founder_conversation"])
+    seed_posts(db, ["fitness_conversation"])
     replacement = {**GOOD, "reply_en": "Have you tried asking ten users what they would pay for?"}
     service = GrowthReplyService(FakeGenerator([dict(GOOD), replacement, dict(GOOD)]), db)
     draft = service.build(OBSERVED_ON, NOW)[0]
@@ -171,7 +171,7 @@ def _buttons(message):
 
 def test_digest_summary_links_reply_cards_with_italian_and_copy(tmp_path):
     db = Database(str(tmp_path / "telegram.db"))
-    digest = seed_posts(db, ["founder_conversation", "founder_conversation"])
+    digest = seed_posts(db, ["fitness_conversation", "fitness_conversation"])
     service = GrowthReplyService(FakeGenerator(), db)
     service.build(OBSERVED_ON, NOW)
     controller, telegram = _controller(tmp_path, db, service)
@@ -205,7 +205,7 @@ def test_digest_summary_links_reply_cards_with_italian_and_copy(tmp_path):
 
 def test_regenerate_button_sends_updated_card(tmp_path):
     db = Database(str(tmp_path / "regen-telegram.db"))
-    seed_posts(db, ["founder_conversation"])
+    seed_posts(db, ["fitness_conversation"])
     replacement = {**GOOD, "reply_en": "How are you deciding which feature to cut first?"}
     service = GrowthReplyService(FakeGenerator([dict(GOOD), replacement]), db)
     draft = service.build(OBSERVED_ON, NOW)[0]

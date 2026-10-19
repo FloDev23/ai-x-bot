@@ -377,15 +377,16 @@ GROWTH_QUERY_BUDGET = _positive_int_env("GROWTH_QUERY_BUDGET", 3, maximum=3)
 GROWTH_NEW_PROFILE_BUDGET = _positive_int_env("GROWTH_NEW_PROFILE_BUDGET", 25)
 GROWTH_PROFILE_CACHE_DAYS = _positive_int_env("GROWTH_PROFILE_CACHE_DAYS", 7)
 GROWTH_DIGEST_LIMIT = _positive_int_env("GROWTH_DIGEST_LIMIT", 5)
-# People who talk to these accounts are founders building in public: the
-# audience most likely to follow back and support a Product Hunt launch.
+# People who talk to these accounts love training: the fitness creators,
+# coaches and venues FlexDropin wants around it. ProductHunt keeps a small
+# founder channel open.
 GROWTH_SEED_ACCOUNTS = (
+    "ClassPass",
+    "CrossFit",
+    "Peloton",
+    "Mindbody",
+    "Hevy",
     "ProductHunt",
-    "IndieHackers",
-    "levelsio",
-    "marc_louvion",
-    "arvidkahl",
-    "tdinh_me",
 )
 
 # ========== NewsAPI ==========

@@ -943,7 +943,7 @@ def test_service_builds_closed_ranked_daily_digest_with_one_search(tmp_path):
     assert digest["outcome"] == "created"
     assert [row["object_id"] for row in digest["accounts"]] == ["101"]
     assert [row["object_id"] for row in digest["posts"]] == ["9001", "9002"]
-    assert digest["posts"][0]["reason_codes"][0] == "founder_conversation"
+    assert digest["posts"][0]["reason_codes"][0] == "fitness_conversation"
     assert digest["posts"][0]["score"] == 86
     assert len(x_client.queries) == 1
     assert x_client.queries[0][1] == 25
@@ -955,7 +955,7 @@ def test_service_builds_closed_ranked_daily_digest_with_one_search(tmp_path):
     assert x_client.engagement_writes == []
 
 
-def test_followed_peer_posts_skip_keywords_but_respect_age_and_peer_bio(tmp_path):
+def test_followed_target_posts_skip_keywords_but_respect_age_and_bio(tmp_path):
     database = Database(str(tmp_path / "followed-account.db"))
     _follow(database, [
         _peer_profile("301", "gym_one"),
@@ -983,8 +983,10 @@ def test_followed_peer_posts_skip_keywords_but_respect_age_and_peer_bio(tmp_path
     ).build(NOW)
 
     assert x_client.following_reads == 1
-    assert [row["object_id"] for row in digest["posts"]] == ["9101"]
-    assert digest["posts"][0]["reason_codes"] == ["followed_account", "recent"]
+    assert sorted(row["object_id"] for row in digest["posts"]) == ["9101", "9103"]
+    assert all(
+        row["reason_codes"][0] == "followed_account" for row in digest["posts"]
+    )
 
 
 def test_like_quotas_fill_order_and_one_post_per_author(tmp_path):
@@ -1017,8 +1019,8 @@ def test_like_quotas_fill_order_and_one_post_per_author(tmp_path):
 
     sources = [row["reason_codes"][0] for row in digest["posts"]]
     assert sources == (
-        ["followed_account"] * 4 + ["founder_conversation"] * 3
-        + ["followed_account"] + ["founder_conversation"] * 2
+        ["followed_account"] * 4 + ["fitness_conversation"] * 3
+        + ["followed_account"] + ["fitness_conversation"] * 2
     )
     authors = [row["payload"]["author_id"] for row in digest["posts"]]
     assert len(authors) == len(set(authors)) == 10

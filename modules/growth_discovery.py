@@ -19,7 +19,7 @@ from modules.growth_candidate_schema import (
     GROWTH_RELEVANCE_POLICY,
     as_utc,
     evaluate_growth_candidate_filters,
-    has_founder_context,
+    audience_segment,
     is_canonical_growth_latest_post,
     is_canonical_growth_profile,
     parse_growth_datetime,
@@ -28,16 +28,21 @@ from modules.growth_candidate_schema import (
 
 logger = logging.getLogger(__name__)
 
-# X search matches post text, so each query looks for what founders write
-# about while building; the bio filter then decides who is a founder.
+# X search matches post text, so each query looks for what fitness creators,
+# coaches and venues write about; the bio filter then decides who is on target.
 DEFAULT_TOPIC_QUERIES = (
-    '("build in public" OR #buildinpublic OR "indie hacker" OR #indiehackers OR '
-    '"solo founder" OR bootstrapped) '
+    '(workout OR "leg day" OR "training session" OR "my clients" OR '
+    '"my class" OR "class today" OR "coaching") '
     'lang:en -is:retweet -is:reply',
-    '("Product Hunt" OR "first paying customer" OR "first customers" OR MRR OR '
-    '"my SaaS" OR "my startup") '
-    '(launch OR launched OR shipped OR building) '
+    '("gym owner" OR "studio owner" OR "boutique fitness" OR "my gym" OR '
+    '"my studio" OR "group class" OR "fitness community" OR "drop-in") '
     'lang:en -is:retweet -is:reply',
+)
+_FITNESS_TOPIC_TERMS = (
+    "workout", "workouts", "training", "gym", "class", "classes", "coach",
+    "coaching", "yoga", "pilates", "crossfit", "hiit", "lifting", "strength",
+    "mobility", "studio", "fitness", "community", "drop-in", "membership",
+    "routine", "session",
 )
 _STARTUP_TOPIC_TERMS = (
     "build in public",
@@ -90,7 +95,7 @@ def score_growth_candidate(
     latest_post: Optional[Dict],
     now: datetime,
 ) -> Dict:
-    """Return the arithmetic 0-100 founder relevance score."""
+    """Return the arithmetic 0-100 fitness-first relevance score."""
     profile = profile if isinstance(profile, dict) else {}
     latest_post = latest_post if isinstance(latest_post, dict) else {}
     bio = profile.get("description")
@@ -99,23 +104,38 @@ def score_growth_candidate(
     recent_text = post_text.lower() if type(post_text) is str else ""
     reasons = []
 
-    if has_founder_context(profile):
-        segment = "peer"
+    segment = audience_segment(profile)
+    if segment == "fitness":
+        # Fitness bios outrank founder bios on equal activity.
+        role_bio = 40
+        reasons.append("fitness_bio")
+        topic_terms = _FITNESS_TOPIC_TERMS + _STARTUP_TOPIC_TERMS
+        multiple_reason, single_reason = (
+            "multiple_fitness_topics", "one_fitness_topic",
+        )
+    elif segment == "peer":
         role_bio = 35
         reasons.append("founder_bio")
+        topic_terms = _STARTUP_TOPIC_TERMS
+        multiple_reason, single_reason = (
+            "multiple_startup_topics", "one_startup_topic",
+        )
     else:
         segment = "other"
         role_bio = 0
+        # Off-target bios are only audited: count every topic, legacy codes.
+        topic_terms = _FITNESS_TOPIC_TERMS + _STARTUP_TOPIC_TERMS
+        multiple_reason, single_reason = (
+            "multiple_startup_topics", "one_startup_topic",
+        )
 
-    topic_matches = sum(
-        _contains(recent_text, term) for term in _STARTUP_TOPIC_TERMS
-    )
+    topic_matches = sum(_contains(recent_text, term) for term in topic_terms)
     if topic_matches >= 2:
         recent_topic_fit = 25
-        reasons.append("multiple_startup_topics")
+        reasons.append(multiple_reason)
     elif topic_matches == 1:
         recent_topic_fit = 15
-        reasons.append("one_startup_topic")
+        reasons.append(single_reason)
     else:
         recent_topic_fit = 0
 

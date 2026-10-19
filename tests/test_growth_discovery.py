@@ -105,7 +105,7 @@ def discovery(tmp_path, fake_x, **overrides):
 def test_relevant_founder_has_exact_score_components():
     result = score_growth_candidate(profile(), post(), NOW)
     assert result == {
-        "relevance_policy": "startup_founder_peer_v1",
+        "relevance_policy": "fitness_first_v1",
         "role_bio": 35,
         "recent_topic_fit": 25,
         "activity": 15,
@@ -140,7 +140,7 @@ def test_score_components_reach_exact_maximum_with_fitness_affinity():
         "role_bio", "recent_topic_fit", "activity", "market",
         "account_quality", "affinity", "total",
     )} == {
-        "role_bio": 35,
+        "role_bio": 40,
         "recent_topic_fit": 25,
         "activity": 15,
         "market": 15,
@@ -193,16 +193,15 @@ def test_hard_filter_rejects_account_without_founder_identity():
         post(text="Launched on Product Hunt today, feedback welcome"),
         NOW,
     )
-    assert (accepted, reason) == (False, "no_founder_context")
+    assert (accepted, reason) == (False, "no_audience_context")
 
 
 @pytest.mark.parametrize(
     "description",
     [
-        "Personal trainer and fitness creator",
-        "Gym owner in Bristol",
-        "Product manager at a CrossFit gym",
         "Decision maker, coffee lover",
+        "Product manager at a bank",
+        "Dad of two, amateur photographer",
     ],
 )
 def test_non_founder_bios_do_not_qualify(description):
@@ -210,7 +209,7 @@ def test_non_founder_bios_do_not_qualify(description):
 
     assert passes_candidate_filters(candidate_profile, post(), NOW) == (
         False,
-        "no_founder_context",
+        "no_audience_context",
     )
     assert score_growth_candidate(candidate_profile, post(), NOW)["total"] < 75
 
@@ -300,7 +299,7 @@ def test_cached_candidate_from_previous_relevance_policy_is_re_evaluated(tmp_pat
     assert fake_x.latest_calls == ["old-policy"]
     refreshed = db.get_cached_growth_candidate("old-policy", NOW)
     assert refreshed["score_data"]["relevance_policy"] == (
-        "startup_founder_peer_v1"
+        "fitness_first_v1"
     )
 
 
@@ -434,7 +433,7 @@ def test_active_sqlite_suppression_skips_evaluation_and_digest(tmp_path):
 def test_low_score_and_hard_filtered_candidates_are_stored_only_for_audit(tmp_path):
     fake_x = FakeX()
     fake_x.followers = [
-        profile("low", "low_score", description="Fitness member"),
+        profile("low", "low_score", description="Coffee lover"),
         profile("inactive", "inactive_owner"),
     ]
     fake_x.latest_posts = {
@@ -449,10 +448,10 @@ def test_low_score_and_hard_filtered_candidates_are_stored_only_for_audit(tmp_pa
 
     low = growth.db.get_growth_candidate("low")
     inactive = growth.db.get_growth_candidate("inactive")
-    assert low["score"] == 45
+    assert low["score"] == 40
     assert low["score_data"]["hard_filter_passed"] is False
     assert low["score_data"]["filter_reason"] == (
-        "no_founder_context"
+        "no_audience_context"
     )
     assert inactive["score"] == 85
     assert inactive["score_data"]["hard_filter_passed"] is False
@@ -493,7 +492,7 @@ def test_sqlite_digest_sorts_by_score_then_latest_activity_and_limits_five(tmp_p
             "latest_post": post(str(910 + index), activity.isoformat()),
             "score": score,
             "score_data": {
-                "relevance_policy": "startup_founder_peer_v1",
+                "relevance_policy": "fitness_first_v1",
                 "total": score,
                 "audience_segment": "peer",
                 "reasons": ["founder_bio"],
@@ -514,15 +513,15 @@ def test_sqlite_digest_sorts_by_score_then_latest_activity_and_limits_five(tmp_p
     assert rows[0]["audience_segment"] == "peer"
 
 
-def test_shipped_queries_target_founder_conversations_in_english():
+def test_shipped_queries_target_fitness_conversations_in_english():
     from modules.growth_discovery import DEFAULT_TOPIC_QUERIES
 
     for query in DEFAULT_TOPIC_QUERIES:
         assert "lang:en" in query
         assert "-is:retweet" in query
         assert "-is:reply" in query
-    assert "build in public" in DEFAULT_TOPIC_QUERIES[0]
-    assert "Product Hunt" in DEFAULT_TOPIC_QUERIES[1]
+    assert "workout" in DEFAULT_TOPIC_QUERIES[0]
+    assert '"gym owner"' in DEFAULT_TOPIC_QUERIES[1]
 
 
 def test_source_order_rotates_between_daily_runs_in_sqlite(tmp_path):

@@ -7,10 +7,22 @@ from typing import Any, Dict, Optional, Tuple
 
 
 _USERNAME_PATTERN = re.compile(r"[A-Za-z0-9_]{1,15}")
-GROWTH_RELEVANCE_POLICY = "startup_founder_peer_v1"
+GROWTH_RELEVANCE_POLICY = "fitness_first_v1"
 
-# A peer is someone building a product: the people who follow back, reply and
-# show up on a launch day. The bio must say so; a post alone is not enough.
+# Fitness creators, coaches and venues are the main audience: their followers
+# love training, and they may mention FlexDropin. The bio must say so; a post
+# alone is not enough.
+_FITNESS_IDENTITY_PATTERN = re.compile(
+    r"\b(?:(?:personal |online |strength |fitness |running |yoga |pilates |"
+    r"mobility |crossfit |hiit |boxing |swim |sports? )?(?:coach|trainer)s?|"
+    r"fitness|gym|gyms|crossfit|calisthenics|powerlift(?:er|ing)|"
+    r"bodybuild(?:er|ing)|weightlift(?:er|ing)|athlete|runner|marathon(?:er)?|"
+    r"yoga|pilates|hiit|instructor|studio owner|box owner|"
+    r"boutique fitness|wellness|mobility|lifter|training|workouts?)\b|"
+    r"#fitness|#gymlife|#fitfam",
+    re.IGNORECASE,
+)
+# Founders stay a secondary segment: they follow back and support launches.
 _FOUNDER_IDENTITY_PATTERN = re.compile(
     r"\b(?:co[- ]?founders?|founders?|ceo|cto|indie ?hackers?|indie (?:devs?|makers?)|"
     r"solo(?:preneur| founder| dev)|bootstrapp(?:ed|ing|er)|"
@@ -26,6 +38,8 @@ _NOISE_PATTERN = re.compile(
     r"dm (?:for|me for) (?:promo|collab)s?|backlinks?|directory submissions?|"
     r"here'?s an? (?:passionate|innovative|creative|enthusiastic)|"
     r"make \$\d[\d,]*k? ?(?:monthly|a month|per month|/month))\b|"
+    r"\b(?:affiliates?|(?:discount|promo|coupon) code|use code|sarms?|"
+    r"steroids?|peptides?|trt)\b|"
     r"\$[A-Z]{2,6}\b",
     re.IGNORECASE,
 )
@@ -71,6 +85,26 @@ def has_founder_context(profile: Any) -> bool:
         type(description) is str
         and _FOUNDER_IDENTITY_PATTERN.search(description) is not None
     )
+
+
+def has_fitness_context(profile: Any) -> bool:
+    """Return whether the bio presents a fitness creator, coach or venue."""
+    if not isinstance(profile, dict):
+        return False
+    description = profile.get("description")
+    return (
+        type(description) is str
+        and _FITNESS_IDENTITY_PATTERN.search(description) is not None
+    )
+
+
+def audience_segment(profile: Any) -> Optional[str]:
+    """Return "fitness", "peer" (founder) or None for an off-target bio."""
+    if has_fitness_context(profile):
+        return "fitness"
+    if has_founder_context(profile):
+        return "peer"
+    return None
 
 
 def has_noise_signals(text: Any) -> bool:
@@ -193,6 +227,6 @@ def evaluate_growth_candidate_filters(
         return False, "suppressed_within_30_days"
     if has_noise_signals(bio) or has_noise_signals(text):
         return False, "noise_signals"
-    if not has_founder_context(profile):
-        return False, "no_founder_context"
+    if audience_segment(profile) is None:
+        return False, "no_audience_context"
     return True, "accepted"

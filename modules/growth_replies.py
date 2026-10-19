@@ -1,4 +1,4 @@
-"""Draft manual replies to the day's founder conversations, with Italian text.
+"""Draft manual replies to the day's fitness conversations, with Italian text.
 
 The bot never replies on X: the operator reads the Italian translation, copies
 the English reply from Telegram and posts it by hand.
@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 REPLY_DAILY_LIMIT = 5
 REPLY_MAX_LENGTH = 240
 REPLY_MAX_GENERATIONS = 3
-# Founder conversations first: they invite answers. Suggested accounts' latest
+# Fitness conversations first: they invite answers. Suggested accounts' latest
 # posts fill the remaining slots.
-_REPLY_SOURCES = ("founder_conversation", "suggested_account")
+_REPLY_SOURCES = ("fitness_conversation", "suggested_account")
 # Em dashes are the quickest tell of machine-written replies.
 _FORBIDDEN_IN_REPLY = re.compile(
     r"https?://|www\.|(?<!\w)[#@]\w|flexdropin|[—–]", re.IGNORECASE,
@@ -54,7 +54,7 @@ class GrowthReplyService:
 
     def _draft(self, post_text: str) -> Optional[Dict[str, str]]:
         try:
-            return validate_reply_draft(self.generator.draft_founder_reply(post_text))
+            return validate_reply_draft(self.generator.draft_manual_reply(post_text))
         except Exception as error:
             logger.warning(
                 "growth_reply_generation_failed error_type=%s",

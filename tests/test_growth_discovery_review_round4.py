@@ -69,7 +69,7 @@ FILTER_CASES = [
         "post-context-only",
         {"description": " \t "},
         {},
-        (False, "no_founder_context"),
+        (False, "no_audience_context"),
     ),
     (
         "bio-context-only",
@@ -242,7 +242,7 @@ def test_hard_filter_cache_and_digest_share_canonical_eligibility_matrix(
         "latest_post": latest_post,
         "score": 85,
         "score_data": {
-            "relevance_policy": "startup_founder_peer_v1",
+            "relevance_policy": "fitness_first_v1",
             "total": 85,
             "audience_segment": "peer",
             "reasons": ["founder_bio"],
@@ -293,7 +293,7 @@ def test_whitespace_only_context_is_excluded_from_cache_digest_and_full_run(
         "latest_post": latest_post,
         "score": 85,
         "score_data": {
-            "relevance_policy": "startup_founder_peer_v1",
+            "relevance_policy": "fitness_first_v1",
             "total": 85,
             "audience_segment": "peer",
             "reasons": ["founder_bio"],

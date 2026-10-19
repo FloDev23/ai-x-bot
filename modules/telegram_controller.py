@@ -66,6 +66,7 @@ _SOURCE_TRUST_LABELS = {"verified": "Verificata"}
 _LIKE_SOURCE_LABELS = {
     "followed_account": "account seguito",
     "suggested_account": "account suggerito",
+    "fitness_conversation": "conversazione fitness",
     "founder_conversation": "conversazione founder",
 }
 _MANUAL_CATEGORY_LABELS = {
@@ -848,7 +849,7 @@ class TelegramController:
         ]
         lines = [
             "Growth giornaliero — azioni manuali su X",
-            f"Founder da seguire: {len(collections['accounts'])}",
+            f"Account da seguire: {len(collections['accounts'])}",
             f"Like: {len(collections['posts'])}",
             f"Risposte da scrivere: {len(replies)}",
             f"Unfollow proposti: {len(collections['reevaluate'])}",
@@ -1063,7 +1064,7 @@ class TelegramController:
         elif expected_kind == "account":
             metrics = payload["public_metrics"]
             text = "\n".join([
-                f"Founder da seguire @{username}",
+                f"Account da seguire @{username}",
                 f"follower: {metrics['followers_count']}",
                 f"following: {metrics['following_count']}",
                 f"post: {metrics['tweet_count']}",
@@ -1769,7 +1770,7 @@ class TelegramController:
             "Comandi",
             "/status — stato e prossimi job",
             "/posts — bozze in coda (no pubblicati)",
-            "/growth — founder da seguire, like e unfollow suggeriti",
+            "/growth — account da seguire, like e unfollow suggeriti",
             "/stats — riepilogo performance",
             "/ideas — aggiungi una fonte",
             "/newpost — aggiungi un post manuale alla coda",

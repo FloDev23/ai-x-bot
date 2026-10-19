@@ -142,7 +142,7 @@ def test_manual_command_and_scheduled_push_share_one_compact_formatter(tmp_path)
 
     assert service.calls == [NOW]
     assert len(telegram.messages) == 1
-    assert "Founder da seguire: 1" in telegram.messages[0][1]
+    assert "Account da seguire: 1" in telegram.messages[0][1]
     assert "Like: 1" in telegram.messages[0][1]
     assert "Unfollow proposti: 1" in telegram.messages[0][1]
     assert [button["text"] for button in _buttons(telegram.messages[0])] == [
@@ -244,7 +244,7 @@ def test_account_detail_offers_profile_links_and_local_not_relevant(tmp_path):
         callback_update(10, navigation["callback_data"])
     ) == "processed"
     detail = telegram.messages[-1]
-    assert "Founder da seguire @studio_owner" in detail[1]
+    assert "Account da seguire @studio_owner" in detail[1]
     assert "follower: 1200" in detail[1]
     buttons = _buttons(detail)
     assert buttons[0] == {"text": "Apri profilo", "url": "https://x.com/studio_owner"}

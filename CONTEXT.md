@@ -41,9 +41,9 @@ Tutti sotto `/Users/floriano/flo_mobile_app/`:
 | 2026-10-03 | **Pivot growth**: da gestori di palestre a **startup founder / indie hacker / build-in-public** (account 10 follower, ~9 impression/post; ricerca gym owner = 0 candidati; i founder ricambiano il follow e supportano PH). Reply Copilot rimosso, codice gym-classifier rimosso |
 | 2026-10-03 | `feat(growth)`: bozze di risposta manuali a founder con traduzione IT (`growth_replies`) |
 | 2026-10-03/05 | Fix: bozze reply con em dash scartate (ultimo commit `e7e0293`) |
-| 2026-10-16 (oggi) | Nessun lavoro in corso tranne file untracked `scripts/reschedule_human_first_campaign.py` |
+| 2026-10-19 | **Growth fitness-first**: target principale creator/coach/venue fitness, founder secondari (max 2 su 5 account); vedi §8 |
 
-Preferenze utente (da memoria): **cancellare il codice morto** invece di tenerlo; **non reintrodurre logica gym-classifier** nel growth; i gym owner si raggiungono **fuori da X** (Instagram, LinkedIn, gruppi FB, outreach diretto).
+Preferenze utente (da memoria): **cancellare il codice morto** invece di tenerlo; **non reintrodurre logica gym-classifier** nel growth; i gym owner si raggiungono **anche fuori da X** (Instagram, LinkedIn, gruppi FB, outreach diretto); su X si passa dai creator/coach fitness, i cui follower sono il pubblico di FlexDropin.
 
 ## 3. Architettura
 
@@ -147,17 +147,19 @@ Callback growth: `gr:<id>:<rev>` (scheda reply), `gra:p|s|g:<ref>` (Pubblicata /
 
 Testo inviato sempre `parse_mode=None` (nessun Markdown/HTML da dati utente), limite messaggio, callback ≤64 byte.
 
-## 8. Growth (stato post-pivot founder)
+## 8. Growth (fitness-first dal 2026-10-19)
 
-- **Target**: bio con segnali founder (`founder, co-founder, ceo, cto, indie hacker, solopreneur, bootstrapped, building in public, startup, saas`) e nessun rumore (crypto, NFT, follow-back, promo…). `GROWTH_RELEVANCE_POLICY="startup_founder_peer_v1"`, segmento unico `peer`.
-- **Seed accounts** (`config.GROWTH_SEED_ACCOUNTS`): ProductHunt, IndieHackers, levelsio, marc_louvion, arvidkahl, tdinh_me. (`.env.example` riporta `GROWTH_SEED_ACCOUNTS=` ma `config.py` non lo legge dall'env: è hardcoded.)
-- **Query**: 2 query topic in `growth_discovery.DEFAULT_TOPIC_QUERIES` + 1 query post (`founder_conversation`) in `growth_digest.POST_QUERY_PORTFOLIO` (budget 1/giorno).
-- **Score post** (`_POST_SIGNALS`): build_in_public 15, launch 12, traction 12, feedback_request 10, fitness_tech 10, founder_struggle 8, question 6.
-- **Like**: quote 4 followed_account / 3 suggested_account / 3 founder_conversation; autore cooldown 3gg; followed ≤72h, suggested ≤7gg.
-- **Unfollow**: ≥30 giorni di osservazione (`GROWTH_UNFOLLOW_REVIEW_DAYS`≥30), non ricambia, non `pinned`; 5/settimana.
-- **Reply drafts**: persistite in `growth_reply_drafts` (1 per suggestion), fonte prima `founder_conversation` poi `suggested_account`; prompt in `AIGenerator.draft_founder_reply` (peer tone, no pitch, no link/hashtag/@/emoji/em dash). Floriano copia il testo EN da Telegram e risponde a mano.
-- Tabelle: `growth_candidates`, `growth_profile_claims`, `growth_suggestions` (kind `account|post|reevaluate`, cooldown 30gg), `growth_digest_runs`, `growth_read_claims`, `x_following`, `follower_snapshots(+_runs)`, `growth_follows`.
-- Costi X (default): post read 0.005, user read 0.010, owned read 0.001, create 0.015, create **con URL 0.200**, media 0 → i link nei post costano ~13×: da qui il limite 1 link/settimana.
+- **Target**: segmento principale `fitness` (creator, coach, trainer, atleti, istruttori yoga/pilates, palestre e studi: regex bio `_FITNESS_IDENTITY_PATTERN`); segmento secondario `peer` (founder/indie hacker, `_FOUNDER_IDENTITY_PATTERN`). `audience_segment(profile)` restituisce `"fitness"`, `"peer"` o `None` (fitness vince se la bio ha entrambi). `GROWTH_RELEVANCE_POLICY="fitness_first_v1"`: il cambio di valore invalida le cache candidati vecchie (rivalutate al prossimo run). Filtro duro `no_audience_context` se la bio non è né fitness né founder. Rumore esteso: affiliate, codici sconto, sarms/steroidi/peptidi/trt oltre a crypto, follow-back ecc.
+- **Score account**: role_bio fitness 40 / founder 35, topic fit (fitness+startup terms per fitness, solo startup per founder) 25/15, activity 15/8, mercato en 15, follow-back range 10, affinità 5. Soglia 75.
+- **Digest account**: ≤5 al giorno, di cui **al massimo 2 founder** (`MAX_FOUNDER_ACCOUNTS`).
+- **Seed accounts** (`config.GROWTH_SEED_ACCOUNTS`, hardcoded, non da env): ClassPass, CrossFit, Peloton, Mindbody, Hevy, ProductHunt. Gli handle sono ipotesi non verificate: un handle sbagliato non produce risultati ma non rompe nulla; da rivedere a mano.
+- **Query**: 2 query topic in `growth_discovery.DEFAULT_TOPIC_QUERIES` (cosa postano creator/coach: workout, leg day, my clients, class today; e venue: gym owner, studio owner, boutique fitness, drop-in) + 1 query post `fitness_conversation` in `growth_digest.POST_QUERY_PORTFOLIO` (budget 1/giorno).
+- **Score post** (`_POST_SIGNALS`): training_content 12, class_or_gym_talk 12, access_pain 12 (drop-in, day pass, membership, travel), poi i vecchi segnali founder (build_in_public 15, launch 12, traction 12, feedback_request 10, fitness_tech 10, founder_struggle 8, question 6).
+- **Like**: quote 4 followed_account / 3 suggested_account / 3 `fitness_conversation`; autore cooldown 3gg; followed ≤72h, suggested ≤7gg. `get_following_state()` espone `target` (bio fitness o founder) per filtrare la timeline.
+- **Unfollow**: ≥30 giorni, non ricambia, non `pinned`; 5/settimana.
+- **Reply drafts**: `AIGenerator.draft_manual_reply` (ex `draft_founder_reply`): Floriano risponde da pari a creator/coach/venue/founder, mai pitch, né link/hashtag/@/emoji/em dash, niente consigli medici. Fonti reply: `fitness_conversation` poi `suggested_account`. I code storici `founder_conversation` restano ammessi nelle allowlist del DB per leggere righe già persistite.
+- Tabelle: `growth_candidates`, `growth_profile_claims`, `growth_suggestions` (kind `account|post|reevaluate`, cooldown 30gg), `growth_digest_runs`, `growth_read_claims`, `x_following`, `follower_snapshots(+_runs)`, `growth_reply_drafts`, `growth_follows`.
+- Costi X (default): post read 0.005, user read 0.010, owned read 0.001, create 0.015, create **con URL 0.200**, media 0.
 
 ## 9. Campagne e contenuti
 
@@ -188,8 +190,8 @@ Testo inviato sempre `parse_mode=None` (nessun Markdown/HTML da dati utente), li
 ## 12. Incoerenze e debito tecnico noti
 
 1. **README.md e SETUP.md obsoleti**: descrivono ancora il digest "palestre da seguire / non-palestra da unfolloware", `GROWTH_POST_QUERY_BUDGET`, Reply Copilot come dismesso, etc. Il codice ora è founder-oriented e non classifica più le palestre. `VPS_ROLLOUT.md` riporta ancora `GROWTH_POST_QUERY_BUDGET=2` e `GROWTH_UNFOLLOW_REVIEW_DAYS=14`, che oggi **non validano** (budget deve essere 1, review ≥30); e fa riferimento a HEAD `e51ac9c`.
-2. **`character.json` ancora gym-centrico** (bio "for gym and studio operators", lore "100 gyms challenge", topic palestre; `categoryAgents` include categorie legacy IT). Coerente con le categorie post (che parlano di gym), ma NON con il target growth founder. Decisione da prendere: va riallineato (contenuti X verso founder/build-in-public?) oppure no (contenuti restano per gym owner/utenti, solo il growth cerca founder).
-3. **Mismatch tra audience dei contenuti e target growth**: i post pianificati (human-first + gym owner + product journey) parlano a US gym owner e utenti fitness; il growth cerca founder. È una scelta di strategia in sospeso, non un bug.
+2. **`character.json` gym-centrico** (bio "for gym and studio operators", lore "100 gyms challenge", topic palestre; `categoryAgents` include categorie legacy IT). Coerente con le categorie post (che parlano di gym), ma NON con il target growth founder. Decisione da prendere: va riallineato (contenuti X verso founder/build-in-public?) oppure no (contenuti restano per gym owner/utenti, solo il growth cerca founder).
+3. **Audience contenuti vs growth**: ora allineate (fitness). `character.json` resta gym-centrico, coerente con il nuovo target; i founder sono solo secondari.
 4. **`.env.example`** contiene `GROWTH_SEED_ACCOUNTS=`, `GROWTH_DIGEST_LIMIT`, `ENABLE_REPLY_COPILOT`, `REPLY_COPILOT_*`, che non hanno più effetto (seed hardcoded in `config.py`; reply copilot rimosso). Da pulire (preferenza utente: cancellare codice/config morti).
 5. **Codice morto/legacy probabile**: `lead_finder.py` + job lead (default off), `content_scheduler.py`, `generate_flexdropin_comment/value_reply/lead_dm` in `ai_generator`, tabelle `leads`, `seen_tweets`, `target_accounts`, `spam_guard`, `ideas`, `posted_tweets`, `reply_suggestions` (residua nel DB locale), pagine leads/engagement della dashboard, `create_draft_cycle`/`publish_cycle` per slot, variabili legacy di §10, e la tabella `growth_follows`. Verificare uso reale prima di rimuovere.
 6. `main.py: growth_digest_cycle` chiama `growth_replies.build` e poi `push_growth_digest`, che richiama `build` ancora (idempotente) — duplicazione innocua.
@@ -209,7 +211,7 @@ Checklist rapida:
 3. Chiedere a Floriano il valore di `DRY_RUN` in produzione (il `.env` non è leggibile).
 4. Prima di toccare `config.py`, `Publisher`, `TwitterClient` o `database.py`: leggere i test omologhi e rieseguire la suite. Non aggiungere mai chiamate X di engagement; non allentare i controlli fail-closed.
 5. Per riprogrammare post dopo outage/cambi data: copiare il pattern di `scripts/reschedule_credit_outage_posts.py` e `announce_product_hunt_date_change.py` (backup → verifica → update idempotente).
-6. Per cambi alla strategia growth: restare sul target founder (§8), non reintrodurre classificazione palestre.
+6. Per cambi alla strategia growth: restare fitness-first (§8), non reintrodurre il vecchio classificatore palestre.
 
 ## 14. Esito test odierno
 

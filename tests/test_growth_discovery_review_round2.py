@@ -220,7 +220,7 @@ def _persist_complete_candidate(database, user_id="cache-user", username="cache_
         "latest_post": review_post("810"),
         "score": 95,
         "score_data": {
-            "relevance_policy": "startup_founder_peer_v1",
+            "relevance_policy": "fitness_first_v1",
             "total": 95,
             "audience_segment": "peer",
             "reasons": ["founder_bio"],

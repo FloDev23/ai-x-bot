@@ -128,11 +128,11 @@ def test_none_description_from_tweepy_is_audited_but_not_growth_eligible(tmp_pat
     assert audit["score"] == 70
     assert audit["score_data"]["hard_filter_passed"] is False
     assert audit["score_data"]["filter_reason"] == (
-        "no_founder_context"
+        "no_audience_context"
     )
     assert passes_candidate_filters(audit["profile"], audit["latest_post"], NOW) == (
         False,
-        "no_founder_context",
+        "no_audience_context",
     )
     assert database.get_cached_growth_candidate("101", NOW) is None
     assert database.get_digest_candidates(now=NOW, threshold=70) == []
@@ -161,7 +161,7 @@ def test_none_lang_from_tweepy_is_eligible_without_market_points(tmp_path):
     assert [row["user_id"] for row in rows] == ["102"]
     audit = database.get_growth_candidate("102")
     assert audit["latest_post"]["lang"] == ""
-    assert audit["score"] == 90
+    assert audit["score"] == 95
     assert audit["score_data"]["market"] == 0
     assert "english_market" not in audit["score_data"]["reasons"]
     assert audit["score_data"]["hard_filter_passed"] is True
