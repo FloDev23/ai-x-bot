@@ -24,7 +24,7 @@ Operatore: Floriano (FloDev23, flexdropin@gmail.com), solo founder. Lingua opera
 Tutti sotto `/Users/floriano/flo_mobile_app/`:
 - `../flexDropin` — app mobile (Expo/React Native + Supabase + Stripe Connect). Fatti di prodotto, fee, categorie: `../flexDropin/CLAUDE.md`.
 - `../flexDropin-website` — sito Next.js `flexdropin.com` (EN default, `/it` in euro), hub deeplink. Contesto: `../flexDropin-website/CLAUDE.md`.
-- `../flexdropin-instagram` — contenuti Instagram e LinkedIn `@flexdropin` (qui sono confluiti i materiali marketing dell’ex `flexdropin-growth`, cartella eliminata il 2026-10-30) (italiano, target gestori palestre e clienti drop-in a Verona; post programmati in Meta Business Suite, storie pubblicate a mano). Contesto: `../flexdropin-instagram/CLAUDE.md`. Canale separato da X: stesso prodotto, lingua e target diversi.
+- `../flexdropin-social` — contenuti social (Instagram + LinkedIn) `@flexdropin` (qui sono confluiti i materiali marketing dell’ex `flexdropin-growth`, cartella eliminata il 2026-10-30) (italiano, target gestori palestre e clienti drop-in a Verona; post programmati in Meta Business Suite, storie pubblicate a mano). Contesto: `../flexdropin-social/CLAUDE.md`. Canale separato da X: stesso prodotto, lingua e target diversi.
 
 ## 2. Stato e decisioni recenti (cronologia utile)
 
