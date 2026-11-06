@@ -14,6 +14,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+APP_JPG = Path("/Users/floriano/flo_mobile_app/remotion/public/app")
 SCREENS = Path(
     "/Users/floriano/1.Floriano/flexdropin_doc/flexdropin_app_img/Flexdropin-compressed"
 )
@@ -92,7 +93,8 @@ def rounded(image, radius):
 
 def phone(name, crop=(0.0, 1.0), height=760):
     """Return a screenshot cropped vertically by fractions of its height."""
-    shot = Image.open(SCREENS / f"{name}.png").convert("RGB")
+    source = Path(name) if name.startswith("/") else SCREENS / f"{name}.png"
+    shot = Image.open(source).convert("RGB")
     top, bottom = crop
     shot = shot.crop((0, int(shot.height * top), shot.width, int(shot.height * bottom)))
     width = round(shot.width * height / shot.height)
@@ -188,6 +190,21 @@ def main():
         "screen-widget.png", "Your next class, on your Home Screen.", {"next", "class"},
         "The widget shows the gym, the start time and a countdown.",
         "Widget", crop=(0.0, 0.52),
+    )
+    screen_card(
+        "screen-choose-lesson.png", "Single, recurring or from a template.", {"recurring"},
+        "Gyms publish a class once and FlexDropin builds the dates.",
+        str(APP_JPG / "choose-lesson.jpg"), crop=(0.0, 0.96),
+    )
+    screen_card(
+        "screen-stripe.png", "Paid straight to the gym's own Stripe account.", {"stripe"},
+        "Customers pay in the app. No subscription, no setup fee.",
+        str(APP_JPG / "stripe-status.jpg"), crop=(0.0, 0.7),
+    )
+    screen_card(
+        "screen-partner.png", "One app to run your drop-in classes.", {"drop-in"},
+        "Classes, instructors, bookings, payments and stats.",
+        str(APP_JPG / "become-partner.jpg"), crop=(0.0, 0.9),
     )
     cards = {
         "card-crossfit.png": ("First class", "Your first CrossFit class.", {"crossfit"}, "Arrive early. Mention injuries. Scale without apology."),
