@@ -221,3 +221,13 @@ Checklist rapida:
 - Da controllare: `/growth` domani alle 09:00 Rome (account fitness presenti, max 2 founder), `/errors` vuoto, handle dei seed (§8) che restituiscono risultati.
 - Untracked, non committato: `scripts/reschedule_human_first_campaign.py`.
 - Restano non verificati: coda/piani in produzione e crediti X API (§13).
+
+## 15. Campagna novembre 2026 (programmata il 2026-11-06)
+
+- **60 post programmati dal 6 al 30 novembre** (ET: 2 al giorno, 3 il mar/gio/sab), tutti `approved`+`planned` in produzione (draft 157-216), 19 con media riservato, 3 thread (10, 17, 24 nov). Backup pre-run: `~/ai-x-bot/backups/bot_data.db.pre-november-campaign-20261106`.
+- Script: `scripts/schedule_november_campaign.py` (testi, orari e media in un unico file; `--check` valida lunghezza, trattini, similarità semantica < 0.6 contro tutti i draft esistenti e tra loro, tetto link 2/settimana, slot per giorno). Idempotente (token `NovCampaign26_<data><M|D|E>`). Eseguito sul VPS da `/tmp` con `PYTHONPATH=~/ai-x-bot CAMPAIGN_DB_PATH=... CAMPAIGN_MEDIA_ROOT=~/ai-x-bot/media_library` dopo prova su copia del DB. Il token di sessione deve avere almeno 16 caratteri.
+- Immagini: `scripts/build_november_assets.py` (Pillow, non è dipendenza del bot; font Avenir Next di sistema) crea 5 card con schermata app e 8 card disciplina 1600x900 da `Flexdropin-compressed/`; ritagli per escludere "Booking is final", certificato medico e "IFF CrossFit". Video EN da `../remotion/out/`: AthleteFlow, StoryFlow, AdMapPin (wide e 15s), Whiteboard, AdFillSpots 15s. Esclusi ExplainerGyms e PartnerPromo (mostrano KPI di ricavi/occupazione).
+- Regole editoriali applicate: niente trattini lunghi, niente cifre di palestre/utenti, commissione sempre "15% + Stripe", niente promesse di annullamento/rimborso, niente IFF CrossFit, max 4 post con link (flexdropin.com) in tutto il mese, Maria Petaccia è la founder e Floriano il developer (vedi `../flexdropin-social/CLAUDE.md`).
+- Mix: 26 pensieri human-first, 17 educativi (fitness_education), 12 product_proof (6 video, 5 schermate), 8 gym_strategy, 3 founder_journey, 5 shareable_fitness (con domande a coach/creator). Orari variabili tra 08:35-10:15, 13:20-14:20, 18:10-20:15 ET.
+- Dopo il 30 novembre non c'è nulla in coda: servono altri post (l'ultimo draft è `216`). Il `replenisher` continua a generare bozze che richiedono approvazione Telegram.
+
